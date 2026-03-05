@@ -295,4 +295,46 @@ lazy_static! {
         &["protocol", "customer_email", "meeting_id", "server_instance", "region"]
     )
     .expect("Failed to create server_reconnections_total metric");
+
+    // ===== PHASE 1 METRICS: Browser State and Quality Indicators =====
+
+    /// Client tab visibility indicator (1=visible, 0=hidden/backgrounded)
+    pub static ref CLIENT_TAB_VISIBLE: GaugeVec = register_gauge_vec!(
+        "videocall_client_tab_visible",
+        "Indicates if client browser tab is visible (1=visible, 0=hidden/throttled)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create client_tab_visible metric");
+
+    /// Client JS heap memory usage in bytes (Chrome only)
+    pub static ref CLIENT_MEMORY_USED_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_client_memory_used_bytes",
+        "JS heap memory used by client in bytes (Chrome only)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create client_memory_used_bytes metric");
+
+    /// Client JS heap memory total/limit in bytes (Chrome only)
+    pub static ref CLIENT_MEMORY_TOTAL_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_client_memory_total_bytes",
+        "JS heap memory limit for client in bytes (Chrome only)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create client_memory_total_bytes metric");
+
+    /// Video frames dropped by receiver
+    pub static ref VIDEO_FRAMES_DROPPED: GaugeVec = register_gauge_vec!(
+        "videocall_video_frames_dropped",
+        "Number of video frames dropped by the receiver",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_frames_dropped metric");
+
+    /// Audio packet loss percentage (0.0-100.0)
+    pub static ref AUDIO_PACKET_LOSS_PCT: GaugeVec = register_gauge_vec!(
+        "videocall_audio_packet_loss_pct",
+        "Audio packet loss percentage calculated from NetEQ concealment events",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create audio_packet_loss_pct metric");
 }

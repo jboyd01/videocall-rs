@@ -36,13 +36,14 @@ type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
 use sec_api::metrics::{
-    ACTIVE_SESSIONS_TOTAL, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, MEETING_PARTICIPANTS,
+    ACTIVE_SESSIONS_TOTAL, AUDIO_PACKET_LOSS_PCT, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
+    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_TAB_VISIBLE, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC,
     NETEQ_DTMF_OPS_PER_SEC, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_FAST_ACCELERATE_OPS_PER_SEC,
     NETEQ_MERGE_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
     NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_UNDEFINED_OPS_PER_SEC,
     PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
+    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PACKETS_BUFFERED,
 };
 
 async fn metrics_handler(
@@ -115,6 +116,23 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = SELF_VIDEO_ENABLED
         .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_user_id]);
 
+    // Phase 1: Remove tab visibility and memory metrics
+    let _ = CLIENT_TAB_VISIBLE.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_peer,
+    ]);
+    let _ = CLIENT_MEMORY_USED_BYTES.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_peer,
+    ]);
+    let _ = CLIENT_MEMORY_TOTAL_BYTES.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_peer,
+    ]);
+
     // Remove active server metrics for this session
     for (server_url, server_type) in &session_info.active_servers {
         let server_labels = [
@@ -157,6 +175,10 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         let _ = NETEQ_COMFORT_NOISE_OPS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_DTMF_OPS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_UNDEFINED_OPS_PER_SEC.remove_label_values(&labels);
+
+        // Phase 1: Remove frames dropped and audio loss metrics
+        let _ = VIDEO_FRAMES_DROPPED.remove_label_values(&labels);
+        let _ = AUDIO_PACKET_LOSS_PCT.remove_label_values(&labels);
     }
 
     // Meeting participants is recomputed on next scrape; no need to force remove
@@ -286,6 +308,40 @@ fn process_health_packet_to_metrics_pb(
             } else {
                 0.0
             });
+
+        // Phase 1 metrics: Tab visibility (HealthPacket level)
+        debug!(
+            "Setting CLIENT_TAB_VISIBLE for meeting={}, session={}, peer={}, value={}",
+            meeting_id, session_id, reporting_peer, health_packet.is_tab_visible
+        );
+        CLIENT_TAB_VISIBLE
+            .with_label_values(&[meeting_id, session_id, reporting_peer])
+            .set(if health_packet.is_tab_visible {
+                1.0
+            } else {
+                0.0
+            });
+
+        // Phase 1 metrics: Memory usage (HealthPacket level, Chrome only)
+        if let Some(mem_used) = health_packet.memory_used_bytes {
+            debug!(
+                "Setting CLIENT_MEMORY_USED_BYTES for meeting={}, session={}, peer={}, value={} bytes",
+                meeting_id, session_id, reporting_peer, mem_used
+            );
+            CLIENT_MEMORY_USED_BYTES
+                .with_label_values(&[meeting_id, session_id, reporting_peer])
+                .set(mem_used as f64);
+        }
+
+        if let Some(mem_total) = health_packet.memory_total_bytes {
+            debug!(
+                "Setting CLIENT_MEMORY_TOTAL_BYTES for meeting={}, session={}, peer={}, value={} bytes",
+                meeting_id, session_id, reporting_peer, mem_total
+            );
+            CLIENT_MEMORY_TOTAL_BYTES
+                .with_label_values(&[meeting_id, session_id, reporting_peer])
+                .set(mem_total as f64);
+        }
 
         // Process peer health data
         if !health_packet.peer_stats.is_empty() {
@@ -523,7 +579,7 @@ fn process_health_packet_to_metrics_pb(
                         }
 
                         if video_stats.frames_buffered != 0.0 {
-                            debug!("Setting VIDEO_PACKETS_BUFFERED for meeting={}, session={}, from_peer={}, to_peer={}, value={}", 
+                            debug!("Setting VIDEO_PACKETS_BUFFERED for meeting={}, session={}, from_peer={}, to_peer={}, value={}",
                                    meeting_id, session_id, reporting_user_id, peer_id, video_stats.frames_buffered);
                             VIDEO_PACKETS_BUFFERED
                                 .with_label_values(&[
@@ -534,6 +590,28 @@ fn process_health_packet_to_metrics_pb(
                                 ])
                                 .set(video_stats.frames_buffered);
                         }
+                    }
+
+                    // Phase 1 metrics: Frames dropped (PeerStats level)
+                    if peer_data.frames_dropped > 0 {
+                        debug!(
+                            "Setting VIDEO_FRAMES_DROPPED for meeting={}, session={}, from_peer={}, to_peer={}, value={}",
+                            meeting_id, session_id, reporting_peer, peer_id, peer_data.frames_dropped
+                        );
+                        VIDEO_FRAMES_DROPPED
+                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .set(peer_data.frames_dropped as f64);
+                    }
+
+                    // Phase 1 metrics: Audio packet loss percentage (PeerStats level)
+                    if peer_data.audio_packet_loss_pct > 0.0 {
+                        debug!(
+                            "Setting AUDIO_PACKET_LOSS_PCT for meeting={}, session={}, from_peer={}, to_peer={}, value={:.2}%",
+                            meeting_id, session_id, reporting_peer, peer_id, peer_data.audio_packet_loss_pct
+                        );
+                        AUDIO_PACKET_LOSS_PCT
+                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .set(peer_data.audio_packet_loss_pct);
                     }
 
                     // Process explicit peer status flags if present
