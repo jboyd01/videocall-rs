@@ -409,11 +409,20 @@ impl HealthReporter {
                                 video_stats["frames_decoded"] = json!(frames);
                             }
                         }
-                        "bitrate_kbps" => {
-                            if let MetricValue::U64(bitrate) = &metric.value {
-                                video_stats["bitrate_kbps"] = json!(bitrate);
+                        "frames_dropped" => {
+                            if let MetricValue::U64(dropped) = &metric.value {
+                                video_stats["frames_dropped"] = json!(dropped);
                             }
                         }
+                        "bitrate_kbps" => match &metric.value {
+                            MetricValue::U64(bitrate) => {
+                                video_stats["bitrate_kbps"] = json!(bitrate);
+                            }
+                            MetricValue::F64(bitrate) => {
+                                video_stats["bitrate_kbps"] = json!(*bitrate as u64);
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -530,6 +539,40 @@ impl HealthReporter {
             pb.active_server_rtt_ms = rtt;
         }
 
+        // Phase 1 metrics: Tab visibility
+        #[cfg(target_arch = "wasm32")]
+        {
+            pb.is_tab_visible = web_sys::window()
+                .and_then(|w| w.document())
+                .map(|d| !d.hidden())
+                .unwrap_or(true); // Default to visible if API unavailable
+
+            // Phase 1 metrics: Memory usage (Chrome only)
+            if let Some(window) = web_sys::window() {
+                if let Some(perf) = window.performance() {
+                    // Try to access performance.memory (Chrome extension)
+                    if let Ok(memory) = js_sys::Reflect::get(&perf, &"memory".into()) {
+                        if !memory.is_undefined() {
+                            if let Ok(used) =
+                                js_sys::Reflect::get(&memory, &"usedJSHeapSize".into())
+                            {
+                                if let Some(used_f64) = used.as_f64() {
+                                    pb.memory_used_bytes = Some(used_f64 as u64);
+                                }
+                            }
+                            if let Ok(total) =
+                                js_sys::Reflect::get(&memory, &"jsHeapSizeLimit".into())
+                            {
+                                if let Some(total_f64) = total.as_f64() {
+                                    pb.memory_total_bytes = Some(total_f64 as u64);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for (peer_id, health_data) in health_map.iter() {
             let mut ps = PbPeerStats::new();
             ps.can_listen = health_data.can_listen;
@@ -555,6 +598,22 @@ impl HealthReporter {
                     // use as-is
                     ns.packets_per_sec = v;
                 }
+
+                // Phase 1: Calculate audio packet loss percentage from NetEQ lifetime stats
+                if let Some(lifetime) = neteq.get("lifetime") {
+                    let concealment_events =
+                        lifetime.get("concealment_events").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let packets_received = lifetime
+                        .get("jitter_buffer_packets_received")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+
+                    if packets_received > 0 {
+                        ps.audio_packet_loss_pct =
+                            (concealment_events as f64 / packets_received as f64) * 100.0;
+                    }
+                }
+
                 if let Some(network) = neteq.get("network") {
                     let mut nn = PbNetEqNetwork::new();
                     if let Some(counters) = network.get("operation_counters") {
@@ -620,6 +679,11 @@ impl HealthReporter {
                     vs.bitrate_kbps = v;
                 }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
+
+                // Phase 1: Extract frames_dropped from video stats
+                if let Some(dropped) = video.get("frames_dropped").and_then(|v| v.as_u64()) {
+                    ps.frames_dropped = dropped;
+                }
             }
 
             pb.peer_stats.insert(peer_id.clone(), ps);

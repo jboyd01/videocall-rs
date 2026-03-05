@@ -45,6 +45,10 @@ message PeerStats {
   // Structured stats
   NetEqStats neteq_stats = 5;
   VideoStats video_stats = 6;
+
+  // Phase 1 metrics: Quality indicators
+  uint64 frames_dropped = 7; // Video frames dropped (sender side)
+  double audio_packet_loss_pct = 8; // Audio packet loss percentage (0.0-100.0)
 }
 
 message HealthPacket {
@@ -64,5 +68,10 @@ message HealthPacket {
   string active_server_url = 8;
   string active_server_type = 9; // "webtransport" | "websocket"
   double active_server_rtt_ms = 10;
+
+  // Phase 1 metrics: Browser state and resource usage
+  bool is_tab_visible = 11; // Tab visibility state (true = visible/active)
+  optional uint64 memory_used_bytes = 12; // JS heap memory used (Chrome only)
+  optional uint64 memory_total_bytes = 13; // JS heap memory limit (Chrome only)
 }
 

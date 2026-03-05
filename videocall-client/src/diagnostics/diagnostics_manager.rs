@@ -86,6 +86,7 @@ struct FpsTracker {
     bytes_received: u64,      // Track total bytes received
     last_bitrate_update: f64, // Last time we calculated bitrate
     current_bitrate: f64,     // Current bitrate in kbits/sec
+    frames_dropped: u32,      // Phase 1: Track dropped frames
 }
 
 impl FpsTracker {
@@ -101,6 +102,7 @@ impl FpsTracker {
             bytes_received: 0,
             last_bitrate_update: now,
             current_bitrate: 0.0,
+            frames_dropped: 0,
         }
     }
 
@@ -438,6 +440,7 @@ impl DiagnosticWorker {
                     metrics: vec![
                         metric!("fps", tracker.fps),
                         metric!("bitrate_kbps", tracker.current_bitrate),
+                        metric!("frames_dropped", tracker.frames_dropped as u64),
                         metric!("media_type", format!("{:?}", media_type)),
                         metric!("from_peer", self.userid.clone()),
                         metric!("to_peer", peer_id.clone()),
@@ -457,6 +460,7 @@ impl DiagnosticWorker {
                     metrics: vec![
                         metric!("fps_received", tracker.fps),
                         metric!("bitrate_kbps", tracker.current_bitrate),
+                        metric!("frames_dropped", tracker.frames_dropped as u64),
                         metric!("from_peer", self.userid.clone()),
                         metric!("to_peer", peer_id.clone()),
                     ],
