@@ -120,17 +120,17 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = CLIENT_TAB_VISIBLE.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
-        &session_info.reporting_peer,
+        &session_info.reporting_user_id,
     ]);
     let _ = CLIENT_MEMORY_USED_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
-        &session_info.reporting_peer,
+        &session_info.reporting_user_id,
     ]);
     let _ = CLIENT_MEMORY_TOTAL_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
-        &session_info.reporting_peer,
+        &session_info.reporting_user_id,
     ]);
 
     // Remove active server metrics for this session
@@ -211,33 +211,27 @@ fn process_health_packet_to_metrics_pb(
     };
     let reporting_user_id = reporting_user_id_str.as_str();
 
-    // Update session tracker
+    // Update session tracker: create entry on first packet, then refresh last_seen only.
+    // Using entry().or_insert_with() preserves accumulated to_peers/peer_ids/active_servers
+    // across packets. The previous tracker.insert() reset them every packet, causing a leak
+    // where peers that left mid-session had their Prometheus labels written but never cleaned up.
     {
         let mut tracker = session_tracker.lock().unwrap();
         let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-        tracker.insert(
-            session_key,
-            SessionInfo {
-                session_id: session_id.to_string(),
-                meeting_id: meeting_id.to_string(),
-                reporting_user_id: reporting_user_id.to_string(),
-                last_seen: Instant::now(),
-                to_peers: HashSet::new(),
-                peer_ids: HashSet::new(),
-                active_servers: HashSet::new(),
-            },
-        );
+        let info = tracker.entry(session_key).or_insert_with(|| SessionInfo {
+            session_id: session_id.to_string(),
+            meeting_id: meeting_id.to_string(),
+            reporting_user_id: reporting_user_id.to_string(),
+            last_seen: Instant::now(),
+            to_peers: HashSet::new(),
+            peer_ids: HashSet::new(),
+            active_servers: HashSet::new(),
+        });
+        info.last_seen = Instant::now();
     }
 
-    // Check if this session is active (not cleaned up)
-    let is_session_active = {
-        let tracker = session_tracker.lock().unwrap();
-        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-        tracker.contains_key(&session_key)
-    };
-
-    // Only publish metrics for active sessions
-    if is_session_active {
+    // Process metrics for this session
+    {
         // Client-side active server info (optional)
         if !health_packet.active_server_url.is_empty() {
             let server_url = &health_packet.active_server_url;
@@ -312,10 +306,10 @@ fn process_health_packet_to_metrics_pb(
         // Phase 1 metrics: Tab visibility (HealthPacket level)
         debug!(
             "Setting CLIENT_TAB_VISIBLE for meeting={}, session={}, peer={}, value={}",
-            meeting_id, session_id, reporting_peer, health_packet.is_tab_visible
+            meeting_id, session_id, reporting_user_id, health_packet.is_tab_visible
         );
         CLIENT_TAB_VISIBLE
-            .with_label_values(&[meeting_id, session_id, reporting_peer])
+            .with_label_values(&[meeting_id, session_id, reporting_user_id])
             .set(if health_packet.is_tab_visible {
                 1.0
             } else {
@@ -326,20 +320,20 @@ fn process_health_packet_to_metrics_pb(
         if let Some(mem_used) = health_packet.memory_used_bytes {
             debug!(
                 "Setting CLIENT_MEMORY_USED_BYTES for meeting={}, session={}, peer={}, value={} bytes",
-                meeting_id, session_id, reporting_peer, mem_used
+                meeting_id, session_id, reporting_user_id, mem_used
             );
             CLIENT_MEMORY_USED_BYTES
-                .with_label_values(&[meeting_id, session_id, reporting_peer])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(mem_used as f64);
         }
 
         if let Some(mem_total) = health_packet.memory_total_bytes {
             debug!(
                 "Setting CLIENT_MEMORY_TOTAL_BYTES for meeting={}, session={}, peer={}, value={} bytes",
-                meeting_id, session_id, reporting_peer, mem_total
+                meeting_id, session_id, reporting_user_id, mem_total
             );
             CLIENT_MEMORY_TOTAL_BYTES
-                .with_label_values(&[meeting_id, session_id, reporting_peer])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(mem_total as f64);
         }
 
@@ -592,25 +586,26 @@ fn process_health_packet_to_metrics_pb(
                         }
                     }
 
-                    // Phase 1 metrics: Frames dropped (PeerStats level)
-                    if peer_data.frames_dropped > 0 {
+                    // Phase 1 metrics: Decode errors per second (PeerStats level)
+                    // Note: this is decode errors (codec resets), not CPU-pressure frame drops.
+                    if peer_data.decode_errors_per_sec > 0.0 {
                         debug!(
-                            "Setting VIDEO_FRAMES_DROPPED for meeting={}, session={}, from_peer={}, to_peer={}, value={}",
-                            meeting_id, session_id, reporting_peer, peer_id, peer_data.frames_dropped
+                            "Setting VIDEO_FRAMES_DROPPED for meeting={}, session={}, from_peer={}, to_peer={}, value={:.2}",
+                            meeting_id, session_id, reporting_user_id, peer_id, peer_data.decode_errors_per_sec
                         );
                         VIDEO_FRAMES_DROPPED
-                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
-                            .set(peer_data.frames_dropped as f64);
+                            .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
+                            .set(peer_data.decode_errors_per_sec);
                     }
 
                     // Phase 1 metrics: Audio packet loss percentage (PeerStats level)
                     if peer_data.audio_packet_loss_pct > 0.0 {
                         debug!(
                             "Setting AUDIO_PACKET_LOSS_PCT for meeting={}, session={}, from_peer={}, to_peer={}, value={:.2}%",
-                            meeting_id, session_id, reporting_peer, peer_id, peer_data.audio_packet_loss_pct
+                            meeting_id, session_id, reporting_user_id, peer_id, peer_data.audio_packet_loss_pct
                         );
                         AUDIO_PACKET_LOSS_PCT
-                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
                             .set(peer_data.audio_packet_loss_pct);
                     }
 
