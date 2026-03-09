@@ -47,7 +47,11 @@
       "Bash(node:*)",
       "Bash(make e2e-lint:*)",
       "Bash(make:*)",
-      "Bash(docker system:*)"
+      "Bash(docker system:*)",
+      "Bash(protoc:*)",
+      "Bash(mkdir:*)",
+      "Bash(python3:*)",
+      "Bash(claude mcp:*)"
     ]
   }
 }
