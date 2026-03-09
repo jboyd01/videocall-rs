@@ -437,6 +437,10 @@ impl ConnectionManager {
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
         connection.send_packet(rtt_packet);
+        // Count RTT probes in packets_sent so the sent/received rates are symmetric.
+        // packets_received already counts inbound RTT echoes; excluding probes from
+        // packets_sent made the two rates incomparable (ratio was meaningless).
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
         debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }

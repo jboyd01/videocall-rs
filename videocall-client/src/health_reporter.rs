@@ -307,15 +307,6 @@ impl HealthReporter {
                 }
             }
         }
-        // Handle decoder events (from local DiagnosticManager)
-        // These carry FPS/bitrate/decode_errors for a peer's stream. The "video" subsystem
-        // events carry the same data and drive update_video_stats(); this arm is kept as a
-        // debug sink only (see Bug 5 in CODE_REVIEW_METRICS: double DiagEvent emission).
-        else if event.subsystem == "decoder" {
-            debug!(
-                "Decoder event for peer: {target_peer} (from {reporting_peer})"
-            );
-        }
         // Handle sender events (from local SenderDiagnosticManager)
         else if event.subsystem == "sender" {
             debug!(
