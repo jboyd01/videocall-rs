@@ -128,7 +128,7 @@ struct InnerOptions {
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
-    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
+    connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     connection_state: ConnectionState,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
@@ -154,7 +154,7 @@ struct Inner {
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
-    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
+    connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
 }
@@ -229,7 +229,7 @@ impl VideoCallClient {
             None
         };
 
-        let connection_controller: Rc<RefCell<Option<ConnectionController>>> =
+        let connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>> =
             Rc::new(RefCell::new(None));
 
         let client = Self {
@@ -386,7 +386,18 @@ impl VideoCallClient {
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
 
-        *self.connection_controller.try_borrow_mut()? = Some(connection_controller);
+        // Store the controller as an Rc so we can share it with the health reporter
+        let controller_rc = Rc::new(connection_controller);
+        *self.connection_controller.try_borrow_mut()? = Some(controller_rc.clone());
+
+        // Pass the connection controller to the health reporter for communication metrics
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(hrb) = hr.try_borrow() {
+                    hrb.set_connection_controller(controller_rc);
+                }
+            }
+        }
 
         info!("ConnectionManager created with RTT testing and 1Hz diagnostics reporting");
         Ok(())

@@ -247,6 +247,11 @@ impl WebSocketTask {
             self.notification.emit(WebSocketStatus::Error);
         }
     }
+
+    /// Get the amount of data in bytes queued to be transmitted (bufferedAmount)
+    pub fn get_buffered_amount(&self) -> Option<u64> {
+        Some(self.ws.buffered_amount() as u64)
+    }
 }
 
 impl WebSocketTask {
