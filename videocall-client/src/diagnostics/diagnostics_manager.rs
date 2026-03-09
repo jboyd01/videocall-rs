@@ -45,6 +45,13 @@ pub enum DiagnosticEvent {
         media_type: MediaType,
         frame_size: u64, // Size of the frame in bytes
     },
+    DecodeError {
+        peer_id: String,
+        media_type: MediaType,
+    },
+    RemovePeer {
+        peer_id: String,
+    },
     RequestStats,
     SetStatsCallback(Callback<String>),
     SetReportingInterval(u64),
@@ -86,7 +93,8 @@ struct FpsTracker {
     bytes_received: u64,      // Track total bytes received
     last_bitrate_update: f64, // Last time we calculated bitrate
     current_bitrate: f64,     // Current bitrate in kbits/sec
-    frames_dropped: u32,      // Phase 1: Track dropped frames
+    decode_errors_count: u32, // Windowed counter (resets every 1s)
+    decode_errors_per_sec: f64, // Decode errors per second
 }
 
 impl FpsTracker {
@@ -102,7 +110,8 @@ impl FpsTracker {
             bytes_received: 0,
             last_bitrate_update: now,
             current_bitrate: 0.0,
-            frames_dropped: 0,
+            decode_errors_count: 0,
+            decode_errors_per_sec: 0.0,
         }
     }
 
@@ -125,6 +134,10 @@ impl FpsTracker {
             let bits = (self.bytes_received * 8) as f64;
             self.current_bitrate = (bits / elapsed_ms) * 1000.0 / 1000.0; // Convert to kbits/sec
 
+            // Calculate decode errors per second
+            self.decode_errors_per_sec = (self.decode_errors_count as f64 * 1000.0) / elapsed_ms;
+            self.decode_errors_count = 0;
+
             // Reset counters
             self.bytes_received = 0;
             self.last_fps_update = now;
@@ -132,6 +145,10 @@ impl FpsTracker {
         }
 
         (self.fps, self.current_bitrate)
+    }
+
+    fn track_decode_error(&mut self) {
+        self.decode_errors_count += 1;
     }
 
     // Check if no frames have been received for a while and reset FPS if needed
@@ -197,7 +214,6 @@ impl std::fmt::Debug for JsTimer {
 pub struct DiagnosticManager {
     sender: Sender<DiagnosticEvent>,
     frames_decoded: Arc<AtomicU32>,
-    frames_dropped: Arc<AtomicU32>,
     report_interval_ms: u64,
     timer: Option<Rc<JsTimer>>,
 }
@@ -221,7 +237,6 @@ impl std::fmt::Debug for DiagnosticManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiagnosticManager")
             .field("frames_decoded", &self.frames_decoded)
-            .field("frames_dropped", &self.frames_dropped)
             .field("report_interval_ms", &self.report_interval_ms)
             .finish()
     }
@@ -247,7 +262,6 @@ impl DiagnosticManager {
         let mut manager = Self {
             sender: sender.clone(),
             frames_decoded: Arc::new(AtomicU32::new(0)),
-            frames_dropped: Arc::new(AtomicU32::new(0)),
             report_interval_ms: 500,
             timer: None,
         };
@@ -323,7 +337,7 @@ impl DiagnosticManager {
 
     // Track a frame received from a peer for a specific media type
     pub fn track_frame(&self, peer_id: &str, media_type: MediaType, frame_size: u64) -> f64 {
-        self.frames_decoded.fetch_add(1, Ordering::SeqCst);
+        self.frames_decoded.fetch_add(1, Ordering::Relaxed);
 
         if let Err(e) = self
             .sender
@@ -344,19 +358,28 @@ impl DiagnosticManager {
         0.0
     }
 
-    // Increment the frames dropped counter
-    pub fn increment_frames_dropped(&self) {
-        self.frames_dropped.fetch_add(1, Ordering::SeqCst);
+    // Track a decode error for a specific peer (Phase 1 metric - windowed counter)
+    // Note: this counts codec/decode errors (keyframe miss, parse error, decoder reset),
+    // NOT CPU-pressure-driven throughput drops (which WebCodecs does not expose).
+    pub fn track_decode_error(&self, peer_id: &str, media_type: MediaType) {
+        // Send event to worker to increment the windowed counter for this peer
+        if let Err(e) = self.sender.clone().try_send(DiagnosticEvent::DecodeError {
+            peer_id: peer_id.to_string(),
+            media_type,
+        }) {
+            error!("Failed to track decode error: {e}");
+        }
     }
 
-    // Get the current frames decoded count
-    pub fn get_frames_decoded(&self) -> u32 {
-        self.frames_decoded.load(Ordering::SeqCst)
-    }
-
-    // Get the current frames dropped count
-    pub fn get_frames_dropped(&self) -> u32 {
-        self.frames_dropped.load(Ordering::SeqCst)
+    // Remove all tracking state for a departed peer.
+    // Must be called when a peer leaves to prevent stale FpsTracker entries from
+    // broadcasting stale DiagEvents indefinitely, which would defeat the freshness gate.
+    pub fn remove_peer(&self, peer_id: &str) {
+        if let Err(e) = self.sender.clone().try_send(DiagnosticEvent::RemovePeer {
+            peer_id: peer_id.to_string(),
+        }) {
+            error!("Failed to remove peer from diagnostics: {e}");
+        }
     }
 
     // Method to be implemented fully later
@@ -401,11 +424,26 @@ impl DiagnosticWorker {
 
                 tracker.track_frame_with_size(frame_size);
             }
+            DiagnosticEvent::DecodeError {
+                peer_id,
+                media_type,
+            } => {
+                let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
+
+                let tracker = peer_trackers
+                    .entry(media_type)
+                    .or_insert_with(|| FpsTracker::new(media_type));
+
+                tracker.track_decode_error();
+            }
             DiagnosticEvent::SetStatsCallback(callback) => {
                 self.on_stats_update = Some(callback);
             }
             DiagnosticEvent::SetReportingInterval(interval) => {
                 self.report_interval_ms = interval;
+            }
+            DiagnosticEvent::RemovePeer { peer_id } => {
+                self.fps_trackers.remove(&peer_id);
             }
             DiagnosticEvent::RequestStats => {
                 self.maybe_report_stats_to_ui();
@@ -440,15 +478,15 @@ impl DiagnosticWorker {
                     metrics: vec![
                         metric!("fps", tracker.fps),
                         metric!("bitrate_kbps", tracker.current_bitrate),
-                        metric!("frames_dropped", tracker.frames_dropped as u64),
+                        metric!("decode_errors_per_sec", tracker.decode_errors_per_sec),
                         metric!("media_type", format!("{:?}", media_type)),
                         metric!("from_peer", self.userid.clone()),
                         metric!("to_peer", peer_id.clone()),
                     ],
                 };
                 debug!(
-                    "Broadcasting decoder event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps",
-                    peer_id, media_type, tracker.fps, tracker.current_bitrate
+                    "Broadcasting decoder event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps, DecodeErrors={:.1}/s",
+                    peer_id, media_type, tracker.fps, tracker.current_bitrate, tracker.decode_errors_per_sec
                 );
                 let _ = global_sender().try_broadcast(event);
 
@@ -460,7 +498,7 @@ impl DiagnosticWorker {
                     metrics: vec![
                         metric!("fps_received", tracker.fps),
                         metric!("bitrate_kbps", tracker.current_bitrate),
-                        metric!("frames_dropped", tracker.frames_dropped as u64),
+                        metric!("decode_errors_per_sec", tracker.decode_errors_per_sec),
                         metric!("from_peer", self.userid.clone()),
                         metric!("to_peer", peer_id.clone()),
                     ],
