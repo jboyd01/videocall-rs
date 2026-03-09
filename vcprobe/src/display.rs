@@ -226,7 +226,7 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
             let jitter = stats
                 .neteq_stats
                 .as_ref()
-                .map(|n| n.current_buffer_size_ms)
+                .map(|n| n.target_delay_ms)
                 .unwrap_or(0.0);
             let fps = stats
                 .video_stats
@@ -238,24 +238,21 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
                 .as_ref()
                 .map(|v| v.bitrate_kbps)
                 .unwrap_or(0);
-            let listen = if stats.can_listen { "🔊" } else { "🔇" };
-            let see = if stats.can_see { "📹" } else { "  " };
-
             // Phase 1 metrics: audio packet loss and frames dropped
             let audio_loss = if stats.audio_packet_loss_pct > 0.01 {
                 format!(" loss={:.1}%", stats.audio_packet_loss_pct)
             } else {
                 String::new()
             };
-            let dropped = if stats.frames_dropped > 0 {
-                format!(" drop={}", stats.frames_dropped)
+            let dropped = if stats.decode_errors_per_sec > 0.01 {
+                format!(" decerr={:.1}/s", stats.decode_errors_per_sec)
             } else {
                 String::new()
             };
 
             println!(
-                "                      ├─ {:<16} {} {} jitter={:.0}ms fps={:.0} {}kbps{}{}",
-                peer_id, listen, see, jitter, fps, kbps, audio_loss, dropped
+                "                      ├─ {:<16} jitter={:.0}ms fps={:.0} {}kbps{}{}",
+                peer_id, jitter, fps, kbps, audio_loss, dropped
             );
         }
     } else {

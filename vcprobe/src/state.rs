@@ -19,8 +19,11 @@ const PRUNE_THRESHOLD: Duration = Duration::from_secs(10);
 /// Populated from HEALTH packets. May be absent if no health data received yet.
 #[derive(Debug, Clone)]
 pub struct QualitySnapshot {
-    /// Audio jitter buffer depth (ms) — lower is better
-    pub jitter_ms: f64,
+    /// Audio jitter buffer current depth (ms) — how much audio is queued right now
+    pub buf_depth_ms: f64,
+    /// Delay manager target delay (ms) — the algorithm's estimate of network jitter.
+    /// This is the real VoIP jitter metric: <30ms excellent, <75ms acceptable, >=75ms poor.
+    pub target_delay_ms: f64,
     /// Audio concealment rate (expand_per_sec) — the key quality signal.
     /// 0 = perfect, >5 = degraded, >10 = poor
     pub conceal_per_sec: f64,
@@ -28,10 +31,18 @@ pub struct QualitySnapshot {
     pub fps: f64,
     /// Video bitrate as observed by a peer (kbps)
     pub bitrate_kbps: u64,
-    /// Whether the observer can see this participant's video
-    pub can_see: bool,
-    /// Whether the observer can hear this participant's audio
-    pub can_listen: bool,
+    /// Video frames dropped per second (windowed rate)
+    pub decode_errors_per_sec: f64,
+    /// Audio packet loss percentage (0.0-100.0)
+    pub audio_packet_loss_pct: f64,
+    /// Audio packets received per second (from NetEQ). Near 0 = speaker is silent (DTX).
+    pub audio_packets_per_sec: f64,
+    /// Average decode latency in ms (optional)
+    pub avg_decode_latency_ms: Option<f64>,
+    /// Client-computed quality scores (0-100, absent when stream inactive)
+    pub audio_quality_score: Option<f64>,
+    pub video_quality_score: Option<f64>,
+    pub call_quality_score: Option<f64>,
     pub updated_at: Instant,
 }
 
@@ -45,6 +56,20 @@ pub struct Participant {
     pub rtt_ms: Option<f64>,
     /// Latest quality snapshot from any peer observing this participant
     pub quality: Option<QualitySnapshot>,
+    /// Tab visibility state
+    pub is_tab_visible: bool,
+    /// Memory used in bytes (Chrome only)
+    pub memory_used_bytes: Option<u64>,
+    /// Average encode latency in ms
+    pub avg_encode_latency_ms: Option<f64>,
+    /// Browser tab throttling state
+    pub is_tab_throttled: bool,
+    /// Bytes queued in send buffer
+    pub send_queue_bytes: Option<u64>,
+    /// Inbound packet rate (packets/sec)
+    pub packets_received_per_sec: Option<f64>,
+    /// Outbound packet rate (packets/sec)
+    pub packets_sent_per_sec: Option<f64>,
     pub _joined_at: Instant,
 }
 
@@ -57,6 +82,13 @@ impl Participant {
             last_heartbeat: Instant::now(),
             rtt_ms: None,
             quality: None,
+            is_tab_visible: true,
+            memory_used_bytes: None,
+            avg_encode_latency_ms: None,
+            is_tab_throttled: false,
+            send_queue_bytes: None,
+            packets_received_per_sec: None,
+            packets_sent_per_sec: None,
             _joined_at: Instant::now(),
         }
     }
@@ -74,7 +106,12 @@ impl Participant {
             // 0.0 = perfect, 1.0 = terrible
             // Weighted: concealment is the most important signal
             let conceal_score = (q.conceal_per_sec / 10.0).min(1.0);
-            let jitter_score = (q.jitter_ms / 500.0).min(1.0);
+            // Only score jitter when audio is actually flowing; default to 0 (no penalty)
+            let jitter_score = if q.audio_packets_per_sec >= 2.0 {
+                (q.target_delay_ms / 150.0).min(1.0)
+            } else {
+                0.0
+            };
             let rtt_score = self
                 .rtt_ms
                 .map(|r| (r / 300.0).min(1.0))
@@ -177,9 +214,16 @@ impl MeetingState {
             return;
         }
 
-        // Update reporter's own RTT and mark as active
+        // Update reporter's own metrics and mark as active
         if let Some(p) = self.participants.get_mut(&health.reporting_peer) {
             p.rtt_ms = Some(health.active_server_rtt_ms);
+            p.is_tab_visible = health.is_tab_visible;
+            p.memory_used_bytes = health.memory_used_bytes;
+            p.avg_encode_latency_ms = health.avg_encode_latency_ms;
+            p.is_tab_throttled = health.is_tab_throttled;
+            p.send_queue_bytes = health.send_queue_bytes;
+            p.packets_received_per_sec = health.packets_received_per_sec;
+            p.packets_sent_per_sec = health.packets_sent_per_sec;
             p.last_heartbeat = Instant::now(); // HEALTH packets also indicate activity
         }
 
@@ -197,10 +241,16 @@ impl MeetingState {
             };
 
             if let Some(p) = self.participants.get_mut(&email) {
-                let jitter_ms = peer_stats
+                let buf_depth_ms = peer_stats
                     .neteq_stats
                     .as_ref()
                     .map(|n| n.current_buffer_size_ms)
+                    .unwrap_or(0.0);
+
+                let target_delay_ms = peer_stats
+                    .neteq_stats
+                    .as_ref()
+                    .map(|n| n.target_delay_ms)
                     .unwrap_or(0.0);
 
                 let conceal_per_sec = peer_stats
@@ -223,13 +273,25 @@ impl MeetingState {
                     .map(|v| v.bitrate_kbps)
                     .unwrap_or(0);
 
+                let audio_packets_per_sec = peer_stats
+                    .neteq_stats
+                    .as_ref()
+                    .map(|n| n.packets_per_sec)
+                    .unwrap_or(0.0);
+
                 p.quality = Some(QualitySnapshot {
-                    jitter_ms,
+                    buf_depth_ms,
+                    target_delay_ms,
                     conceal_per_sec,
                     fps,
                     bitrate_kbps,
-                    can_see: peer_stats.can_see,
-                    can_listen: peer_stats.can_listen,
+                    decode_errors_per_sec: peer_stats.decode_errors_per_sec,
+                    audio_packet_loss_pct: peer_stats.audio_packet_loss_pct,
+                    audio_packets_per_sec,
+                    avg_decode_latency_ms: peer_stats.avg_decode_latency_ms,
+                    audio_quality_score: peer_stats.audio_quality_score,
+                    video_quality_score: peer_stats.video_quality_score,
+                    call_quality_score: peer_stats.call_quality_score,
                     updated_at: Instant::now(),
                 });
             }
@@ -256,7 +318,7 @@ impl MeetingState {
             when: Local::now(),
             msg,
         });
-        if self.events.len() > 50 {
+        if self.events.len() > 500 {
             self.events.remove(0);
         }
     }
@@ -266,12 +328,25 @@ impl MeetingState {
         let mut v: Vec<&Participant> = self.participants.values().collect();
 
         if by_quality {
-            // Sort by quality (worst-first), then by email
+            // Sort worst-first by call_quality_score (0-100, higher = better → invert for sort).
+            // Fall back to the locally-computed quality_score() (0.0-1.0, higher = worse) when
+            // no HEALTH packets have arrived yet for a participant.
             v.sort_by(|a, b| {
-                let score_a = a.quality_score().unwrap_or(0.0);
-                let score_b = b.quality_score().unwrap_or(0.0);
+                // Normalise both to 0.0-1.0 where 1.0 = worst, for a uniform comparison key.
+                let score_a = a.quality
+                    .as_ref()
+                    .and_then(|q| q.call_quality_score)
+                    .map(|s| 1.0 - s / 100.0)           // invert: 100→0.0, 0→1.0
+                    .or_else(|| a.quality_score())       // fallback: already 0.0=good,1.0=bad
+                    .unwrap_or(0.0);                     // no data → treat as perfect (float to bottom)
+                let score_b = b.quality
+                    .as_ref()
+                    .and_then(|q| q.call_quality_score)
+                    .map(|s| 1.0 - s / 100.0)
+                    .or_else(|| b.quality_score())
+                    .unwrap_or(0.0);
 
-                // Higher score = worse quality, so reverse for worst-first
+                // Higher score = worse → sort descending (worst at top)
                 match score_b.partial_cmp(&score_a) {
                     Some(std::cmp::Ordering::Equal) | None => a.email.cmp(&b.email),
                     Some(ord) => ord,
