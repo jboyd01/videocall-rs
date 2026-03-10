@@ -137,6 +137,8 @@ pub struct MeetingState {
     pub started_at: Instant,
     pub participants: HashMap<String, Participant>,
     pub events: Vec<Event>,
+    /// Stores display_name for sessions whose PARTICIPANT_JOINED arrived before MEDIA/HEALTH.
+    pending_display_names: HashMap<String, String>,
 }
 
 impl MeetingState {
@@ -146,6 +148,7 @@ impl MeetingState {
             started_at: Instant::now(),
             participants: HashMap::new(),
             events: Vec::new(),
+            pending_display_names: HashMap::new(),
         }
     }
 
@@ -192,6 +195,11 @@ impl MeetingState {
             .entry(session_id.clone())
             .or_insert_with(|| Participant::new(user_id.clone(), session_id.clone()));
         p.last_heartbeat = Instant::now();
+        if p.display_name.is_none() {
+            if let Some(dn) = self.pending_display_names.get(&session_id) {
+                p.display_name = Some(dn.clone());
+            }
+        }
 
         if media
             .media_type
@@ -231,6 +239,11 @@ impl MeetingState {
             .participants
             .entry(session_id.clone())
             .or_insert_with(|| Participant::new(reporting_user.clone(), session_id.clone()));
+        if p.display_name.is_none() {
+            if let Some(dn) = self.pending_display_names.get(&session_id) {
+                p.display_name = Some(dn.clone());
+            }
+        }
         p.rtt_ms = Some(health.active_server_rtt_ms);
         p.is_tab_visible = health.is_tab_visible;
         p.memory_used_bytes = health.memory_used_bytes;
@@ -324,6 +337,10 @@ impl MeetingState {
 
         let session_id = meeting.session_id.to_string();
         let display_name = user_id_bytes_to_string(&meeting.display_name);
+
+        // Always store so MEDIA/HEALTH upserts can apply it even if they arrive later.
+        self.pending_display_names
+            .insert(session_id.clone(), display_name.clone());
 
         if let Some(p) = self.participants.get_mut(&session_id) {
             if p.display_name.is_none() {
