@@ -513,7 +513,7 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
     };
 
     // Truncate email to fit
-    let display_name = truncate(&p.email, 20);
+    let display_name = truncate(&p.user_id, 20);
 
     Row::new(vec![
         Cell::from(display_name).style(name_style),
@@ -590,7 +590,7 @@ fn render_detail(
         None => return,
     };
 
-    let title = format!(" Detail: {} ", p.email);
+    let title = format!(" Detail: {} ", p.user_id);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue))

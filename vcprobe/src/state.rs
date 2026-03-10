@@ -49,7 +49,7 @@ pub struct QualitySnapshot {
 
 #[derive(Debug)]
 pub struct Participant {
-    pub email: String,
+    pub user_id: String,
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub last_heartbeat: Instant,
@@ -75,9 +75,9 @@ pub struct Participant {
 }
 
 impl Participant {
-    fn new(email: String) -> Self {
+    fn new(user_id: String) -> Self {
         Self {
-            email,
+            user_id,
             video_enabled: false,
             audio_enabled: false,
             last_heartbeat: Instant::now(),
@@ -131,8 +131,9 @@ pub struct MeetingState {
     pub started_at: Instant,
     pub participants: HashMap<String, Participant>,
     pub events: Vec<Event>,
-    /// Maps session IDs (numbers as strings) to email addresses
-    /// Built from MEDIA packets to resolve HEALTH packet peer_stats keys
+    /// Maps numeric session_id strings → user_id strings.
+    /// Built from MEDIA/PacketWrapper (session_id, user_id) pairs.
+    /// Required because HealthPacket.peer_stats keys are always numeric session_id strings.
     session_to_email: HashMap<String, String>,
 }
 
@@ -170,28 +171,26 @@ impl MeetingState {
             Err(_) => return,
         };
 
-        // user_id is in the MediaPacket; fall back to PacketWrapper user_id
-        let email = if !media.user_id.is_empty() {
-            user_id_bytes_to_string(&media.user_id)
-        } else if !pkt.user_id.is_empty() {
-            user_id_bytes_to_string(&pkt.user_id)
-        } else {
+        // MediaPacket.user_id is always populated since PR #724 (renamed from email).
+        if media.user_id.is_empty() {
+            log::debug!("process_media: MediaPacket has empty user_id, skipping");
             return;
-        };
+        }
+        let user_id = user_id_bytes_to_string(&media.user_id);
 
-        // Track session_id → email mapping for HEALTH packet resolution
+        // Track session_id → user_id mapping for HEALTH packet resolution
         if pkt.session_id > 0 {
             let session_key = pkt.session_id.to_string();
-            self.session_to_email.insert(session_key, email.clone());
+            self.session_to_email.insert(session_key, user_id.clone());
         }
 
         // Update last_heartbeat on ANY packet type for fast drop detection
         // At ~70 packets/sec combined (AUDIO+VIDEO), this enables ~1-2sec detection
-        let is_new = !self.participants.contains_key(&email);
+        let is_new = !self.participants.contains_key(&user_id);
         let p = self
             .participants
-            .entry(email.clone())
-            .or_insert_with(|| Participant::new(email.clone()));
+            .entry(user_id.clone())
+            .or_insert_with(|| Participant::new(user_id.clone()));
         p.last_heartbeat = Instant::now();
 
         // Process type-specific metadata
@@ -206,7 +205,7 @@ impl MeetingState {
                 p.audio_enabled = hb.audio_enabled;
             }
             if is_new {
-                self.push_event(format!("{} joined", email));
+                self.push_event(format!("{} joined", user_id));
             }
         }
     }
@@ -237,18 +236,17 @@ impl MeetingState {
 
         // Update quality for each peer the reporter is observing
         for (peer_id, peer_stats) in &health.peer_stats {
-            // peer_id might be an email or a session_id (numeric string)
-            // Try direct lookup first, then session_to_email mapping
-            let email = if self.participants.contains_key(peer_id) {
-                peer_id.clone()
-            } else if let Some(resolved) = self.session_to_email.get(peer_id) {
-                resolved.clone()
-            } else {
-                // Unknown peer - skip
-                continue;
+            // peer_stats keys are always numeric session_id strings (stamped by health_reporter.rs
+            // using sid_str). Resolve to user_id via the session_to_email map built from MEDIA packets.
+            let peer_user_id = match self.session_to_email.get(peer_id) {
+                Some(uid) => uid.clone(),
+                None => {
+                    log::debug!("process_health: no session mapping for peer_id={}", peer_id);
+                    continue;
+                }
             };
 
-            if let Some(p) = self.participants.get_mut(&email) {
+            if let Some(p) = self.participants.get_mut(&peer_user_id) {
                 let buf_depth_ms = peer_stats
                     .neteq_stats
                     .as_ref()
@@ -312,12 +310,12 @@ impl MeetingState {
             .participants
             .values()
             .filter(|p| p.should_prune())
-            .map(|p| p.email.clone())
+            .map(|p| p.user_id.clone())
             .collect();
 
-        for email in stale {
-            self.participants.remove(&email);
-            self.push_event(format!("{} left", email));
+        for uid in stale {
+            self.participants.remove(&uid);
+            self.push_event(format!("{} left", uid));
         }
     }
 
@@ -358,13 +356,13 @@ impl MeetingState {
 
                 // Higher score = worse → sort descending (worst at top)
                 match score_b.partial_cmp(&score_a) {
-                    Some(std::cmp::Ordering::Equal) | None => a.email.cmp(&b.email),
+                    Some(std::cmp::Ordering::Equal) | None => a.user_id.cmp(&b.user_id),
                     Some(ord) => ord,
                 }
             });
         } else {
             // Alphabetical by email
-            v.sort_by(|a, b| a.email.cmp(&b.email));
+            v.sort_by(|a, b| a.user_id.cmp(&b.user_id));
         }
 
         v
