@@ -128,6 +128,13 @@ impl HealthReporter {
         self.meeting_id = meeting_id;
     }
 
+    /// Update the session_id to the server-assigned value received via SESSION_ASSIGNED.
+    /// Must be called when SESSION_ASSIGNED arrives so health packets carry the correct
+    /// session_id that matches the PacketWrapper.session_id used for room traffic.
+    pub fn set_session_id(&mut self, session_id: String) {
+        self.session_id = session_id;
+    }
+
     /// Update sender self-state: audio enabled (authoritative)
     pub fn set_reporting_audio_enabled(&self, enabled: bool) {
         if let Ok(mut ae) = self.reporting_audio_enabled.try_borrow_mut() {

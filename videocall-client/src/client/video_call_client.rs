@@ -993,6 +993,14 @@ impl Inner {
                         }
                     }
                 }
+
+                // Update health reporter with the server-assigned session_id so that
+                // HealthPacket.session_id matches PacketWrapper.session_id for room traffic.
+                if let Some(hr) = &self.health_reporter {
+                    if let Ok(mut reporter) = hr.try_borrow_mut() {
+                        reporter.set_session_id(response.session_id.to_string());
+                    }
+                }
             }
             Ok(PacketType::MEETING) => match MeetingPacket::parse_from_bytes(&response.data) {
                 Ok(meeting_packet) => {
