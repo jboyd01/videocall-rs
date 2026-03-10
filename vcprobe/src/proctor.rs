@@ -394,7 +394,7 @@ fn render_participants(
     let table = Table::new(
         rows,
         [
-            Constraint::Min(18),    // name
+            Constraint::Min(52),    // name (display | user_id | s:XXXX)
             Constraint::Length(11), // [V][M]
             Constraint::Length(8),  // RTT
             Constraint::Length(8),  // concealment/s
@@ -512,11 +512,18 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
         Style::default().fg(name_color)
     };
 
-    // Truncate email to fit
-    let display_name = truncate(&p.user_id, 20);
+    // Display: display_name (or user_id fallback) | user_id | s:last4
+    let dn = p.display_name.as_deref().unwrap_or(&p.user_id);
+    let last4 = &p.session_id[p.session_id.len().saturating_sub(4)..];
+    let name_col = format!(
+        "{:<20} | {:<20} | s:{}",
+        truncate(dn, 20),
+        truncate(&p.user_id, 20),
+        last4
+    );
 
     Row::new(vec![
-        Cell::from(display_name).style(name_style),
+        Cell::from(name_col).style(name_style),
         Cell::from(status_line),
         Cell::from(rtt_str).style(Style::default().fg(rtt_color)),
         Cell::from(conceal_str).style(Style::default().fg(conceal_color)),
@@ -590,7 +597,12 @@ fn render_detail(
         None => return,
     };
 
-    let title = format!(" Detail: {} ", p.user_id);
+    let title = format!(
+        " Detail: {} | {} | s:{} ",
+        p.display_name.as_deref().unwrap_or(&p.user_id),
+        p.user_id,
+        p.session_id
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue))

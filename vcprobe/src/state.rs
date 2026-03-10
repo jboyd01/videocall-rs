@@ -6,6 +6,8 @@ use protobuf::Message;
 use videocall_types::protos::health_packet::HealthPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::user_id_bytes_to_string;
@@ -50,6 +52,8 @@ pub struct QualitySnapshot {
 #[derive(Debug)]
 pub struct Participant {
     pub user_id: String,
+    pub session_id: String,
+    pub display_name: Option<String>,
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub last_heartbeat: Instant,
@@ -75,9 +79,11 @@ pub struct Participant {
 }
 
 impl Participant {
-    fn new(user_id: String) -> Self {
+    fn new(user_id: String, session_id: String) -> Self {
         Self {
             user_id,
+            session_id,
+            display_name: None,
             video_enabled: false,
             audio_enabled: false,
             last_heartbeat: Instant::now(),
@@ -131,10 +137,6 @@ pub struct MeetingState {
     pub started_at: Instant,
     pub participants: HashMap<String, Participant>,
     pub events: Vec<Event>,
-    /// Maps numeric session_id strings → user_id strings.
-    /// Built from MEDIA/PacketWrapper (session_id, user_id) pairs.
-    /// Required because HealthPacket.peer_stats keys are always numeric session_id strings.
-    session_to_email: HashMap<String, String>,
 }
 
 impl MeetingState {
@@ -144,7 +146,6 @@ impl MeetingState {
             started_at: Instant::now(),
             participants: HashMap::new(),
             events: Vec::new(),
-            session_to_email: HashMap::new(),
         }
     }
 
@@ -161,6 +162,7 @@ impl MeetingState {
         {
             PacketType::MEDIA => self.process_media(&pkt),
             PacketType::HEALTH => self.process_health(&pkt),
+            PacketType::MEETING => self.process_meeting(&pkt),
             _ => {}
         }
     }
@@ -171,29 +173,26 @@ impl MeetingState {
             Err(_) => return,
         };
 
-        // MediaPacket.user_id is always populated since PR #724 (renamed from email).
         if media.user_id.is_empty() {
             log::debug!("process_media: MediaPacket has empty user_id, skipping");
             return;
         }
         let user_id = user_id_bytes_to_string(&media.user_id);
 
-        // Track session_id → user_id mapping for HEALTH packet resolution
-        if pkt.session_id > 0 {
-            let session_key = pkt.session_id.to_string();
-            self.session_to_email.insert(session_key, user_id.clone());
+        // Use session_id as the unique key per browser tab
+        if pkt.session_id == 0 {
+            log::debug!("process_media: PacketWrapper has session_id=0, skipping");
+            return;
         }
+        let session_id = pkt.session_id.to_string();
 
-        // Update last_heartbeat on ANY packet type for fast drop detection
-        // At ~70 packets/sec combined (AUDIO+VIDEO), this enables ~1-2sec detection
-        let is_new = !self.participants.contains_key(&user_id);
+        let is_new = !self.participants.contains_key(&session_id);
         let p = self
             .participants
-            .entry(user_id.clone())
-            .or_insert_with(|| Participant::new(user_id.clone()));
+            .entry(session_id.clone())
+            .or_insert_with(|| Participant::new(user_id.clone(), session_id.clone()));
         p.last_heartbeat = Instant::now();
 
-        // Process type-specific metadata
         if media
             .media_type
             .enum_value()
@@ -205,7 +204,11 @@ impl MeetingState {
                 p.audio_enabled = hb.audio_enabled;
             }
             if is_new {
-                self.push_event(format!("{} joined", user_id));
+                self.push_event(format!(
+                    "{} joined (s:{})",
+                    user_id,
+                    &session_id[session_id.len().saturating_sub(4)..]
+                ));
             }
         }
     }
@@ -216,25 +219,18 @@ impl MeetingState {
             Err(_) => return,
         };
 
-        if health.reporting_user_id.is_empty() {
+        if health.reporting_user_id.is_empty() || health.session_id.is_empty() {
             return;
         }
         let reporting_user = user_id_bytes_to_string(&health.reporting_user_id);
+        let session_id = health.session_id.clone();
 
-        // Seed session_to_email from the HEALTH packet's own session_id.
-        // This handles listen-only participants and cases where HEALTH arrives before MEDIA.
-        if !health.session_id.is_empty() {
-            self.session_to_email
-                .entry(health.session_id.clone())
-                .or_insert_with(|| reporting_user.clone());
-        }
-
-        // Upsert the reporter — create if not yet seen (e.g. listen-only, or HEALTH before MEDIA).
-        let is_new = !self.participants.contains_key(&reporting_user);
+        // Upsert reporter — create if not yet seen (listen-only, or HEALTH arrived before MEDIA)
+        let is_new = !self.participants.contains_key(&session_id);
         let p = self
             .participants
-            .entry(reporting_user.clone())
-            .or_insert_with(|| Participant::new(reporting_user.clone()));
+            .entry(session_id.clone())
+            .or_insert_with(|| Participant::new(reporting_user.clone(), session_id.clone()));
         p.rtt_ms = Some(health.active_server_rtt_ms);
         p.is_tab_visible = health.is_tab_visible;
         p.memory_used_bytes = health.memory_used_bytes;
@@ -245,22 +241,16 @@ impl MeetingState {
         p.packets_sent_per_sec = health.packets_sent_per_sec;
         p.last_heartbeat = Instant::now();
         if is_new {
-            self.push_event(format!("{} joined (health-only)", reporting_user));
+            self.push_event(format!(
+                "{} joined (s:{})",
+                reporting_user,
+                &session_id[session_id.len().saturating_sub(4)..]
+            ));
         }
 
-        // Update quality for each peer the reporter is observing
+        // peer_stats keys ARE session_id strings — direct lookup, no mapping needed
         for (peer_id, peer_stats) in &health.peer_stats {
-            // peer_stats keys are always numeric session_id strings (stamped by health_reporter.rs
-            // using sid_str). Resolve to user_id via the session_to_email map built from MEDIA packets.
-            let peer_user_id = match self.session_to_email.get(peer_id) {
-                Some(uid) => uid.clone(),
-                None => {
-                    log::debug!("process_health: no session mapping for peer_id={}", peer_id);
-                    continue;
-                }
-            };
-
-            if let Some(p) = self.participants.get_mut(&peer_user_id) {
+            if let Some(p) = self.participants.get_mut(peer_id) {
                 let buf_depth_ms = peer_stats
                     .neteq_stats
                     .as_ref()
@@ -318,18 +308,46 @@ impl MeetingState {
         }
     }
 
+    fn process_meeting(&mut self, pkt: &PacketWrapper) {
+        let meeting = match MeetingPacket::parse_from_bytes(&pkt.data) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        if meeting.event_type.enum_value_or_default() != MeetingEventType::PARTICIPANT_JOINED {
+            return;
+        }
+
+        if meeting.session_id == 0 || meeting.display_name.is_empty() {
+            return;
+        }
+
+        let session_id = meeting.session_id.to_string();
+        let display_name = user_id_bytes_to_string(&meeting.display_name);
+
+        if let Some(p) = self.participants.get_mut(&session_id) {
+            if p.display_name.is_none() {
+                p.display_name = Some(display_name);
+            }
+        }
+    }
+
     /// Called every second: prune participants that have been silent too long.
     pub fn tick(&mut self) {
-        let stale: Vec<String> = self
+        let stale: Vec<(String, String)> = self
             .participants
             .values()
             .filter(|p| p.should_prune())
-            .map(|p| p.user_id.clone())
+            .map(|p| (p.session_id.clone(), p.user_id.clone()))
             .collect();
 
-        for uid in stale {
-            self.participants.remove(&uid);
-            self.push_event(format!("{} left", uid));
+        for (sid, uid) in stale {
+            self.participants.remove(&sid);
+            self.push_event(format!(
+                "{} left (s:{})",
+                uid,
+                &sid[sid.len().saturating_sub(4)..]
+            ));
         }
     }
 
@@ -370,13 +388,20 @@ impl MeetingState {
 
                 // Higher score = worse → sort descending (worst at top)
                 match score_b.partial_cmp(&score_a) {
-                    Some(std::cmp::Ordering::Equal) | None => a.user_id.cmp(&b.user_id),
+                    Some(std::cmp::Ordering::Equal) | None => a
+                        .user_id
+                        .cmp(&b.user_id)
+                        .then(a.session_id.cmp(&b.session_id)),
                     Some(ord) => ord,
                 }
             });
         } else {
-            // Alphabetical by email
-            v.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+            // Alphabetical by user_id, then session_id for same-user tabs
+            v.sort_by(|a, b| {
+                a.user_id
+                    .cmp(&b.user_id)
+                    .then(a.session_id.cmp(&b.session_id))
+            });
         }
 
         v
