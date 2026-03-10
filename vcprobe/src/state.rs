@@ -221,17 +221,31 @@ impl MeetingState {
         }
         let reporting_user = user_id_bytes_to_string(&health.reporting_user_id);
 
-        // Update reporter's own metrics and mark as active
-        if let Some(p) = self.participants.get_mut(&reporting_user) {
-            p.rtt_ms = Some(health.active_server_rtt_ms);
-            p.is_tab_visible = health.is_tab_visible;
-            p.memory_used_bytes = health.memory_used_bytes;
-            p.avg_encode_latency_ms = health.avg_encode_latency_ms;
-            p.is_tab_throttled = health.is_tab_throttled;
-            p.send_queue_bytes = health.send_queue_bytes;
-            p.packets_received_per_sec = health.packets_received_per_sec;
-            p.packets_sent_per_sec = health.packets_sent_per_sec;
-            p.last_heartbeat = Instant::now(); // HEALTH packets also indicate activity
+        // Seed session_to_email from the HEALTH packet's own session_id.
+        // This handles listen-only participants and cases where HEALTH arrives before MEDIA.
+        if !health.session_id.is_empty() {
+            self.session_to_email
+                .entry(health.session_id.clone())
+                .or_insert_with(|| reporting_user.clone());
+        }
+
+        // Upsert the reporter — create if not yet seen (e.g. listen-only, or HEALTH before MEDIA).
+        let is_new = !self.participants.contains_key(&reporting_user);
+        let p = self
+            .participants
+            .entry(reporting_user.clone())
+            .or_insert_with(|| Participant::new(reporting_user.clone()));
+        p.rtt_ms = Some(health.active_server_rtt_ms);
+        p.is_tab_visible = health.is_tab_visible;
+        p.memory_used_bytes = health.memory_used_bytes;
+        p.avg_encode_latency_ms = health.avg_encode_latency_ms;
+        p.is_tab_throttled = health.is_tab_throttled;
+        p.send_queue_bytes = health.send_queue_bytes;
+        p.packets_received_per_sec = health.packets_received_per_sec;
+        p.packets_sent_per_sec = health.packets_sent_per_sec;
+        p.last_heartbeat = Instant::now();
+        if is_new {
+            self.push_event(format!("{} joined (health-only)", reporting_user));
         }
 
         // Update quality for each peer the reporter is observing
