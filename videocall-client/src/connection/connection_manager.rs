@@ -545,6 +545,17 @@ impl ConnectionManager {
                         if let Some(connection) = self.connections.get(&connection_id) {
                             connection.set_session_id(sid);
                         }
+
+                        // Emit a synthetic SESSION_ASSIGNED packet so that the
+                        // VideoCallClient (and HealthReporter) learn the real
+                        // session_id.  The normal path (line 317) only fires
+                        // when SESSION_ASSIGNED arrives *after* election; in the
+                        // common case the packet arrives during RTT-testing and is
+                        // buffered here, so we must re-emit it now.
+                        let mut session_pkt = PacketWrapper::new();
+                        session_pkt.packet_type = PacketType::SESSION_ASSIGNED.into();
+                        session_pkt.session_id = sid;
+                        self.options.on_inbound_media.emit(session_pkt);
                     }
                 }
                 self.pending_session_ids.borrow_mut().clear();
