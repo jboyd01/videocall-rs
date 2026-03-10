@@ -89,5 +89,9 @@ message HealthPacket {
   optional uint64 send_queue_bytes = 16; // Bytes queued in send buffer
   optional double packets_received_per_sec = 17; // Inbound packet rate
   optional double packets_sent_per_sec = 18; // Outbound packet rate
+  // Display name as entered by the user in the UI (e.g. "Jay at work").
+  // Included in every health packet so observers (vcprobe, metrics_server)
+  // can learn display names without depending on one-shot PARTICIPANT_JOINED events.
+  optional string display_name = 19;
 }
 

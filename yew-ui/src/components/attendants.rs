@@ -306,6 +306,7 @@ impl AttendantsComponent {
                 .user_id
                 .clone()
                 .unwrap_or_else(|| display_name.clone()),
+            display_name: display_name.clone(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,

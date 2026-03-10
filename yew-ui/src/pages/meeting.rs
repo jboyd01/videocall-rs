@@ -183,6 +183,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
 
                 let opts = VideoCallClientOptions {
                     user_id: user_id_value,
+                    display_name: display_name.clone(),
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,

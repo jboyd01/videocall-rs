@@ -94,6 +94,7 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
 
                 let opts = VideoCallClientOptions {
                     user_id: user_id.clone(),
+                    display_name: String::new(),
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,

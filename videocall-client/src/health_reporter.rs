@@ -90,8 +90,9 @@ impl PeerHealthData {
 /// Health reporter that collects diagnostics and sends health packets
 #[derive(Debug)]
 pub struct HealthReporter {
-    session_id: String,
-    meeting_id: String, // Add meeting_id field
+    session_id: Rc<RefCell<String>>,
+    meeting_id: String,
+    display_name: String,
     reporting_peer: String,
     peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>>,
     send_packet_callback: Option<Callback<PacketWrapper>>,
@@ -108,8 +109,9 @@ impl HealthReporter {
     /// Create a new health reporter
     pub fn new(session_id: String, reporting_peer: String, health_interval_ms: u64) -> Self {
         Self {
-            session_id,
-            meeting_id: "".to_string(), // Will be set later
+            session_id: Rc::new(RefCell::new(session_id)),
+            meeting_id: String::new(),
+            display_name: String::new(),
             reporting_peer,
             peer_health_data: Rc::new(RefCell::new(HashMap::new())),
             send_packet_callback: None,
@@ -132,7 +134,12 @@ impl HealthReporter {
     /// Must be called when SESSION_ASSIGNED arrives so health packets carry the correct
     /// session_id that matches the PacketWrapper.session_id used for room traffic.
     pub fn set_session_id(&mut self, session_id: String) {
-        self.session_id = session_id;
+        *self.session_id.borrow_mut() = session_id;
+    }
+
+    /// Set the display name for health packet reporting
+    pub fn set_display_name(&mut self, display_name: String) {
+        self.display_name = display_name;
     }
 
     /// Update sender self-state: audio enabled (authoritative)
@@ -414,9 +421,10 @@ impl HealthReporter {
         }
 
         let peer_health_data = Rc::downgrade(&self.peer_health_data);
-        let session_id = self.session_id.clone();
+        let session_id = Rc::downgrade(&self.session_id);
         let meeting_id = self.meeting_id.clone();
         let reporting_peer = self.reporting_peer.clone();
+        let display_name = self.display_name.clone();
         let send_callback = self.send_packet_callback.clone().unwrap();
         let interval_ms = self.health_interval_ms;
         let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
@@ -432,6 +440,12 @@ impl HealthReporter {
             loop {
                 // Wait for the interval
                 gloo_timers::future::TimeoutFuture::new(interval_ms as u32).await;
+
+                // Upgrade session_id Weak ref; if the HealthReporter was dropped, stop.
+                let session_id_val = match Weak::upgrade(&session_id) {
+                    Some(s) => s.borrow().clone(),
+                    None => break,
+                };
 
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
                     if let Ok(health_map) = peer_health_data.try_borrow() {
@@ -472,9 +486,10 @@ impl HealthReporter {
                             };
 
                         let health_packet = Self::create_health_packet(
-                            &session_id,
+                            &session_id_val,
                             &meeting_id,
                             &reporting_peer,
+                            &display_name,
                             &health_map,
                             self_audio_enabled,
                             self_video_enabled,
@@ -488,7 +503,7 @@ impl HealthReporter {
 
                         if let Some(packet) = health_packet {
                             send_callback.emit(packet);
-                            debug!("Sent health packet for session: {session_id}");
+                            debug!("Sent health packet for session: {session_id_val}");
                         }
                     }
                 } else {
@@ -505,6 +520,7 @@ impl HealthReporter {
         session_id: &str,
         meeting_id: &str,
         reporting_peer: &str,
+        display_name: &str,
         health_map: &HashMap<String, PeerHealthData>,
         self_audio_enabled: bool,
         self_video_enabled: bool,
@@ -530,6 +546,9 @@ impl HealthReporter {
             .as_millis() as u64;
         pb.reporting_audio_enabled = self_audio_enabled;
         pb.reporting_video_enabled = self_video_enabled;
+        if !display_name.is_empty() {
+            pb.display_name = Some(display_name.to_string());
+        }
 
         // Include active connection info if available
         if let Some(url) = active_server_url {

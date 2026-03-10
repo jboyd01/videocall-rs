@@ -63,6 +63,7 @@ pub struct VideoCallClientOptions {
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
     pub user_id: String,
+    pub display_name: String,
     pub meeting_id: String,
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
@@ -219,6 +220,7 @@ impl VideoCallClient {
             );
 
             reporter.set_meeting_id(options.meeting_id.clone());
+            reporter.set_display_name(options.display_name.clone());
 
             if let Some(interval) = options.health_reporting_interval_ms {
                 reporter.set_health_interval(interval);

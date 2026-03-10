@@ -240,7 +240,11 @@ impl MeetingState {
             .entry(session_id.clone())
             .or_insert_with(|| Participant::new(reporting_user.clone(), session_id.clone()));
         if p.display_name.is_none() {
-            if let Some(dn) = self.pending_display_names.get(&session_id) {
+            // Prefer display_name carried in the health packet itself (field 19).
+            // Fall back to pending_display_names populated from PARTICIPANT_JOINED.
+            if let Some(dn) = health.display_name.as_deref().filter(|s| !s.is_empty()) {
+                p.display_name = Some(dn.to_string());
+            } else if let Some(dn) = self.pending_display_names.get(&session_id) {
                 p.display_name = Some(dn.clone());
             }
         }
