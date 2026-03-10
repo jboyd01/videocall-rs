@@ -702,8 +702,10 @@ impl HealthReporter {
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
                 // Extract decode_errors_per_sec (windowed rate) from video stats
-                if let Some(error_rate) = video.get("decode_errors_per_sec").and_then(|v| v.as_f64()) {
-                    ps.decode_errors_per_sec = error_rate;
+                if let Some(error_rate) =
+                    video.get("decode_errors_per_sec").and_then(|v| v.as_f64())
+                {
+                    ps.frames_dropped_per_sec = error_rate;
                 }
             }
 
@@ -712,13 +714,15 @@ impl HealthReporter {
             // not a misleading zero. audio_fresh/video_fresh computed above.
 
             // Audio quality (0-100): only meaningful when packets are flowing
-            let audio_packets_per_sec = ps.neteq_stats
+            let audio_packets_per_sec = ps
+                .neteq_stats
                 .as_ref()
                 .map(|n| n.packets_per_sec)
                 .unwrap_or(0.0);
 
             if audio_fresh && audio_packets_per_sec >= 2.0 {
-                let conceal = ps.neteq_stats
+                let conceal = ps
+                    .neteq_stats
                     .as_ref()
                     .and_then(|n| n.network.as_ref())
                     .and_then(|net| net.operation_counters.as_ref())
@@ -732,7 +736,7 @@ impl HealthReporter {
                 // signal. Concealment already captures the downstream effect of real
                 // jitter (late/lost packets → expand events → audible degradation).
                 let conceal_penalty = (conceal / 10.0).min(1.0) * 70.0;
-                let loss_penalty    = (loss / 5.0).min(1.0) * 30.0;
+                let loss_penalty = (loss / 5.0).min(1.0) * 30.0;
                 let score = (100.0 - conceal_penalty - loss_penalty).max(0.0);
                 ps.audio_quality_score = Some(score);
             }
@@ -741,9 +745,13 @@ impl HealthReporter {
             // fps > 0.0 already proves video is flowing; video_enabled (sender self-report
             // from peer_status events) is not required here and would suppress scores
             // if peer_status hasn't arrived yet.
-            let fps = ps.video_stats.as_ref().map(|v| v.fps_received).unwrap_or(0.0);
+            let fps = ps
+                .video_stats
+                .as_ref()
+                .map(|v| v.fps_received)
+                .unwrap_or(0.0);
             if video_fresh && fps > 0.0 {
-                let dropped = ps.decode_errors_per_sec;
+                let dropped = ps.frames_dropped_per_sec;
 
                 // FPS score: 0 fps→0, 10 fps→50, 20+ fps→100
                 let fps_score = if fps >= 20.0 {
@@ -762,9 +770,9 @@ impl HealthReporter {
             // Call quality: worst of whichever streams are active
             let call_score = match (ps.audio_quality_score, ps.video_quality_score) {
                 (Some(a), Some(v)) => Some(a.min(v)),
-                (Some(a), None)    => Some(a),
-                (None,    Some(v)) => Some(v),
-                (None,    None)    => None,
+                (Some(a), None) => Some(a),
+                (None, Some(v)) => Some(v),
+                (None, None) => None,
             };
             ps.call_quality_score = call_score;
 

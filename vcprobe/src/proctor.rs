@@ -46,11 +46,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    meeting_id: String,
-    use_utc: bool,
-) -> Result<()> {
+pub async fn run(mut rx: mpsc::Receiver<Vec<u8>>, meeting_id: String, use_utc: bool) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let result = run_inner(&mut terminal, &mut rx, meeting_id, use_utc).await;
     restore_terminal(&mut terminal)?;
@@ -246,18 +242,26 @@ fn render(
     let participants = state.sorted_participants(sort_by_quality);
 
     // Adaptive detail height: show it only when someone is selected
-    let detail_h = if table_state.selected().is_some() { 7u16 } else { 0u16 };
+    let detail_h = if table_state.selected().is_some() {
+        7u16
+    } else {
+        0u16
+    };
     // Events panel: taller when focused so there's room to scroll
-    let events_h = if focus == Focus::Events { Constraint::Min(10) } else { Constraint::Length(6) };
+    let events_h = if focus == Focus::Events {
+        Constraint::Min(10)
+    } else {
+        Constraint::Length(6)
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),                           // header
-            Constraint::Min(4),                              // participant table
-            Constraint::Length(detail_h),                    // detail panel
-            events_h,                                        // events (expands when focused)
-            Constraint::Length(1),                           // footer
+            Constraint::Length(4),        // header
+            Constraint::Min(4),           // participant table
+            Constraint::Length(detail_h), // detail panel
+            events_h,                     // events (expands when focused)
+            Constraint::Length(1),        // footer
         ])
         .split(area);
 
@@ -277,7 +281,13 @@ fn render(
 
 // ── Header ────────────────────────────────────────────────────────────────────
 
-fn render_header(f: &mut Frame, area: Rect, state: &MeetingState, use_utc: bool, sort_by_quality: bool) {
+fn render_header(
+    f: &mut Frame,
+    area: Rect,
+    state: &MeetingState,
+    use_utc: bool,
+    sort_by_quality: bool,
+) {
     let now = if use_utc {
         Utc::now().format("%H:%M:%S UTC").to_string()
     } else {
@@ -291,9 +301,17 @@ fn render_header(f: &mut Frame, area: Rect, state: &MeetingState, use_utc: bool,
     };
 
     let title = Line::from(vec![
-        Span::styled(" vcprobe proctor ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " vcprobe proctor ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("── "),
-        Span::styled(&state.meeting_id, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            &state.meeting_id,
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw(format!("  ({})", state.elapsed_str())),
     ]);
 
@@ -303,13 +321,19 @@ fn render_header(f: &mut Frame, area: Rect, state: &MeetingState, use_utc: bool,
         Span::raw(format!(
             "   {} participant{}  ─ Sort: ",
             state.participants.len(),
-            if state.participants.len() == 1 { "" } else { "s" }
+            if state.participants.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         )),
         Span::styled(sort_mode, Style::default().fg(Color::Yellow)),
         Span::styled(" [S]", Style::default().fg(Color::DarkGray)),
     ]);
 
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -363,29 +387,23 @@ fn render_participants(
     .style(Style::default().fg(Color::Yellow))
     .height(1);
 
-    let rows: Vec<Row> = participants
-        .iter()
-        .map(|p| participant_row(p))
-        .collect();
+    let rows: Vec<Row> = participants.iter().map(|p| participant_row(p)).collect();
 
-    let title = format!(
-        " Participants ({}) ",
-        state.participants.len()
-    );
+    let title = format!(" Participants ({}) ", state.participants.len());
 
     let table = Table::new(
         rows,
         [
-            Constraint::Min(18),      // name
-            Constraint::Length(11),   // [V][M]
-            Constraint::Length(8),    // RTT
-            Constraint::Length(8),    // concealment/s
-            Constraint::Length(5),    // FPS
-            Constraint::Length(6),    // kbps
-            Constraint::Length(5),    // Aud score
-            Constraint::Length(5),    // Vid score
-            Constraint::Length(5),    // Call score
-            Constraint::Length(12),   // quality bar
+            Constraint::Min(18),    // name
+            Constraint::Length(11), // [V][M]
+            Constraint::Length(8),  // RTT
+            Constraint::Length(8),  // concealment/s
+            Constraint::Length(5),  // FPS
+            Constraint::Length(6),  // kbps
+            Constraint::Length(5),  // Aud score
+            Constraint::Length(5),  // Vid score
+            Constraint::Length(5),  // Call score
+            Constraint::Length(12), // quality bar
         ],
     )
     .header(header_group)
@@ -463,9 +481,13 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
         match s {
             None => (" --".to_string(), Color::DarkGray),
             Some(v) => {
-                let c = if v >= 75.0 { Color::Green }
-                        else if v >= 40.0 { Color::Yellow }
-                        else { Color::Red };
+                let c = if v >= 75.0 {
+                    Color::Green
+                } else if v >= 40.0 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
                 (format!("{:>3.0}", v), c)
             }
         }
@@ -473,19 +495,19 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
     let (aud_str, aud_color) = fmt_score(p.quality.as_ref().and_then(|q| q.audio_quality_score));
     let (vid_str, vid_color) = fmt_score(p.quality.as_ref().and_then(|q| q.video_quality_score));
     let (call_str, call_color) = fmt_score(
-        p.quality.as_ref().and_then(|q| q.call_quality_score)
-            .or_else(|| p.quality_score().map(|s| (1.0 - s) * 100.0))
+        p.quality
+            .as_ref()
+            .and_then(|q| q.call_quality_score)
+            .or_else(|| p.quality_score().map(|s| (1.0 - s) * 100.0)),
     );
 
     // Name color-coding driven by call quality score
-    let name_color = if stale {
-        Color::DarkGray
-    } else {
-        call_color
-    };
+    let name_color = if stale { Color::DarkGray } else { call_color };
 
     let name_style = if stale {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
     } else {
         Style::default().fg(name_color)
     };
@@ -498,8 +520,16 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
         Cell::from(status_line),
         Cell::from(rtt_str).style(Style::default().fg(rtt_color)),
         Cell::from(conceal_str).style(Style::default().fg(conceal_color)),
-        Cell::from(fps_str).style(Style::default().fg(if p.video_enabled { Color::Reset } else { Color::DarkGray })),
-        Cell::from(kbps_str).style(Style::default().fg(if p.video_enabled { Color::Reset } else { Color::DarkGray })),
+        Cell::from(fps_str).style(Style::default().fg(if p.video_enabled {
+            Color::Reset
+        } else {
+            Color::DarkGray
+        })),
+        Cell::from(kbps_str).style(Style::default().fg(if p.video_enabled {
+            Color::Reset
+        } else {
+            Color::DarkGray
+        })),
         Cell::from(aud_str).style(Style::default().fg(aud_color)),
         Cell::from(vid_str).style(Style::default().fg(vid_color)),
         Cell::from(call_str).style(Style::default().fg(call_color)),
@@ -511,27 +541,40 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
 fn quality_bar(p: &Participant) -> (String, Color) {
     // Prefer client-computed call_quality_score (0-100, higher = better).
     // Fall back to locally-computed score (0.0-1.0, lower = better) if not yet available.
-    let (score_0_to_1, color) = if let Some(q) = p.quality.as_ref().and_then(|q| q.call_quality_score) {
-        let s = q / 100.0; // convert 0-100 → 0.0-1.0 (higher = better)
-        let c = if s >= 0.75 { Color::Green }
-                else if s >= 0.4 { Color::Yellow }
-                else { Color::Red };
-        (s, c)
-    } else {
-        match p.quality_score() { // 0.0 = perfect, 1.0 = terrible
-            None => return ("▒▒▒▒▒▒▒▒▒▒".to_string(), Color::DarkGray),
-            Some(s) => {
-                let c = if s < 0.25 { Color::Green }
-                        else if s < 0.6 { Color::Yellow }
-                        else { Color::Red };
-                (1.0 - s, c) // invert so 1.0 = perfect for bar fill
+    let (score_0_to_1, color) =
+        if let Some(q) = p.quality.as_ref().and_then(|q| q.call_quality_score) {
+            let s = q / 100.0; // convert 0-100 → 0.0-1.0 (higher = better)
+            let c = if s >= 0.75 {
+                Color::Green
+            } else if s >= 0.4 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            (s, c)
+        } else {
+            match p.quality_score() {
+                // 0.0 = perfect, 1.0 = terrible
+                None => return ("▒▒▒▒▒▒▒▒▒▒".to_string(), Color::DarkGray),
+                Some(s) => {
+                    let c = if s < 0.25 {
+                        Color::Green
+                    } else if s < 0.6 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    };
+                    (1.0 - s, c) // invert so 1.0 = perfect for bar fill
+                }
             }
-        }
-    };
+        };
     let filled = (score_0_to_1 * 10.0) as usize;
     let filled = filled.min(10);
     let empty = 10 - filled;
-    (format!("{}{}", "█".repeat(filled), "░".repeat(empty)), color)
+    (
+        format!("{}{}", "█".repeat(filled), "░".repeat(empty)),
+        color,
+    )
 }
 
 // ── Detail panel ──────────────────────────────────────────────────────────────
@@ -560,27 +603,25 @@ fn render_detail(
         .map(|r| format!("{}ms", r as u32))
         .unwrap_or_else(|| "--".to_string());
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            label("Video: "),
-            flag(p.video_enabled),
-            Span::raw("   "),
-            label("Audio: "),
-            flag(p.audio_enabled),
-            Span::raw("   "),
-            label("RTT: "),
-            Span::styled(rtt_str, rtt_style_from(p.rtt_ms)),
-            Span::raw("   "),
-            label("Tab: "),
-            if p.is_tab_visible {
-                Span::styled("Visible", Style::default().fg(Color::Green))
-            } else if p.is_tab_throttled {
-                Span::styled("Throttled", Style::default().fg(Color::Red))
-            } else {
-                Span::styled("Hidden", Style::default().fg(Color::Yellow))
-            },
-        ]),
-    ];
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        label("Video: "),
+        flag(p.video_enabled),
+        Span::raw("   "),
+        label("Audio: "),
+        flag(p.audio_enabled),
+        Span::raw("   "),
+        label("RTT: "),
+        Span::styled(rtt_str, rtt_style_from(p.rtt_ms)),
+        Span::raw("   "),
+        label("Tab: "),
+        if p.is_tab_visible {
+            Span::styled("Visible", Style::default().fg(Color::Green))
+        } else if p.is_tab_throttled {
+            Span::styled("Throttled", Style::default().fg(Color::Red))
+        } else {
+            Span::styled("Hidden", Style::default().fg(Color::Yellow))
+        },
+    ])];
 
     // Add encoding and packet rate metrics
     let mut perf_line = vec![];
@@ -588,9 +629,13 @@ fn render_detail(
         perf_line.push(label("Encode: "));
         perf_line.push(colored_value(
             format!("{:.1}ms", encode_ms),
-            if encode_ms < 10.0 { Color::Green }
-            else if encode_ms < 30.0 { Color::Yellow }
-            else { Color::Red }
+            if encode_ms < 10.0 {
+                Color::Green
+            } else if encode_ms < 30.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            },
         ));
         perf_line.push(Span::raw("   "));
     }
@@ -599,26 +644,39 @@ fn render_detail(
         let kb = queue_bytes / 1024;
         perf_line.push(colored_value(
             format!("{}KB", kb),
-            if kb < 100 { Color::Green }
-            else if kb < 500 { Color::Yellow }
-            else { Color::Red }
+            if kb < 100 {
+                Color::Green
+            } else if kb < 500 {
+                Color::Yellow
+            } else {
+                Color::Red
+            },
         ));
         perf_line.push(Span::raw("   "));
     }
     if let Some(rx_rate) = p.packets_received_per_sec {
         perf_line.push(label("Rx: "));
-        perf_line.push(Span::styled(format!("{:.0}pkt/s", rx_rate), Style::default().fg(Color::Reset)));
+        perf_line.push(Span::styled(
+            format!("{:.0}pkt/s", rx_rate),
+            Style::default().fg(Color::Reset),
+        ));
         perf_line.push(Span::raw("   "));
     }
     if let Some(tx_rate) = p.packets_sent_per_sec {
         perf_line.push(label("Tx: "));
-        perf_line.push(Span::styled(format!("{:.0}pkt/s", tx_rate), Style::default().fg(Color::Reset)));
+        perf_line.push(Span::styled(
+            format!("{:.0}pkt/s", tx_rate),
+            Style::default().fg(Color::Reset),
+        ));
         perf_line.push(Span::raw("   "));
     }
     if let Some(mem_bytes) = p.memory_used_bytes {
         perf_line.push(label("Mem: "));
         let mb = mem_bytes / (1024 * 1024);
-        perf_line.push(Span::styled(format!("{}MB", mb), Style::default().fg(Color::Reset)));
+        perf_line.push(Span::styled(
+            format!("{}MB", mb),
+            Style::default().fg(Color::Reset),
+        ));
     }
     if !perf_line.is_empty() {
         lines.push(Line::from(perf_line));
@@ -634,7 +692,11 @@ fn render_detail(
         Some(q) => {
             let age_secs = q.updated_at.elapsed().as_secs();
             let stale = p.is_tab_throttled || age_secs > 10;
-            let stale_label = if p.is_tab_throttled { " (throttled)" } else { " (stale)" };
+            let stale_label = if p.is_tab_throttled {
+                " (throttled)"
+            } else {
+                " (stale)"
+            };
             let no_audio = q.audio_packets_per_sec < 2.0;
             // Line 1: Audio jitter — real network jitter (target_delay_ms) + buffer depth
             lines.push(Line::from(vec![
@@ -666,9 +728,13 @@ fn render_detail(
                 label("Pkt Loss: "),
                 colored_value(
                     format!("{:.1}%", q.audio_packet_loss_pct),
-                    if q.audio_packet_loss_pct < 1.0 { Color::Green }
-                    else if q.audio_packet_loss_pct < 5.0 { Color::Yellow }
-                    else { Color::Red }
+                    if q.audio_packet_loss_pct < 1.0 {
+                        Color::Green
+                    } else if q.audio_packet_loss_pct < 5.0 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    },
                 ),
             ]));
             // Line 2: Video metrics
@@ -688,9 +754,13 @@ fn render_detail(
                 label("DecErr: "),
                 colored_value(
                     format!("{:.1}/s", q.decode_errors_per_sec),
-                    if q.decode_errors_per_sec < 0.5 { Color::Green }
-                    else if q.decode_errors_per_sec < 5.0 { Color::Yellow }
-                    else { Color::Red }
+                    if q.decode_errors_per_sec < 0.5 {
+                        Color::Green
+                    } else if q.decode_errors_per_sec < 5.0 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    },
                 ),
             ];
             if let Some(decode_ms) = q.avg_decode_latency_ms {
@@ -698,9 +768,13 @@ fn render_detail(
                 video_line.push(label("Decode: "));
                 video_line.push(colored_value(
                     format!("{:.1}ms", decode_ms),
-                    if decode_ms < 10.0 { Color::Green }
-                    else if decode_ms < 30.0 { Color::Yellow }
-                    else { Color::Red }
+                    if decode_ms < 10.0 {
+                        Color::Green
+                    } else if decode_ms < 30.0 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    },
                 ));
             }
             lines.push(Line::from(video_line));
@@ -712,7 +786,13 @@ fn render_detail(
                     score_line.push(label("Audio "));
                     score_line.push(colored_value(
                         format!("{:.0}", a),
-                        if a >= 75.0 { Color::Green } else if a >= 40.0 { Color::Yellow } else { Color::Red },
+                        if a >= 75.0 {
+                            Color::Green
+                        } else if a >= 40.0 {
+                            Color::Yellow
+                        } else {
+                            Color::Red
+                        },
                     ));
                 }
                 if let Some(v) = q.video_quality_score {
@@ -720,7 +800,13 @@ fn render_detail(
                     score_line.push(label("Video "));
                     score_line.push(colored_value(
                         format!("{:.0}", v),
-                        if v >= 75.0 { Color::Green } else if v >= 40.0 { Color::Yellow } else { Color::Red },
+                        if v >= 75.0 {
+                            Color::Green
+                        } else if v >= 40.0 {
+                            Color::Yellow
+                        } else {
+                            Color::Red
+                        },
                     ));
                 }
                 if let Some(c) = q.call_quality_score {
@@ -728,7 +814,13 @@ fn render_detail(
                     score_line.push(label("Call "));
                     score_line.push(colored_value(
                         format!("{:.0}", c),
-                        if c >= 75.0 { Color::Green } else if c >= 40.0 { Color::Yellow } else { Color::Red },
+                        if c >= 75.0 {
+                            Color::Green
+                        } else if c >= 40.0 {
+                            Color::Yellow
+                        } else {
+                            Color::Red
+                        },
                     ));
                 }
                 lines.push(Line::from(score_line));
@@ -758,10 +850,16 @@ fn render_detail(
 fn interpret_quality(q: &QualitySnapshot, rtt_ms: Option<f64>) -> String {
     let mut issues = Vec::new();
     if q.conceal_per_sec > 5.0 && q.audio_packets_per_sec > 2.0 {
-        issues.push(format!("high audio concealment ({:.1}/s)", q.conceal_per_sec));
+        issues.push(format!(
+            "high audio concealment ({:.1}/s)",
+            q.conceal_per_sec
+        ));
     }
     if q.target_delay_ms > 75.0 && q.audio_packets_per_sec >= 2.0 {
-        issues.push(format!("high jitter ({}ms target delay)", q.target_delay_ms as u32));
+        issues.push(format!(
+            "high jitter ({}ms target delay)",
+            q.target_delay_ms as u32
+        ));
     }
     if let Some(rtt) = rtt_ms {
         if rtt > 150.0 {
@@ -773,7 +871,14 @@ fn interpret_quality(q: &QualitySnapshot, rtt_ms: Option<f64>) -> String {
 
 // ── Events panel ─────────────────────────────────────────────────────────────
 
-fn render_events(f: &mut Frame, area: Rect, state: &MeetingState, use_utc: bool, focus: Focus, event_scroll: usize) {
+fn render_events(
+    f: &mut Frame,
+    area: Rect,
+    state: &MeetingState,
+    use_utc: bool,
+    focus: Focus,
+    event_scroll: usize,
+) {
     let focused = focus == Focus::Events;
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
@@ -805,7 +910,10 @@ fn render_events(f: &mut Frame, area: Rect, state: &MeetingState, use_utc: bool,
         .take(end.saturating_sub(start))
         .map(|ev| {
             let when_str = if use_utc {
-                ev.when.with_timezone(&Utc).format("%H:%M:%S UTC").to_string()
+                ev.when
+                    .with_timezone(&Utc)
+                    .format("%H:%M:%S UTC")
+                    .to_string()
             } else {
                 ev.when.format("%H:%M:%S").to_string()
             };
@@ -820,10 +928,13 @@ fn render_events(f: &mut Frame, area: Rect, state: &MeetingState, use_utc: bool,
     // If there's history above the visible window, show a hint on the first line
     let mut display_lines = lines;
     if start > 0 && !display_lines.is_empty() {
-        display_lines.insert(0, Line::from(Span::styled(
-            format!("  ↑ {} more", start),
-            Style::default().fg(Color::DarkGray),
-        )));
+        display_lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!("  ↑ {} more", start),
+                Style::default().fg(Color::DarkGray),
+            )),
+        );
         display_lines.truncate(max_lines);
     }
 
@@ -873,10 +984,15 @@ fn render_help(f: &mut Frame, area: Rect) {
     let help_text = vec![
         Line::from(Span::styled(
             "vcprobe - Proctor Mode Help",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("Keyboard Controls:", Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled(
+            "Keyboard Controls:",
+            Style::default().fg(Color::Yellow),
+        )),
         Line::from("  h, ?      Show/hide this help screen"),
         Line::from("  s, S      Toggle sort: Name ↔ Call Quality (worst first)"),
         Line::from("  q, Esc    Quit proctor mode"),
@@ -884,10 +1000,15 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  ↑/↓, j/k  Navigate participants or scroll events"),
         Line::from("  Home/End  Jump to first/last"),
         Line::from(""),
-        Line::from(Span::styled("Main Table Columns:", Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled(
+            "Main Table Columns:",
+            Style::default().fg(Color::Yellow),
+        )),
         Line::from("  [V][M]  Camera and microphone enabled (sender self-report)"),
         Line::from(""),
-        Line::from("  RTT     Round-trip time to the media relay server (self-reported by client)."),
+        Line::from(
+            "  RTT     Round-trip time to the media relay server (self-reported by client).",
+        ),
         Line::from("          Reflects one leg of the end-to-end path. True conversational delay"),
         Line::from("          is approximately RTT_you + RTT_them. ITU-T G.114: <150ms one-way"),
         Line::from("          (~300ms RTT) for natural conversation."),
@@ -916,7 +1037,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("          Green: ≥75  Yellow: 40-74  Red: <40"),
         Line::from(""),
         Line::from("  Vid     Video quality score 0-100 (computed by the observing client)."),
-        Line::from("          Formula: fps_score(0fps=0, 10fps=50, 20+fps=100) - decode_error_penalty"),
+        Line::from(
+            "          Formula: fps_score(0fps=0, 10fps=50, 20+fps=100) - decode_error_penalty",
+        ),
         Line::from("          Absent (--) when video is inactive or data is stale (>5s)."),
         Line::from("          Green: ≥75  Yellow: 40-74  Red: <40"),
         Line::from(""),
@@ -928,7 +1051,10 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("  Bar     Visual representation of Call quality score (10-char block fill)."),
         Line::from(""),
-        Line::from(Span::styled("Detail Panel  (select a row with ↑/↓):", Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled(
+            "Detail Panel  (select a row with ↑/↓):",
+            Style::default().fg(Color::Yellow),
+        )),
         Line::from("  Jitter    NetEQ target delay ms. In this stack often settles at a fixed"),
         Line::from("            default (~120ms); Conc/s is the more reliable audio indicator."),
         Line::from("  Buf       Current jitter buffer depth (ms)."),
@@ -950,7 +1076,10 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  • Solo users show RTT but no Aud/Vid/Call scores or FPS/kbps data."),
         Line::from("  • Rows turn gray after ~2s without heartbeat packets (stale/disconnected)."),
         Line::from(""),
-        Line::from(Span::styled("Press h or ? to close", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "Press h or ? to close",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     let block = Block::default()

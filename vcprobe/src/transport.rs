@@ -13,6 +13,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::to_user_id_bytes;
 use web_transport_quinn::ClientBuilder;
 
 pub use crate::nats_transport::connect_nats;
@@ -193,7 +194,7 @@ fn build_connection_packet(username: &str, meeting_id: &str) -> Result<Vec<u8>> 
     };
     let outer = PacketWrapper {
         packet_type: PacketType::CONNECTION.into(),
-        email: username.to_string(),
+        user_id: to_user_id_bytes(username),
         data: inner.write_to_bytes()?,
         ..Default::default()
     };
@@ -208,7 +209,7 @@ fn build_heartbeat_packet(username: &str) -> Result<Vec<u8>> {
 
     let heartbeat = MediaPacket {
         media_type: MediaType::HEARTBEAT.into(),
-        email: username.to_string(),
+        user_id: to_user_id_bytes(username),
         timestamp: now_ms,
         heartbeat_metadata: Some(HeartbeatMetadata {
             video_enabled: false,
@@ -220,7 +221,7 @@ fn build_heartbeat_packet(username: &str) -> Result<Vec<u8>> {
     };
 
     let outer = PacketWrapper {
-        email: username.to_string(),
+        user_id: to_user_id_bytes(username),
         packet_type: PacketType::MEDIA.into(),
         data: heartbeat.write_to_bytes()?,
         ..Default::default()

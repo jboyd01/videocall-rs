@@ -6,6 +6,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoCodec};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::user_id_bytes_to_string;
 
 pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
     let pkt = match PacketWrapper::parse_from_bytes(raw) {
@@ -30,7 +31,7 @@ pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
             } else if verbose {
                 println!(
                     "? MEDIA parse error from {} ({} bytes)",
-                    pkt.email,
+                    user_id_bytes_to_string(&pkt.user_id),
                     raw.len()
                 );
             }
@@ -39,10 +40,11 @@ pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
             let meeting = ConnectionPacket::parse_from_bytes(&pkt.data)
                 .map(|c| c.meeting_id)
                 .unwrap_or_default();
+            let uid = user_id_bytes_to_string(&pkt.user_id);
             if meeting.is_empty() {
-                println!("← {} joined", pkt.email);
+                println!("← {} joined", uid);
             } else {
-                println!("← {} joined (meeting={})", pkt.email, meeting);
+                println!("← {} joined (meeting={})", uid, meeting);
             }
         }
         PacketType::SESSION_ASSIGNED => {
@@ -53,7 +55,7 @@ pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
                 println!(
                     "[{}] DIAG          {:<16} {:>6} B",
                     ts(use_utc),
-                    pkt.email,
+                    user_id_bytes_to_string(&pkt.user_id),
                     raw.len()
                 );
             }
@@ -64,7 +66,7 @@ pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
             } else if verbose {
                 println!(
                     "? HEALTH parse error from {} ({} bytes)",
-                    pkt.email,
+                    user_id_bytes_to_string(&pkt.user_id),
                     raw.len()
                 );
             }
@@ -80,7 +82,7 @@ pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
                 println!(
                     "[{}] CRYPTO        {:<16} {:>6} B  ({})",
                     ts(use_utc),
-                    pkt.email,
+                    user_id_bytes_to_string(&pkt.user_id),
                     raw.len(),
                     pkt.packet_type.value()
                 );
@@ -100,10 +102,12 @@ pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
 
 fn print_media(media: &MediaPacket, verbose: bool, use_utc: bool) {
     let now = ts(use_utc);
-    let sender = if media.email.is_empty() {
+    let sender_str;
+    let sender = if media.user_id.is_empty() {
         "?"
     } else {
-        &media.email
+        sender_str = user_id_bytes_to_string(&media.user_id);
+        &sender_str
     };
     let size = media.data.len();
     let mt = media
@@ -187,10 +191,7 @@ fn print_media(media: &MediaPacket, verbose: bool, use_utc: bool) {
         }
         _ => {
             if verbose {
-                println!(
-                    "[{}] UNKNOWN_MEDIA {:<16} {:>6} B",
-                    now, sender, size
-                );
+                println!("[{}] UNKNOWN_MEDIA {:<16} {:>6} B", now, sender, size);
             }
         }
     }
@@ -203,7 +204,11 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
 
     if verbose {
         // Verbose mode: show full details + Phase 1 metrics
-        let tab = if health.is_tab_visible { "👁️ " } else { "👁️🚫" };
+        let tab = if health.is_tab_visible {
+            "👁️ "
+        } else {
+            "👁️🚫"
+        };
         let mem_info = match (health.memory_used_bytes, health.memory_total_bytes) {
             (Some(used), Some(total)) => {
                 format!(" mem={}MB/{}MB", used / 1_000_000, total / 1_000_000)
@@ -212,10 +217,17 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
             _ => String::new(),
         };
 
+        let reporter = user_id_bytes_to_string(&health.reporting_user_id);
         println!(
             "[{}] HEALTH        {:<16} session={} peers={} rtt={:.1}ms {} {}{}",
-            now, health.reporting_peer, health.session_id, peer_count, rtt,
-            tab, health.active_server_type, mem_info
+            now,
+            reporter,
+            health.session_id,
+            peer_count,
+            rtt,
+            tab,
+            health.active_server_type,
+            mem_info
         );
 
         if peer_count == 0 {
@@ -244,8 +256,8 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
             } else {
                 String::new()
             };
-            let dropped = if stats.decode_errors_per_sec > 0.01 {
-                format!(" decerr={:.1}/s", stats.decode_errors_per_sec)
+            let dropped = if stats.frames_dropped_per_sec > 0.01 {
+                format!(" decerr={:.1}/s", stats.frames_dropped_per_sec)
             } else {
                 String::new()
             };
@@ -259,7 +271,11 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
         // Normal mode: one-line summary
         println!(
             "[{}] HEALTH        {:<16} session={} peers={} rtt={:.1}ms",
-            now, health.reporting_peer, health.session_id, peer_count, rtt
+            now,
+            user_id_bytes_to_string(&health.reporting_user_id),
+            health.session_id,
+            peer_count,
+            rtt
         );
     }
 }

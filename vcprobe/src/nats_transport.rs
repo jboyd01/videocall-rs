@@ -6,16 +6,14 @@ use tokio::sync::mpsc;
 use videocall_types::protos::health_packet::HealthPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::user_id_bytes_to_string;
 
 /// Connect to NATS server and subscribe to health diagnostics and room packets
 /// for the specified meeting ID.
 ///
 /// Returns a channel receiver that delivers PacketWrapper bytes, compatible
 /// with the existing WebTransport/WebSocket transport interface.
-pub async fn connect_nats(
-    nats_url: String,
-    meeting_id: String,
-) -> Result<mpsc::Receiver<Vec<u8>>> {
+pub async fn connect_nats(nats_url: String, meeting_id: String) -> Result<mpsc::Receiver<Vec<u8>>> {
     // Connect to NATS
     let client = async_nats::connect(&nats_url).await?;
     log::info!("Connected to NATS at {}", nats_url);
@@ -69,15 +67,19 @@ async fn health_subscriber(
         let health_packet = match HealthPacket::parse_from_bytes(&message.payload) {
             Ok(h) => h,
             Err(e) => {
-                log::debug!("Failed to parse health packet from {}: {}", message.subject, e);
+                log::debug!(
+                    "Failed to parse health packet from {}: {}",
+                    message.subject,
+                    e
+                );
                 continue;
             }
         };
 
         log::debug!(
-            "Parsed health packet: meeting_id='{}', reporting_peer='{}', target_meeting='{}'",
+            "Parsed health packet: meeting_id='{}', reporting_user='{}', target_meeting='{}'",
             health_packet.meeting_id,
-            health_packet.reporting_peer,
+            user_id_bytes_to_string(&health_packet.reporting_user_id),
             meeting_id
         );
 
@@ -103,12 +105,16 @@ async fn health_subscriber(
             }
         }
 
-        log::info!("Forwarding HEALTH packet from {} for meeting {}", health_packet.reporting_peer, meeting_id);
+        log::info!(
+            "Forwarding HEALTH packet from {} for meeting {}",
+            user_id_bytes_to_string(&health_packet.reporting_user_id),
+            meeting_id
+        );
 
         // Wrap in PacketWrapper for consistency with state.rs expectations
         let wrapper = PacketWrapper {
             packet_type: PacketType::HEALTH.into(),
-            email: health_packet.reporting_peer.clone(),
+            user_id: health_packet.reporting_user_id.clone(),
             data: message.payload.to_vec(), // Original bytes
             ..Default::default()
         };

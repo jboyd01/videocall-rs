@@ -89,11 +89,11 @@ struct FpsTracker {
     total_frames: u32,
     #[allow(dead_code)]
     media_type: MediaType,
-    last_frame_time: f64,     // Add timestamp of last received frame
-    bytes_received: u64,      // Track total bytes received
-    last_bitrate_update: f64, // Last time we calculated bitrate
-    current_bitrate: f64,     // Current bitrate in kbits/sec
-    decode_errors_count: u32, // Windowed counter (resets every 1s)
+    last_frame_time: f64,       // Add timestamp of last received frame
+    bytes_received: u64,        // Track total bytes received
+    last_bitrate_update: f64,   // Last time we calculated bitrate
+    current_bitrate: f64,       // Current bitrate in kbits/sec
+    decode_errors_count: u32,   // Windowed counter (resets every 1s)
     decode_errors_per_sec: f64, // Decode errors per second
 }
 

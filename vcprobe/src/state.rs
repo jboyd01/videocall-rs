@@ -8,6 +8,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::user_id_bytes_to_string;
 
 // Mark participant as stale (grayed out) after no packets
 // Reduced from 6s to 2s since we track all packet types (AUDIO/VIDEO at ~70/sec combined)
@@ -112,10 +113,7 @@ impl Participant {
             } else {
                 0.0
             };
-            let rtt_score = self
-                .rtt_ms
-                .map(|r| (r / 300.0).min(1.0))
-                .unwrap_or(0.0);
+            let rtt_score = self.rtt_ms.map(|r| (r / 300.0).min(1.0)).unwrap_or(0.0);
             (conceal_score * 0.5 + jitter_score * 0.3 + rtt_score * 0.2).min(1.0)
         })
     }
@@ -155,7 +153,11 @@ impl MeetingState {
             Err(_) => return,
         };
 
-        match pkt.packet_type.enum_value().unwrap_or(PacketType::PACKET_TYPE_UNKNOWN) {
+        match pkt
+            .packet_type
+            .enum_value()
+            .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN)
+        {
             PacketType::MEDIA => self.process_media(&pkt),
             PacketType::HEALTH => self.process_health(&pkt),
             _ => {}
@@ -168,11 +170,11 @@ impl MeetingState {
             Err(_) => return,
         };
 
-        // email is in the MediaPacket; fall back to PacketWrapper email
-        let email = if !media.email.is_empty() {
-            media.email.clone()
-        } else if !pkt.email.is_empty() {
-            pkt.email.clone()
+        // user_id is in the MediaPacket; fall back to PacketWrapper user_id
+        let email = if !media.user_id.is_empty() {
+            user_id_bytes_to_string(&media.user_id)
+        } else if !pkt.user_id.is_empty() {
+            user_id_bytes_to_string(&pkt.user_id)
         } else {
             return;
         };
@@ -193,7 +195,12 @@ impl MeetingState {
         p.last_heartbeat = Instant::now();
 
         // Process type-specific metadata
-        if media.media_type.enum_value().unwrap_or(MediaType::MEDIA_TYPE_UNKNOWN) == MediaType::HEARTBEAT {
+        if media
+            .media_type
+            .enum_value()
+            .unwrap_or(MediaType::MEDIA_TYPE_UNKNOWN)
+            == MediaType::HEARTBEAT
+        {
             if let Some(hb) = media.heartbeat_metadata.as_ref() {
                 p.video_enabled = hb.video_enabled;
                 p.audio_enabled = hb.audio_enabled;
@@ -210,12 +217,13 @@ impl MeetingState {
             Err(_) => return,
         };
 
-        if health.reporting_peer.is_empty() {
+        if health.reporting_user_id.is_empty() {
             return;
         }
+        let reporting_user = user_id_bytes_to_string(&health.reporting_user_id);
 
         // Update reporter's own metrics and mark as active
-        if let Some(p) = self.participants.get_mut(&health.reporting_peer) {
+        if let Some(p) = self.participants.get_mut(&reporting_user) {
             p.rtt_ms = Some(health.active_server_rtt_ms);
             p.is_tab_visible = health.is_tab_visible;
             p.memory_used_bytes = health.memory_used_bytes;
@@ -285,7 +293,7 @@ impl MeetingState {
                     conceal_per_sec,
                     fps,
                     bitrate_kbps,
-                    decode_errors_per_sec: peer_stats.decode_errors_per_sec,
+                    decode_errors_per_sec: peer_stats.frames_dropped_per_sec,
                     audio_packet_loss_pct: peer_stats.audio_packet_loss_pct,
                     audio_packets_per_sec,
                     avg_decode_latency_ms: peer_stats.avg_decode_latency_ms,
@@ -333,13 +341,15 @@ impl MeetingState {
             // no HEALTH packets have arrived yet for a participant.
             v.sort_by(|a, b| {
                 // Normalise both to 0.0-1.0 where 1.0 = worst, for a uniform comparison key.
-                let score_a = a.quality
+                let score_a = a
+                    .quality
                     .as_ref()
                     .and_then(|q| q.call_quality_score)
-                    .map(|s| 1.0 - s / 100.0)           // invert: 100→0.0, 0→1.0
-                    .or_else(|| a.quality_score())       // fallback: already 0.0=good,1.0=bad
-                    .unwrap_or(0.0);                     // no data → treat as perfect (float to bottom)
-                let score_b = b.quality
+                    .map(|s| 1.0 - s / 100.0) // invert: 100→0.0, 0→1.0
+                    .or_else(|| a.quality_score()) // fallback: already 0.0=good,1.0=bad
+                    .unwrap_or(0.0); // no data → treat as perfect (float to bottom)
+                let score_b = b
+                    .quality
                     .as_ref()
                     .and_then(|q| q.call_quality_score)
                     .map(|s| 1.0 - s / 100.0)

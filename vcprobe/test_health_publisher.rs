@@ -3,6 +3,7 @@
 
 use protobuf::Message;
 use videocall_types::protos::health_packet::HealthPacket;
+use videocall_types::to_user_id_bytes;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,17 +21,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected!");
 
     let topic = "health.diagnostics.us-east.websocket.test-server";
-    println!("Publishing mock HEALTH packets to {} every 5 seconds", topic);
+    println!(
+        "Publishing mock HEALTH packets to {} every 5 seconds",
+        topic
+    );
     println!("Press Ctrl-C to stop\n");
 
     let mut counter = 0u64;
     loop {
         counter += 1;
 
+        let reporting_user = format!("test-user-{}", counter % 2);
         let health_packet = HealthPacket {
             session_id: counter.to_string(),
             meeting_id: meeting_id.to_string(),
-            reporting_peer: format!("test-user-{}", counter % 2),
+            reporting_user_id: to_user_id_bytes(&reporting_user),
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_millis() as u64,
@@ -41,11 +46,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = health_packet.write_to_bytes()?;
         client.publish(topic, bytes.into()).await?;
 
-        println!("[{}] Published HEALTH packet: session={}, meeting={}, peer={}, rtt={:.1}ms",
+        println!(
+            "[{}] Published HEALTH packet: session={}, meeting={}, peer={}, rtt={:.1}ms",
             chrono::Local::now().format("%H:%M:%S"),
             health_packet.session_id,
             health_packet.meeting_id,
-            health_packet.reporting_peer,
+            reporting_user,
             health_packet.active_server_rtt_ms,
         );
 

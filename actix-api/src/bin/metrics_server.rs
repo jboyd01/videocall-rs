@@ -588,14 +588,14 @@ fn process_health_packet_to_metrics_pb(
 
                     // Phase 1 metrics: Decode errors per second (PeerStats level)
                     // Note: this is decode errors (codec resets), not CPU-pressure frame drops.
-                    if peer_data.decode_errors_per_sec > 0.0 {
+                    if peer_data.frames_dropped_per_sec > 0.0 {
                         debug!(
                             "Setting VIDEO_FRAMES_DROPPED for meeting={}, session={}, from_peer={}, to_peer={}, value={:.2}",
-                            meeting_id, session_id, reporting_user_id, peer_id, peer_data.decode_errors_per_sec
+                            meeting_id, session_id, reporting_user_id, peer_id, peer_data.frames_dropped_per_sec
                         );
                         VIDEO_FRAMES_DROPPED
                             .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
-                            .set(peer_data.decode_errors_per_sec);
+                            .set(peer_data.frames_dropped_per_sec);
                     }
 
                     // Phase 1 metrics: Audio packet loss percentage (PeerStats level)
