@@ -483,29 +483,35 @@ impl DiagnosticWorker {
                     )
                 };
 
-                // Publish one "video" event per peer per heartbeat to the global broadcast system.
-                // The health reporter subscribes to "video" events to update video stats and
-                // compute quality scores. A separate "decoder" event with identical data was
-                // previously also emitted here; it has been removed (the "decoder" handler in
-                // health_reporter.rs was a no-op debug sink).
-                let video_event = DiagEvent {
-                    subsystem: "video",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
-                        metric!("fps_received", fps),
-                        metric!("bitrate_kbps", bitrate),
-                        metric!("decode_errors_per_sec", decode_errors),
-                        metric!("media_type", format!("{:?}", media_type)),
-                        metric!("from_peer", self.userid.clone()),
-                        metric!("to_peer", peer_id.clone()),
-                    ],
-                };
-                debug!(
-                    "Broadcasting video event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps, DecodeErrors={:.1}/s",
-                    peer_id, media_type, fps, bitrate, decode_errors
-                );
-                let _ = global_sender().try_broadcast(video_event);
+                // Only broadcast "video" subsystem events for VIDEO and SCREEN media types.
+                // AUDIO packet rate from fps_trackers must NOT go into the video-quality channel
+                // because:
+                //   1. Audio packet rate (~50/s) would overwrite the real video fps in the
+                //      health reporter's video_stats, showing "50 fps" instead of actual fps.
+                //   2. An inactive AUDIO tracker (fps=0) would zero out video fps even when
+                //      video is flowing fine, causing quality scores to disappear (the N-1
+                //      alternating stats bug observed in vcprobe).
+                // Audio quality is measured by NetEQ via the "neteq" subsystem — not here.
+                if *media_type != MediaType::AUDIO {
+                    let video_event = DiagEvent {
+                        subsystem: "video",
+                        stream_id: None,
+                        ts_ms: now_ms(),
+                        metrics: vec![
+                            metric!("fps_received", fps),
+                            metric!("bitrate_kbps", bitrate),
+                            metric!("decode_errors_per_sec", decode_errors),
+                            metric!("media_type", format!("{:?}", media_type)),
+                            metric!("from_peer", self.userid.clone()),
+                            metric!("to_peer", peer_id.clone()),
+                        ],
+                    };
+                    debug!(
+                        "Broadcasting video event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps, DecodeErrors={:.1}/s",
+                        peer_id, media_type, fps, bitrate, decode_errors
+                    );
+                    let _ = global_sender().try_broadcast(video_event);
+                }
 
                 // Only create and send protobuf packets if packet handler is set (legacy system)
                 if let Some(handler) = &self.packet_handler {
