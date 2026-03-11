@@ -569,10 +569,12 @@ impl HealthReporter {
         // Phase 1 metrics: Tab visibility
         #[cfg(target_arch = "wasm32")]
         {
-            pb.is_tab_visible = web_sys::window()
+            let tab_hidden = web_sys::window()
                 .and_then(|w| w.document())
-                .map(|d| !d.hidden())
-                .unwrap_or(true); // Default to visible if API unavailable
+                .map(|d| d.hidden())
+                .unwrap_or(false);
+            pb.is_tab_visible = !tab_hidden;
+            pb.is_tab_throttled = tab_hidden;
 
             // Phase 1 metrics: Memory usage (Chrome only)
             if let Some(window) = web_sys::window() {
