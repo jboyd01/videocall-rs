@@ -335,12 +335,24 @@ fn process_health_packet_to_metrics_pb(
     {
         // Client-side active server info (optional)
         if !health_packet.active_server_url.is_empty() {
-            // Strip JWT token from URL to prevent leaking credentials in Prometheus labels
-            let server_url_clean = health_packet
-                .active_server_url
-                .split("?token=")
-                .next()
-                .unwrap_or(&health_packet.active_server_url);
+            // Strip JWT token from URL to prevent leaking credentials in Prometheus labels.
+            // Handles both ?token=... (only param) and &token=... (among other params).
+            let server_url_clean = if let Some(q_pos) = health_packet.active_server_url.find('?') {
+                let base = &health_packet.active_server_url[..q_pos];
+                let query = &health_packet.active_server_url[q_pos + 1..];
+                let filtered: Vec<&str> = query
+                    .split('&')
+                    .filter(|p| !p.starts_with("token="))
+                    .collect();
+                if filtered.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{}?{}", base, filtered.join("&"))
+                }
+            } else {
+                health_packet.active_server_url.clone()
+            };
+            let server_url_clean = server_url_clean.as_str();
 
             let server_type = if health_packet.active_server_type.is_empty() {
                 "unknown"
@@ -1680,5 +1692,276 @@ mod tests {
             let tracker_guard = tracker.lock().unwrap();
             assert_eq!(tracker_guard.len(), 0);
         }
+    }
+
+    #[test]
+    fn test_jwt_token_stripped_from_server_url() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // URL with ?token= (only query param)
+        let mut hp = create_test_health_packet("s1", "m1", "alice", HashMap::new());
+        hp.active_server_url = "wss://relay.example.com?token=eyJhbGciOi.secret".to_string();
+        hp.active_server_type = "websocket".to_string();
+        hp.active_server_rtt_ms = 50.0;
+        // Add a peer so the packet isn't empty
+        let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
+        hp.peer_stats.insert(peer_id, ps);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        // Verify the server_url label does NOT contain the token
+        assert!(
+            !series_exists(
+                "videocall_client_active_server",
+                &[(
+                    "server_url",
+                    "wss://relay.example.com?token=eyJhbGciOi.secret"
+                )]
+            ),
+            "JWT token should be stripped from server_url label"
+        );
+        assert!(
+            series_exists(
+                "videocall_client_active_server",
+                &[("server_url", "wss://relay.example.com")]
+            ),
+            "Clean URL without token should be present"
+        );
+    }
+
+    #[test]
+    fn test_jwt_token_stripped_with_other_params() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // URL with token among other query params
+        let mut hp = create_test_health_packet("s2", "m2", "carol", HashMap::new());
+        hp.active_server_url =
+            "wss://relay.example.com?region=us-east&token=secret123&debug=1".to_string();
+        hp.active_server_type = "webtransport".to_string();
+        hp.active_server_rtt_ms = 30.0;
+        let (peer_id, ps) = create_test_peer_stats("dave", true, true, 50.0, 2.0);
+        hp.peer_stats.insert(peer_id, ps);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            series_exists(
+                "videocall_client_active_server",
+                &[(
+                    "server_url",
+                    "wss://relay.example.com?region=us-east&debug=1"
+                )]
+            ),
+            "Token param should be stripped, other params preserved"
+        );
+    }
+
+    #[test]
+    fn test_display_name_resolution_removes_stale_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // First packet: reporter alice sees peer "12345" (no display name yet)
+        let (peer_id, ps) = create_test_peer_stats("12345", true, true, 50.0, 2.0);
+        let mut hp = create_test_health_packet("s10", "m10", "alice", HashMap::new());
+        hp.peer_stats.insert(peer_id, ps);
+        hp.display_name = Some("Alice".to_string());
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        // Verify series exists with session_id as peer_name
+        assert!(
+            series_exists(
+                "videocall_peer_can_listen",
+                &[
+                    ("meeting_id", "m10"),
+                    ("to_peer", "12345"),
+                    ("peer_name", "12345")
+                ]
+            ),
+            "Should have series with session_id as peer_name"
+        );
+
+        // Now the peer sends their own health packet, populating the display_name_map
+        {
+            let mut map = dn_map.lock().unwrap();
+            map.insert("12345".to_string(), "Bob".to_string());
+        }
+
+        // Second packet from alice: now "12345" resolves to "Bob"
+        let (peer_id2, ps2) = create_test_peer_stats("12345", true, true, 50.0, 2.0);
+        let mut hp2 = create_test_health_packet("s10", "m10", "alice", HashMap::new());
+        hp2.peer_stats.insert(peer_id2, ps2);
+        hp2.display_name = Some("Alice".to_string());
+        let result2 = process_health_packet_to_metrics_pb(&hp2, &tracker, &dn_map);
+        assert!(result2.is_ok());
+
+        // Old series with session_id as peer_name should be removed
+        assert!(
+            !series_exists(
+                "videocall_peer_can_listen",
+                &[
+                    ("meeting_id", "m10"),
+                    ("to_peer", "12345"),
+                    ("peer_name", "12345")
+                ]
+            ),
+            "Stale series with session_id as peer_name should be removed"
+        );
+
+        // New series with resolved display_name should exist
+        assert!(
+            series_exists(
+                "videocall_peer_can_listen",
+                &[
+                    ("meeting_id", "m10"),
+                    ("to_peer", "12345"),
+                    ("peer_name", "Bob")
+                ]
+            ),
+            "New series with resolved display_name should exist"
+        );
+    }
+
+    #[test]
+    fn test_meeting_participants_includes_self() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Reporter with 2 peers = 3 total participants
+        let (p1, ps1) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
+        let (p2, ps2) = create_test_peer_stats("carol", true, true, 50.0, 2.0);
+        let mut hp = create_test_health_packet("s20", "m20", "alice", HashMap::new());
+        hp.peer_stats.insert(p1, ps1);
+        hp.peer_stats.insert(p2, ps2);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        // Check the gauge value is 3 (2 peers + 1 self)
+        let families = prometheus::gather();
+        for family in &families {
+            if family.get_name() == "videocall_meeting_participants" {
+                for metric in family.get_metric() {
+                    for label in metric.get_label() {
+                        if label.get_name() == "meeting_id" && label.get_value() == "m20" {
+                            assert_eq!(
+                                metric.get_gauge().get_value(),
+                                3.0,
+                                "participants should be peers + 1 (self)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_p1_metrics_exposed() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
+        let mut hp = create_test_health_packet("s30", "m30", "alice", HashMap::new());
+        hp.peer_stats.insert(peer_id, ps);
+        hp.send_queue_bytes = Some(1024);
+        hp.packets_received_per_sec = Some(50.0);
+        hp.packets_sent_per_sec = Some(45.0);
+        hp.is_tab_throttled = true;
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            series_exists(
+                "videocall_client_send_queue_bytes",
+                &[("meeting_id", "m30"), ("session_id", "s30")]
+            ),
+            "send_queue_bytes should be exposed"
+        );
+        assert!(
+            series_exists(
+                "videocall_client_packets_received_per_sec",
+                &[("meeting_id", "m30")]
+            ),
+            "packets_received_per_sec should be exposed"
+        );
+        assert!(
+            series_exists(
+                "videocall_client_packets_sent_per_sec",
+                &[("meeting_id", "m30")]
+            ),
+            "packets_sent_per_sec should be exposed"
+        );
+        assert!(
+            series_exists("videocall_client_tab_throttled", &[("meeting_id", "m30")]),
+            "tab_throttled should be exposed"
+        );
+    }
+
+    #[test]
+    fn test_health_reports_counter_incremented() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let before = HEALTH_REPORTS_TOTAL.get();
+
+        let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
+        let mut hp = create_test_health_packet("s40", "m40", "alice", HashMap::new());
+        hp.peer_stats.insert(peer_id, ps);
+
+        let _ = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+
+        let after = HEALTH_REPORTS_TOTAL.get();
+        assert!(
+            after > before,
+            "HEALTH_REPORTS_TOTAL should be incremented on each health packet"
+        );
+    }
+
+    #[test]
+    fn test_display_name_map_cleanup() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Populate the display_name_map with some entries
+        {
+            let mut map = dn_map.lock().unwrap();
+            map.insert("active_session".to_string(), "Alice".to_string());
+            map.insert("stale_session".to_string(), "Bob".to_string());
+        }
+
+        // Only add active_session to the tracker
+        {
+            let mut t = tracker.lock().unwrap();
+            t.insert(
+                "m1_active_session_alice".to_string(),
+                SessionInfo {
+                    session_id: "active_session".to_string(),
+                    meeting_id: "m1".to_string(),
+                    reporting_user_id: "alice".to_string(),
+                    display_name: "Alice".to_string(),
+                    last_seen: Instant::now() - Duration::from_secs(60), // stale
+                    to_peers: HashSet::new(),
+                    to_peer_display_names: HashMap::new(),
+                    peer_ids: HashSet::new(),
+                    active_servers: HashSet::new(),
+                },
+            );
+        }
+
+        // Run cleanup — both sessions should be removed (active_session is stale too)
+        cleanup_stale_sessions(&tracker, &dn_map);
+
+        let map = dn_map.lock().unwrap();
+        assert!(
+            map.is_empty(),
+            "All display_name_map entries should be cleaned since all sessions are stale"
+        );
     }
 }
