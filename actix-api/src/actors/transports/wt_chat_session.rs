@@ -26,6 +26,7 @@ use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
+use crate::metrics::{RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL};
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use actix::{
@@ -114,6 +115,7 @@ impl WtChatSession {
             tracker_sender,
             session_manager,
             observer,
+            "webtransport",
         );
 
         WtChatSession {
@@ -140,6 +142,9 @@ impl WtChatSession {
                 false
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                RELAY_PACKET_DROPS_TOTAL
+                    .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
+                    .inc();
                 error!(
                     "Outbound channel full for session {}, dropping message",
                     self.logic.id
@@ -157,6 +162,12 @@ impl WtChatSession {
     /// Start heartbeat check (WebTransport-specific timing)
     fn start_heartbeat(&self, ctx: &mut Context<Self>) {
         ctx.run_interval(WT_HEARTBEAT_INTERVAL, |act, ctx| {
+            // Sample outbound queue depth for Prometheus (capacity 256)
+            let depth = 256 - act.outbound_tx.capacity();
+            RELAY_OUTBOUND_QUEUE_DEPTH
+                .with_label_values(&[&act.logic.room])
+                .set(depth as f64);
+
             // Check if connection is dead (channel closed)
             if act.is_connection_dead() {
                 warn!(
@@ -188,7 +199,7 @@ impl Actor for WtChatSession {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         // Track connection start
-        self.logic.track_connection_start("webtransport");
+        self.logic.track_connection_start();
 
         // Start session via SessionManager
         let session_manager = self.logic.session_manager.clone();
@@ -314,6 +325,9 @@ impl Handler<WtInbound> for WtChatSession {
                         ctx.stop();
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        RELAY_PACKET_DROPS_TOTAL
+                            .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
+                            .inc();
                         error!(
                             "Outbound channel full, dropping RTT echo for session {}",
                             self.logic.id

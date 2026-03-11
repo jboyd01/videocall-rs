@@ -22,9 +22,12 @@ struct SessionInfo {
     session_id: String,
     meeting_id: String,
     reporting_user_id: String,
+    display_name: String,
     last_seen: Instant,
     // Peers we have published metrics for in this session (as to_peer)
     to_peers: HashSet<String>,
+    // Maps peer session_id → display_name for cleanup of display_name-labeled metrics
+    to_peer_display_names: HashMap<String, String>,
     // Peer IDs we have published peer connection metrics for
     peer_ids: HashSet<String>,
     // Server info we have published active server metrics for (server_url, server_type)
@@ -33,17 +36,25 @@ struct SessionInfo {
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
 
+/// Maps session_id → display_name so we can resolve peer display names.
+/// Built from incoming health packets (each carries the reporter's display_name).
+type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
+
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
 use sec_api::metrics::{
-    ACTIVE_SESSIONS_TOTAL, AUDIO_PACKET_LOSS_PCT, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
-    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_TAB_VISIBLE, MEETING_PARTICIPANTS,
+    ACTIVE_SESSIONS_TOTAL, AUDIO_PACKET_LOSS_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE,
+    CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES,
+    CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
+    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC,
     NETEQ_DTMF_OPS_PER_SEC, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_FAST_ACCELERATE_OPS_PER_SEC,
     NETEQ_MERGE_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_UNDEFINED_OPS_PER_SEC,
-    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PACKETS_BUFFERED,
+    NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    NETEQ_UNDEFINED_OPS_PER_SEC, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PACKETS_BUFFERED,
+    VIDEO_QUALITY_SCORE,
 };
 
 async fn metrics_handler(
@@ -111,27 +122,48 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         .remove_label_values(&[&session_info.meeting_id, &session_info.session_id]);
 
     // Remove self-reported enabled metrics for the reporting peer in this meeting
-    let _ = SELF_AUDIO_ENABLED
-        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_user_id]);
-    let _ = SELF_VIDEO_ENABLED
-        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_user_id]);
+    let _ = SELF_AUDIO_ENABLED.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.reporting_user_id,
+        &session_info.display_name,
+    ]);
+    let _ = SELF_VIDEO_ENABLED.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.reporting_user_id,
+        &session_info.display_name,
+    ]);
 
     // Phase 1: Remove tab visibility and memory metrics
     let _ = CLIENT_TAB_VISIBLE.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
+        &session_info.display_name,
     ]);
     let _ = CLIENT_MEMORY_USED_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
+        &session_info.display_name,
     ]);
     let _ = CLIENT_MEMORY_TOTAL_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
+        &session_info.display_name,
     ]);
+
+    // P1: Remove send queue, packet rates, tab throttled metrics
+    let reporter_labels = [
+        &session_info.meeting_id as &str,
+        &session_info.session_id,
+        &session_info.reporting_user_id,
+        &session_info.display_name,
+    ];
+    let _ = CLIENT_SEND_QUEUE_BYTES.remove_label_values(&reporter_labels);
+    let _ = CLIENT_PACKETS_RECEIVED_PER_SEC.remove_label_values(&reporter_labels);
+    let _ = CLIENT_PACKETS_SENT_PER_SEC.remove_label_values(&reporter_labels);
+    let _ = CLIENT_TAB_THROTTLED.remove_label_values(&reporter_labels);
 
     // Remove active server metrics for this session
     for (server_url, server_type) in &session_info.active_servers {
@@ -141,6 +173,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
             &session_info.reporting_user_id,
             server_url.as_str(),
             server_type.as_str(),
+            &session_info.display_name,
         ];
         let _ = CLIENT_ACTIVE_SERVER.remove_label_values(&server_labels);
         let _ = CLIENT_ACTIVE_SERVER_RTT_MS.remove_label_values(&server_labels);
@@ -153,12 +186,23 @@ fn remove_session_metrics(session_info: &SessionInfo) {
 
     // Remove all to_peer series we set for this session
     for to_peer in &session_info.to_peers {
+        // Get peer display name for this to_peer
+        let peer_dn = session_info
+            .to_peer_display_names
+            .get(to_peer)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        // All per-peer metrics now use 6 labels including display names
         let labels = [
             &session_info.meeting_id,
             &session_info.session_id,
             &session_info.reporting_user_id,
             to_peer.as_str(),
+            &session_info.display_name,
+            peer_dn,
         ];
+
         let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
         let _ = PEER_CAN_SEE.remove_label_values(&labels);
         let _ = VIDEO_FPS.remove_label_values(&labels);
@@ -175,10 +219,17 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         let _ = NETEQ_COMFORT_NOISE_OPS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_DTMF_OPS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_UNDEFINED_OPS_PER_SEC.remove_label_values(&labels);
-
-        // Phase 1: Remove frames dropped and audio loss metrics
         let _ = VIDEO_FRAMES_DROPPED.remove_label_values(&labels);
         let _ = AUDIO_PACKET_LOSS_PCT.remove_label_values(&labels);
+        let _ = PEER_AUDIO_ENABLED.remove_label_values(&labels);
+        let _ = PEER_VIDEO_ENABLED.remove_label_values(&labels);
+
+        // Quality score metrics also use the same 6 labels
+        let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
+        let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
+        let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
+        let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
+        let _ = VIDEO_BITRATE_KBPS.remove_label_values(&labels);
     }
 
     // Meeting participants is recomputed on next scrape; no need to force remove
@@ -191,6 +242,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
 fn process_health_packet_to_metrics_pb(
     health_packet: &PbHealthPacket,
     session_tracker: &SessionTracker,
+    display_name_map: &DisplayNameMap,
 ) -> anyhow::Result<()> {
     let meeting_id = if health_packet.meeting_id.is_empty() {
         "unknown"
@@ -211,6 +263,20 @@ fn process_health_packet_to_metrics_pb(
     };
     let reporting_user_id = reporting_user_id_str.as_str();
 
+    // Extract reporter's display name; fall back to email if absent
+    let reporter_display_name = health_packet
+        .display_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(reporting_user_id)
+        .to_string();
+
+    // Register this session's display name so peers can be resolved later
+    {
+        let mut dn_map = display_name_map.lock().unwrap();
+        dn_map.insert(session_id.to_string(), reporter_display_name.clone());
+    }
+
     // Update session tracker: create entry on first packet, then refresh last_seen only.
     // Using entry().or_insert_with() preserves accumulated to_peers/peer_ids/active_servers
     // across packets. The previous tracker.insert() reset them every packet, causing a leak
@@ -222,8 +288,10 @@ fn process_health_packet_to_metrics_pb(
             session_id: session_id.to_string(),
             meeting_id: meeting_id.to_string(),
             reporting_user_id: reporting_user_id.to_string(),
+            display_name: reporter_display_name.clone(),
             last_seen: Instant::now(),
             to_peers: HashSet::new(),
+            to_peer_display_names: HashMap::new(),
             peer_ids: HashSet::new(),
             active_servers: HashSet::new(),
         });
@@ -234,7 +302,13 @@ fn process_health_packet_to_metrics_pb(
     {
         // Client-side active server info (optional)
         if !health_packet.active_server_url.is_empty() {
-            let server_url = &health_packet.active_server_url;
+            // Strip JWT token from URL to prevent leaking credentials in Prometheus labels
+            let server_url_clean = health_packet
+                .active_server_url
+                .split("?token=")
+                .next()
+                .unwrap_or(&health_packet.active_server_url);
+
             let server_type = if health_packet.active_server_type.is_empty() {
                 "unknown"
             } else {
@@ -246,8 +320,9 @@ fn process_health_packet_to_metrics_pb(
                     meeting_id,
                     session_id,
                     reporting_user_id,
-                    server_url,
+                    server_url_clean,
                     server_type,
+                    reporter_display_name.as_str(),
                 ])
                 .set(1.0);
 
@@ -257,8 +332,9 @@ fn process_health_packet_to_metrics_pb(
                         meeting_id,
                         session_id,
                         reporting_user_id,
-                        server_url,
+                        server_url_clean,
                         server_type,
+                        reporter_display_name.as_str(),
                     ])
                     .set(health_packet.active_server_rtt_ms);
             }
@@ -269,7 +345,7 @@ fn process_health_packet_to_metrics_pb(
                 let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                 if let Some(info) = tracker.get_mut(&key) {
                     info.active_servers
-                        .insert((server_url.to_string(), server_type.to_string()));
+                        .insert((server_url_clean.to_string(), server_type.to_string()));
                 }
             }
         }
@@ -284,7 +360,11 @@ fn process_health_packet_to_metrics_pb(
             meeting_id, reporting_user_id, health_packet.reporting_audio_enabled
         );
         SELF_AUDIO_ENABLED
-            .with_label_values(&[meeting_id, reporting_user_id])
+            .with_label_values(&[
+                meeting_id,
+                reporting_user_id,
+                reporter_display_name.as_str(),
+            ])
             .set(if health_packet.reporting_audio_enabled {
                 1.0
             } else {
@@ -296,7 +376,11 @@ fn process_health_packet_to_metrics_pb(
             meeting_id, reporting_user_id, health_packet.reporting_video_enabled
         );
         SELF_VIDEO_ENABLED
-            .with_label_values(&[meeting_id, reporting_user_id])
+            .with_label_values(&[
+                meeting_id,
+                reporting_user_id,
+                reporter_display_name.as_str(),
+            ])
             .set(if health_packet.reporting_video_enabled {
                 1.0
             } else {
@@ -309,7 +393,12 @@ fn process_health_packet_to_metrics_pb(
             meeting_id, session_id, reporting_user_id, health_packet.is_tab_visible
         );
         CLIENT_TAB_VISIBLE
-            .with_label_values(&[meeting_id, session_id, reporting_user_id])
+            .with_label_values(&[
+                meeting_id,
+                session_id,
+                reporting_user_id,
+                reporter_display_name.as_str(),
+            ])
             .set(if health_packet.is_tab_visible {
                 1.0
             } else {
@@ -323,7 +412,12 @@ fn process_health_packet_to_metrics_pb(
                 meeting_id, session_id, reporting_user_id, mem_used
             );
             CLIENT_MEMORY_USED_BYTES
-                .with_label_values(&[meeting_id, session_id, reporting_user_id])
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                ])
                 .set(mem_used as f64);
         }
 
@@ -333,9 +427,48 @@ fn process_health_packet_to_metrics_pb(
                 meeting_id, session_id, reporting_user_id, mem_total
             );
             CLIENT_MEMORY_TOTAL_BYTES
-                .with_label_values(&[meeting_id, session_id, reporting_user_id])
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                ])
                 .set(mem_total as f64);
         }
+
+        // P1 metrics: send queue, packet rates, tab throttled
+        let reporter_labels: [&str; 4] = [
+            meeting_id,
+            session_id,
+            reporting_user_id,
+            reporter_display_name.as_str(),
+        ];
+
+        if let Some(send_queue) = health_packet.send_queue_bytes {
+            CLIENT_SEND_QUEUE_BYTES
+                .with_label_values(&reporter_labels)
+                .set(send_queue as f64);
+        }
+
+        if let Some(rx_pps) = health_packet.packets_received_per_sec {
+            CLIENT_PACKETS_RECEIVED_PER_SEC
+                .with_label_values(&reporter_labels)
+                .set(rx_pps);
+        }
+
+        if let Some(tx_pps) = health_packet.packets_sent_per_sec {
+            CLIENT_PACKETS_SENT_PER_SEC
+                .with_label_values(&reporter_labels)
+                .set(tx_pps);
+        }
+
+        CLIENT_TAB_THROTTLED
+            .with_label_values(&reporter_labels)
+            .set(if health_packet.is_tab_throttled {
+                1.0
+            } else {
+                0.0
+            });
 
         // Process peer health data
         if !health_packet.peer_stats.is_empty() {
@@ -343,6 +476,33 @@ fn process_health_packet_to_metrics_pb(
 
             for (peer_id, peer_data) in &health_packet.peer_stats {
                 participants_count += 1;
+
+                // Compute peer display name once at the top of the loop
+                let peer_dn = {
+                    let dn_map = display_name_map.lock().unwrap();
+                    dn_map
+                        .get(peer_id)
+                        .cloned()
+                        .unwrap_or_else(|| peer_id.to_string())
+                };
+                // Track peer display name for cleanup
+                {
+                    let mut tracker = session_tracker.lock().unwrap();
+                    let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+                    if let Some(info) = tracker.get_mut(&key) {
+                        info.to_peer_display_names
+                            .insert(peer_id.to_string(), peer_dn.clone());
+                        info.to_peers.insert(peer_id.clone());
+                    }
+                }
+                let peer_labels: [&str; 6] = [
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    peer_id,
+                    reporter_display_name.as_str(),
+                    peer_dn.as_str(),
+                ];
 
                 // Set peer connection metric
                 PEER_CONNECTIONS_TOTAL
@@ -362,199 +522,90 @@ fn process_health_packet_to_metrics_pb(
                     {
                         let can_listen = peer_data.can_listen;
                         PEER_CAN_LISTEN
-                            .with_label_values(&[
-                                meeting_id,
-                                session_id,
-                                reporting_user_id,
-                                peer_id,
-                            ])
+                            .with_label_values(&peer_labels)
                             .set(if can_listen { 1.0 } else { 0.0 });
-                        // Track to_peer used
-                        let mut tracker = session_tracker.lock().unwrap();
-                        let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-                        if let Some(info) = tracker.get_mut(&key) {
-                            info.to_peers.insert(peer_id.clone());
-                        }
                     }
 
                     // Process can_see
                     {
                         let can_see = peer_data.can_see;
                         PEER_CAN_SEE
-                            .with_label_values(&[
-                                meeting_id,
-                                session_id,
-                                reporting_user_id,
-                                peer_id,
-                            ])
+                            .with_label_values(&peer_labels)
                             .set(if can_see { 1.0 } else { 0.0 });
-                        let mut tracker = session_tracker.lock().unwrap();
-                        let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-                        if let Some(info) = tracker.get_mut(&key) {
-                            info.to_peers.insert(peer_id.clone());
-                        }
                     }
 
                     // Process NetEQ metrics from neteq_stats object
                     if let Some(neteq_stats) = peer_data.neteq_stats.as_ref() {
                         if neteq_stats.current_buffer_size_ms != 0.0 {
                             NETEQ_AUDIO_BUFFER_MS
-                                .with_label_values(&[
-                                    meeting_id,
-                                    session_id,
-                                    reporting_user_id,
-                                    peer_id,
-                                ])
+                                .with_label_values(&peer_labels)
                                 .set(neteq_stats.current_buffer_size_ms);
-                            let mut tracker = session_tracker.lock().unwrap();
-                            let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-                            if let Some(info) = tracker.get_mut(&key) {
-                                info.to_peers.insert(peer_id.clone());
-                            }
                         }
+
+                        // Target delay (jitter estimate)
+                        NETEQ_TARGET_DELAY_MS
+                            .with_label_values(&peer_labels)
+                            .set(neteq_stats.target_delay_ms);
 
                         if neteq_stats.packets_awaiting_decode != 0.0 {
                             NETEQ_PACKETS_AWAITING_DECODE
-                                .with_label_values(&[
-                                    meeting_id,
-                                    session_id,
-                                    reporting_user_id,
-                                    peer_id,
-                                ])
+                                .with_label_values(&peer_labels)
                                 .set(neteq_stats.packets_awaiting_decode);
-                            let mut tracker = session_tracker.lock().unwrap();
-                            let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-                            if let Some(info) = tracker.get_mut(&key) {
-                                info.to_peers.insert(peer_id.clone());
-                            }
                         }
 
                         if neteq_stats.packets_per_sec != 0.0 {
                             NETEQ_PACKETS_PER_SEC
-                                .with_label_values(&[
-                                    meeting_id,
-                                    session_id,
-                                    reporting_user_id,
-                                    peer_id,
-                                ])
+                                .with_label_values(&peer_labels)
                                 .set(neteq_stats.packets_per_sec);
-                            let mut tracker = session_tracker.lock().unwrap();
-                            let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-                            if let Some(info) = tracker.get_mut(&key) {
-                                info.to_peers.insert(peer_id.clone());
-                            }
                         }
 
                         // Process NetEQ operation metrics from network.operation_counters
                         if let Some(network) = neteq_stats.network.as_ref() {
                             if let Some(operation_counters) = network.operation_counters.as_ref() {
                                 // Normal operations per second
-                                {
-                                    NETEQ_NORMAL_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.normal_per_sec);
-                                }
+                                NETEQ_NORMAL_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.normal_per_sec);
 
                                 // Expand operations per second
-                                {
-                                    NETEQ_EXPAND_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.expand_per_sec);
-                                }
+                                NETEQ_EXPAND_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.expand_per_sec);
 
                                 // Accelerate operations per second
-                                {
-                                    NETEQ_ACCELERATE_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.accelerate_per_sec);
-                                }
+                                NETEQ_ACCELERATE_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.accelerate_per_sec);
 
                                 // Fast accelerate operations per second
-                                {
-                                    NETEQ_FAST_ACCELERATE_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.fast_accelerate_per_sec);
-                                }
+                                NETEQ_FAST_ACCELERATE_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.fast_accelerate_per_sec);
 
                                 // Preemptive expand operations per second
-                                {
-                                    NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.preemptive_expand_per_sec);
-                                }
+                                NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.preemptive_expand_per_sec);
 
                                 // Merge operations per second
-                                {
-                                    NETEQ_MERGE_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.merge_per_sec);
-                                }
+                                NETEQ_MERGE_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.merge_per_sec);
 
                                 // Comfort noise operations per second
-                                {
-                                    NETEQ_COMFORT_NOISE_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.comfort_noise_per_sec);
-                                }
+                                NETEQ_COMFORT_NOISE_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.comfort_noise_per_sec);
 
                                 // DTMF operations per second
-                                {
-                                    NETEQ_DTMF_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.dtmf_per_sec);
-                                }
+                                NETEQ_DTMF_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.dtmf_per_sec);
 
                                 // Undefined operations per second
-                                {
-                                    NETEQ_UNDEFINED_OPS_PER_SEC
-                                        .with_label_values(&[
-                                            meeting_id,
-                                            session_id,
-                                            reporting_user_id,
-                                            peer_id,
-                                        ])
-                                        .set(operation_counters.undefined_per_sec);
-                                }
+                                NETEQ_UNDEFINED_OPS_PER_SEC
+                                    .with_label_values(&peer_labels)
+                                    .set(operation_counters.undefined_per_sec);
                             }
                         }
                     }
@@ -563,25 +614,21 @@ fn process_health_packet_to_metrics_pb(
                     if let Some(video_stats) = peer_data.video_stats.as_ref() {
                         if video_stats.fps_received != 0.0 {
                             VIDEO_FPS
-                                .with_label_values(&[
-                                    meeting_id,
-                                    session_id,
-                                    reporting_user_id,
-                                    peer_id,
-                                ])
+                                .with_label_values(&peer_labels)
                                 .set(video_stats.fps_received);
+                        }
+
+                        if video_stats.bitrate_kbps != 0 {
+                            VIDEO_BITRATE_KBPS
+                                .with_label_values(&peer_labels)
+                                .set(video_stats.bitrate_kbps as f64);
                         }
 
                         if video_stats.frames_buffered != 0.0 {
                             debug!("Setting VIDEO_PACKETS_BUFFERED for meeting={}, session={}, from_peer={}, to_peer={}, value={}",
                                    meeting_id, session_id, reporting_user_id, peer_id, video_stats.frames_buffered);
                             VIDEO_PACKETS_BUFFERED
-                                .with_label_values(&[
-                                    meeting_id,
-                                    session_id,
-                                    reporting_user_id,
-                                    peer_id,
-                                ])
+                                .with_label_values(&peer_labels)
                                 .set(video_stats.frames_buffered);
                         }
                     }
@@ -594,7 +641,7 @@ fn process_health_packet_to_metrics_pb(
                             meeting_id, session_id, reporting_user_id, peer_id, peer_data.frames_dropped_per_sec
                         );
                         VIDEO_FRAMES_DROPPED
-                            .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
+                            .with_label_values(&peer_labels)
                             .set(peer_data.frames_dropped_per_sec);
                     }
 
@@ -605,32 +652,41 @@ fn process_health_packet_to_metrics_pb(
                             meeting_id, session_id, reporting_user_id, peer_id, peer_data.audio_packet_loss_pct
                         );
                         AUDIO_PACKET_LOSS_PCT
-                            .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
+                            .with_label_values(&peer_labels)
                             .set(peer_data.audio_packet_loss_pct);
+                    }
+
+                    // Quality scores (optional in proto — only set when stream is active)
+                    if let Some(score) = peer_data.audio_quality_score {
+                        AUDIO_QUALITY_SCORE
+                            .with_label_values(&peer_labels)
+                            .set(score);
+                    }
+
+                    if let Some(score) = peer_data.video_quality_score {
+                        VIDEO_QUALITY_SCORE
+                            .with_label_values(&peer_labels)
+                            .set(score);
+                    }
+
+                    if let Some(score) = peer_data.call_quality_score {
+                        CALL_QUALITY_SCORE
+                            .with_label_values(&peer_labels)
+                            .set(score);
                     }
 
                     // Process explicit peer status flags if present
                     {
                         let audio_enabled = peer_data.audio_enabled;
                         PEER_AUDIO_ENABLED
-                            .with_label_values(&[
-                                meeting_id,
-                                session_id,
-                                reporting_user_id,
-                                peer_id,
-                            ])
+                            .with_label_values(&peer_labels)
                             .set(if audio_enabled { 1.0 } else { 0.0 });
                     }
 
                     {
                         let video_enabled = peer_data.video_enabled;
                         PEER_VIDEO_ENABLED
-                            .with_label_values(&[
-                                meeting_id,
-                                session_id,
-                                reporting_user_id,
-                                peer_id,
-                            ])
+                            .with_label_values(&peer_labels)
                             .set(if video_enabled { 1.0 } else { 0.0 });
                     }
                 }
@@ -650,6 +706,7 @@ async fn nats_health_consumer(
     nats_client: Client,
     health_store: HealthDataStore,
     session_tracker: SessionTracker,
+    display_name_map: DisplayNameMap,
 ) -> anyhow::Result<()> {
     // Subscribe to all health diagnostics topics from all regions
     let queue_group = "metrics-server-health-diagnostics";
@@ -661,7 +718,9 @@ async fn nats_health_consumer(
 
     while let Some(message) = subscription.next().await {
         debug!("Received health message from NATS: {}", message.subject);
-        if let Err(e) = handle_health_message(message, &health_store, &session_tracker).await {
+        if let Err(e) =
+            handle_health_message(message, &health_store, &session_tracker, &display_name_map).await
+        {
             error!("Failed to handle health message: {}", e);
         }
     }
@@ -673,6 +732,7 @@ async fn handle_health_message(
     message: Message,
     health_store: &HealthDataStore,
     session_tracker: &SessionTracker,
+    display_name_map: &DisplayNameMap,
 ) -> anyhow::Result<()> {
     let topic = &message.subject;
     debug!("Received health data from topic: {}", topic);
@@ -692,7 +752,9 @@ async fn handle_health_message(
 
     if is_fresh {
         // Update Prometheus metrics immediately on ingest
-        if let Err(e) = process_health_packet_to_metrics_pb(&health_packet, session_tracker) {
+        if let Err(e) =
+            process_health_packet_to_metrics_pb(&health_packet, session_tracker, display_name_map)
+        {
             error!("Failed to process health packet for metrics: {}", e);
         }
     } else {
@@ -746,12 +808,18 @@ async fn main() -> anyhow::Result<()> {
     // Create shared session tracker
     let session_tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
+    // Create shared display name map (session_id → display_name)
+    let display_name_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
     // Start NATS consumer in background
     let nats_store = health_store.clone();
     let nats_client_clone = nats_client.clone();
     let nats_tracker = session_tracker.clone();
+    let nats_dn_map = display_name_map.clone();
     task::spawn(async move {
-        if let Err(e) = nats_health_consumer(nats_client_clone, nats_store, nats_tracker).await {
+        if let Err(e) =
+            nats_health_consumer(nats_client_clone, nats_store, nats_tracker, nats_dn_map).await
+        {
             error!("NATS consumer failed: {}", e);
         }
     });
@@ -802,7 +870,11 @@ mod tests {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
         // Process and ensure no error
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
 
         // Metrics presence is indirectly verified by successful processing; we avoid scraping here.
@@ -926,6 +998,8 @@ mod tests {
             last_seen: Instant::now(),
             to_peers: HashSet::new(),
             peer_ids: HashSet::new(),
+            display_name: "test_user".to_string(),
+            to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
         };
 
@@ -950,6 +1024,8 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                display_name: "test_user".to_string(),
+                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key.clone(), session_info);
@@ -992,6 +1068,8 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                display_name: "test_user".to_string(),
+                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
@@ -1008,6 +1086,8 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                display_name: "test_user".to_string(),
+                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
             };
             // Simulate old timestamp by subtracting 40 seconds
@@ -1046,7 +1126,11 @@ mod tests {
             create_test_health_packet("session_123", "meeting_456", "alice", peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &health_packet,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
 
         // Verify session was tracked
@@ -1072,7 +1156,11 @@ mod tests {
         let mut hp = create_test_health_packet("sess_self", "meet_self", "alice", peer_stats);
         hp.reporting_audio_enabled = true;
         hp.reporting_video_enabled = true;
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
 
         assert!(series_exists(
@@ -1096,7 +1184,11 @@ mod tests {
         peer_stats.insert(peer_id.clone(), ps);
 
         let hp = create_test_health_packet("sess_ab", "meet_ab", "alice", peer_stats);
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
 
         assert!(series_exists(
@@ -1175,7 +1267,11 @@ mod tests {
         let reporting_user_id = "alice";
         let packet =
             create_test_health_packet(session_id, meeting_id, reporting_user_id, peer_stats);
-        let result = process_health_packet_to_metrics_pb(&packet, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &packet,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
 
         // Confirm a series exists
@@ -1227,7 +1323,11 @@ mod tests {
             create_test_health_packet("session_789", "meeting_999", "alice", peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &health_packet,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
 
         // Verify session tracking
@@ -1245,7 +1345,11 @@ mod tests {
         // Test minimal packet
         let peer_stats = std::collections::HashMap::new();
         let hp = create_test_health_packet("session_123", "meeting_123", "alice", peer_stats);
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
     }
 
@@ -1266,6 +1370,8 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                display_name: "test_user".to_string(),
+                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key1, session_info1);
@@ -1279,6 +1385,8 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                display_name: "test_user".to_string(),
+                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
             };
             session_info2.last_seen -= Duration::from_secs(40);
@@ -1293,6 +1401,8 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                display_name: "test_user".to_string(),
+                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key3, session_info3);
@@ -1326,6 +1436,8 @@ mod tests {
             last_seen: Instant::now(),
             to_peers: HashSet::new(),
             peer_ids: HashSet::new(),
+            display_name: "test_user".to_string(),
+            to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
         };
 
@@ -1350,6 +1462,8 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                display_name: "test_user".to_string(),
+                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
@@ -1375,7 +1489,11 @@ mod tests {
             create_test_health_packet("session_empty", "meeting_empty", "alice", empty_peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &health_packet,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
 
         // Verify session was still tracked even with empty peer stats
@@ -1404,7 +1522,11 @@ mod tests {
         hp.active_server_rtt_ms = 42.5;
 
         // Process the packet to set RTT metrics
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(result.is_ok());
 
         // Verify server info was tracked
@@ -1487,6 +1609,8 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                display_name: "test_user".to_string(),
+                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
             };
             // Set to exactly 30 seconds ago (timeout boundary)

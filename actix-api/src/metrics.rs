@@ -20,7 +20,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_gauge_vec, register_histogram, Counter, GaugeVec, Histogram,
+    register_counter, register_counter_vec, register_gauge_vec, register_histogram, Counter,
+    CounterVec, GaugeVec, Histogram,
 };
 
 lazy_static! {
@@ -35,7 +36,7 @@ lazy_static! {
     pub static ref PEER_CAN_LISTEN: GaugeVec = register_gauge_vec!(
         "videocall_peer_can_listen",
         "Indicates if a peer can receive audio from another peer (1=yes, 0=no)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create peer_can_listen metric");
 
@@ -43,7 +44,7 @@ lazy_static! {
     pub static ref PEER_CAN_SEE: GaugeVec = register_gauge_vec!(
         "videocall_peer_can_see",
         "Indicates if a peer can receive video from another peer (1=yes, 0=no)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create peer_can_see metric");
 
@@ -51,7 +52,7 @@ lazy_static! {
     pub static ref NETEQ_AUDIO_BUFFER_MS: GaugeVec = register_gauge_vec!(
         "videocall_neteq_audio_buffer_ms",
         "Audio data buffered for playback in milliseconds",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_audio_buffer_ms metric");
 
@@ -59,7 +60,7 @@ lazy_static! {
     pub static ref NETEQ_PACKETS_AWAITING_DECODE: GaugeVec = register_gauge_vec!(
         "videocall_neteq_packets_awaiting_decode",
         "Number of encoded packets waiting to be decoded",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_packets_awaiting_decode metric");
 
@@ -67,7 +68,7 @@ lazy_static! {
     pub static ref NETEQ_PACKETS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_packets_per_sec",
         "Number of audio RTP packets received per second (rolling 1s window)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_packets_per_sec metric");
 
@@ -75,7 +76,7 @@ lazy_static! {
     pub static ref NETEQ_NORMAL_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_normal_ops_per_sec",
         "Normal decode operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_normal_ops_per_sec metric");
 
@@ -83,7 +84,7 @@ lazy_static! {
     pub static ref NETEQ_EXPAND_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_expand_ops_per_sec",
         "Expand operations per second (packet loss concealment)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_expand_ops_per_sec metric");
 
@@ -91,7 +92,7 @@ lazy_static! {
     pub static ref NETEQ_ACCELERATE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_accelerate_ops_per_sec",
         "Accelerate operations per second (time compression)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_accelerate_ops_per_sec metric");
 
@@ -99,7 +100,7 @@ lazy_static! {
     pub static ref NETEQ_FAST_ACCELERATE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_fast_accelerate_ops_per_sec",
         "Fast accelerate operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_fast_accelerate_ops_per_sec metric");
 
@@ -107,7 +108,7 @@ lazy_static! {
     pub static ref NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_preemptive_expand_ops_per_sec",
         "Preemptive expand operations per second (time expansion)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_preemptive_expand_ops_per_sec metric");
 
@@ -115,7 +116,7 @@ lazy_static! {
     pub static ref NETEQ_MERGE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_merge_ops_per_sec",
         "Merge operations per second (blending)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_merge_ops_per_sec metric");
 
@@ -123,7 +124,7 @@ lazy_static! {
     pub static ref NETEQ_COMFORT_NOISE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_comfort_noise_ops_per_sec",
         "Comfort noise operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_comfort_noise_ops_per_sec metric");
 
@@ -131,7 +132,7 @@ lazy_static! {
     pub static ref NETEQ_DTMF_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_dtmf_ops_per_sec",
         "DTMF operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_dtmf_ops_per_sec metric");
 
@@ -139,7 +140,7 @@ lazy_static! {
     pub static ref NETEQ_UNDEFINED_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_undefined_ops_per_sec",
         "Undefined operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_undefined_ops_per_sec metric");
 
@@ -179,7 +180,7 @@ lazy_static! {
     pub static ref VIDEO_PACKETS_BUFFERED: GaugeVec = register_gauge_vec!(
         "videocall_video_packets_buffered",
         "Number of video packets/frames currently buffered awaiting decode",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create video_packets_buffered metric");
 
@@ -187,7 +188,7 @@ lazy_static! {
     pub static ref VIDEO_FPS: GaugeVec = register_gauge_vec!(
         "videocall_video_fps",
         "Video frames per second observed by the receiver",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create video_fps metric");
 
@@ -195,7 +196,7 @@ lazy_static! {
     pub static ref PEER_AUDIO_ENABLED: GaugeVec = register_gauge_vec!(
         "videocall_peer_audio_enabled",
         "Indicates if sender's audio is enabled (1=yes, 0=no)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create peer_audio_enabled metric");
 
@@ -203,7 +204,7 @@ lazy_static! {
     pub static ref PEER_VIDEO_ENABLED: GaugeVec = register_gauge_vec!(
         "videocall_peer_video_enabled",
         "Indicates if sender's camera is enabled (1=yes, 0=no)",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create peer_video_enabled metric");
 
@@ -211,7 +212,7 @@ lazy_static! {
     pub static ref SELF_AUDIO_ENABLED: GaugeVec = register_gauge_vec!(
         "videocall_self_audio_enabled",
         "Sender self-reported audio enabled (1=yes, 0=no)",
-        &["meeting_id", "peer_id"]
+        &["meeting_id", "peer_id", "display_name"]
     )
     .expect("Failed to create self_audio_enabled metric");
 
@@ -219,7 +220,7 @@ lazy_static! {
     pub static ref SELF_VIDEO_ENABLED: GaugeVec = register_gauge_vec!(
         "videocall_self_video_enabled",
         "Sender self-reported video enabled (1=yes, 0=no)",
-        &["meeting_id", "peer_id"]
+        &["meeting_id", "peer_id", "display_name"]
     )
     .expect("Failed to create self_video_enabled metric");
 
@@ -227,7 +228,7 @@ lazy_static! {
     pub static ref CLIENT_ACTIVE_SERVER_RTT_MS: GaugeVec = register_gauge_vec!(
         "videocall_client_active_server_rtt_ms",
         "Client-side measured RTT to the elected server (ms)",
-        &["meeting_id", "session_id", "peer_id", "server_url", "server_type"]
+        &["meeting_id", "session_id", "peer_id", "server_url", "server_type", "display_name"]
     )
     .expect("Failed to create client_active_server_rtt_ms metric");
 
@@ -235,7 +236,7 @@ lazy_static! {
     pub static ref CLIENT_ACTIVE_SERVER: GaugeVec = register_gauge_vec!(
         "videocall_client_active_server",
         "Indicates which server a client is connected to (1)",
-        &["meeting_id", "session_id", "peer_id", "server_url", "server_type"]
+        &["meeting_id", "session_id", "peer_id", "server_url", "server_type", "display_name"]
     )
     .expect("Failed to create client_active_server metric");
 
@@ -302,7 +303,7 @@ lazy_static! {
     pub static ref CLIENT_TAB_VISIBLE: GaugeVec = register_gauge_vec!(
         "videocall_client_tab_visible",
         "Indicates if client browser tab is visible (1=visible, 0=hidden/throttled)",
-        &["meeting_id", "session_id", "peer_id"]
+        &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create client_tab_visible metric");
 
@@ -310,7 +311,7 @@ lazy_static! {
     pub static ref CLIENT_MEMORY_USED_BYTES: GaugeVec = register_gauge_vec!(
         "videocall_client_memory_used_bytes",
         "JS heap memory used by client in bytes (Chrome only)",
-        &["meeting_id", "session_id", "peer_id"]
+        &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create client_memory_used_bytes metric");
 
@@ -318,7 +319,7 @@ lazy_static! {
     pub static ref CLIENT_MEMORY_TOTAL_BYTES: GaugeVec = register_gauge_vec!(
         "videocall_client_memory_total_bytes",
         "JS heap memory limit for client in bytes (Chrome only)",
-        &["meeting_id", "session_id", "peer_id"]
+        &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create client_memory_total_bytes metric");
 
@@ -326,7 +327,7 @@ lazy_static! {
     pub static ref VIDEO_FRAMES_DROPPED: GaugeVec = register_gauge_vec!(
         "videocall_video_frames_dropped",
         "Number of video frames dropped by the receiver",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create video_frames_dropped metric");
 
@@ -334,7 +335,123 @@ lazy_static! {
     pub static ref AUDIO_PACKET_LOSS_PCT: GaugeVec = register_gauge_vec!(
         "videocall_audio_packet_loss_pct",
         "Audio packet loss percentage calculated from NetEQ concealment events",
-        &["meeting_id", "session_id", "from_peer", "to_peer"]
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create audio_packet_loss_pct metric");
+
+    /// Audio quality score (0-100, absent when no audio flowing)
+    pub static ref AUDIO_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
+        "videocall_audio_quality_score",
+        "Audio quality score 0-100 (concealment + packet loss penalty)",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create audio_quality_score metric");
+
+    /// Video quality score (0-100, absent when video disabled)
+    pub static ref VIDEO_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
+        "videocall_video_quality_score",
+        "Video quality score 0-100 (FPS health + decode error penalty)",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_quality_score metric");
+
+    /// Call quality score (0-100, min of audio and video)
+    pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
+        "videocall_call_quality_score",
+        "Call quality score 0-100 — min(audio, video), primary alerting metric",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create call_quality_score metric");
+
+    /// NetEQ target delay (jitter estimate) in milliseconds
+    pub static ref NETEQ_TARGET_DELAY_MS: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_target_delay_ms",
+        "NetEQ delay manager target delay (network jitter estimate) in ms",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create neteq_target_delay_ms metric");
+
+    /// Video bitrate observed by receiver (kbps)
+    pub static ref VIDEO_BITRATE_KBPS: GaugeVec = register_gauge_vec!(
+        "videocall_video_bitrate_kbps",
+        "Video bitrate observed by the receiver in kbps",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_bitrate_kbps metric");
+
+    // ===== P1: PREVIOUSLY IGNORED CLIENT HEALTH FIELDS =====
+
+    /// Client send queue bytes (WebSocket bufferedAmount)
+    pub static ref CLIENT_SEND_QUEUE_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_client_send_queue_bytes",
+        "Client-side send queue buffer size in bytes",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_send_queue_bytes metric");
+
+    /// Client total packets received per second
+    pub static ref CLIENT_PACKETS_RECEIVED_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_client_packets_received_per_sec",
+        "Total packets received per second by client",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_packets_received_per_sec metric");
+
+    /// Client total packets sent per second
+    pub static ref CLIENT_PACKETS_SENT_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_client_packets_sent_per_sec",
+        "Total packets sent per second by client",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_packets_sent_per_sec metric");
+
+    /// Client tab throttled indicator (1=throttled by browser, 0=normal)
+    pub static ref CLIENT_TAB_THROTTLED: GaugeVec = register_gauge_vec!(
+        "videocall_client_tab_throttled",
+        "Indicates if client tab is throttled by browser (1=throttled, 0=normal)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_tab_throttled metric");
+
+    // ===== RELAY SERVER-SIDE METRICS (in-process on relay binaries) =====
+
+    /// Total packet drops from try_send() failures on outbound channels/mailboxes
+    pub static ref RELAY_PACKET_DROPS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_packet_drops_total",
+        "Total packets dropped due to full outbound queue or mailbox",
+        &["room", "transport", "drop_reason"]
+    )
+    .expect("Failed to create relay_packet_drops_total metric");
+
+    /// Current outbound channel occupancy (WebTransport bounded channel only)
+    pub static ref RELAY_OUTBOUND_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
+        "relay_outbound_queue_depth",
+        "Current outbound channel occupancy (WebTransport only)",
+        &["room"]
+    )
+    .expect("Failed to create relay_outbound_queue_depth metric");
+
+    /// NATS publish latency histogram (milliseconds)
+    pub static ref RELAY_NATS_PUBLISH_LATENCY_MS: Histogram = register_histogram!(
+        "relay_nats_publish_latency_ms",
+        "Time to publish a media packet to NATS (ms)",
+        vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0]
+    )
+    .expect("Failed to create relay_nats_publish_latency_ms metric");
+
+    /// Active sessions per room on this relay instance
+    pub static ref RELAY_ACTIVE_SESSIONS_PER_ROOM: GaugeVec = register_gauge_vec!(
+        "relay_active_sessions_per_room",
+        "Number of active connections per meeting room on this relay",
+        &["room", "transport"]
+    )
+    .expect("Failed to create relay_active_sessions_per_room metric");
+
+    /// Total bytes forwarded per room (use rate() in PromQL for bps)
+    pub static ref RELAY_ROOM_BYTES_TOTAL: CounterVec = register_counter_vec!(
+        "relay_room_bytes_total",
+        "Total bytes forwarded per room (use rate() for bps)",
+        &["room", "direction"]
+    )
+    .expect("Failed to create relay_room_bytes_total metric");
 }

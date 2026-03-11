@@ -74,6 +74,11 @@ rustlemania-websocket:
           - websocket-us-east.webtransport.video
           - webtransport-us-east.webtransport.video
 
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+
   autoscaling:
     enabled: false
     minReplicas: 1

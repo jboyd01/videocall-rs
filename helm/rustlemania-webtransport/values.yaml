@@ -43,7 +43,10 @@ resources:
   requests:
     cpu: "300m"
     memory: "300Mi"
-podAnnotations: {}
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "444"
+  prometheus.io/path: "/metrics"
 podSecurityContext: {}
 securityContext: {}
 service:
