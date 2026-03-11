@@ -361,6 +361,7 @@ fn render_participants(
         Cell::from("Participant"),
         Cell::from("Status"),
         Cell::from("Connection").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Audio").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Video").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("").style(Style::default().add_modifier(Modifier::BOLD)),
@@ -375,6 +376,7 @@ fn render_participants(
     let header_cols = Row::new(vec![
         Cell::from(""),
         Cell::from(""),
+        Cell::from("WT").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("RTT").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Conc/s").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("FPS").style(Style::default().add_modifier(Modifier::BOLD)),
@@ -396,6 +398,7 @@ fn render_participants(
         [
             Constraint::Min(52),    // name (display | user_id | s:XXXX)
             Constraint::Length(11), // [V][M]
+            Constraint::Length(3),  // WT indicator
             Constraint::Length(8),  // RTT
             Constraint::Length(8),  // concealment/s
             Constraint::Length(5),  // FPS
@@ -441,6 +444,13 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
     // Note: Removed talking indicator - can't reliably detect from packet stream
     // Audio packets arrive at constant rate regardless of voice activity
     let status_line = Line::from(vec![video, mic]);
+
+    // WT indicator
+    let wt_indicator = if p.active_transport.as_deref() == Some("webtransport") {
+        "✓"
+    } else {
+        " "
+    };
 
     // RTT badge
     let (rtt_str, rtt_color) = match p.rtt_ms {
@@ -520,6 +530,7 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
     Row::new(vec![
         Cell::from(name_col).style(name_style),
         Cell::from(status_line),
+        Cell::from(wt_indicator).style(Style::default().fg(Color::Cyan)),
         Cell::from(rtt_str).style(Style::default().fg(rtt_color)),
         Cell::from(conceal_str).style(Style::default().fg(conceal_color)),
         Cell::from(fps_str).style(Style::default().fg(if p.video_enabled {
@@ -610,12 +621,17 @@ fn render_detail(
         .map(|r| format!("{}ms", r as u32))
         .unwrap_or_else(|| "--".to_string());
 
+    let transport_str = p.active_transport.as_deref().unwrap_or("unknown");
+
     let mut lines: Vec<Line> = vec![Line::from(vec![
         label("Video: "),
         flag(p.video_enabled),
         Span::raw("   "),
         label("Audio: "),
         flag(p.audio_enabled),
+        Span::raw("   "),
+        label("Transport: "),
+        Span::styled(transport_str, Style::default().fg(Color::Cyan)),
         Span::raw("   "),
         label("RTT: "),
         Span::styled(rtt_str, rtt_style_from(p.rtt_ms)),
@@ -1012,6 +1028,10 @@ fn render_help(f: &mut Frame, area: Rect) {
             Style::default().fg(Color::Yellow),
         )),
         Line::from("  [V][M]  Camera and microphone enabled (sender self-report)"),
+        Line::from(""),
+        Line::from(
+            "  WT      WebTransport indicator. ✓ if using WebTransport, blank if WebSocket.",
+        ),
         Line::from(""),
         Line::from(
             "  RTT     Round-trip time to the media relay server (self-reported by client).",

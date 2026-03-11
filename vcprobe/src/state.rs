@@ -59,6 +59,8 @@ pub struct Participant {
     pub last_heartbeat: Instant,
     /// RTT to server, self-reported in HEALTH packets
     pub rtt_ms: Option<f64>,
+    /// Active transport type: "webtransport" or "websocket"
+    pub active_transport: Option<String>,
     /// Latest quality snapshot from any peer observing this participant
     pub quality: Option<QualitySnapshot>,
     /// Tab visibility state
@@ -88,6 +90,7 @@ impl Participant {
             audio_enabled: false,
             last_heartbeat: Instant::now(),
             rtt_ms: None,
+            active_transport: None,
             quality: None,
             is_tab_visible: true,
             memory_used_bytes: None,
@@ -249,6 +252,9 @@ impl MeetingState {
             }
         }
         p.rtt_ms = Some(health.active_server_rtt_ms);
+        if !health.active_server_type.is_empty() {
+            p.active_transport = Some(health.active_server_type.clone());
+        }
         p.is_tab_visible = health.is_tab_visible;
         p.memory_used_bytes = health.memory_used_bytes;
         p.avg_encode_latency_ms = health.avg_encode_latency_ms;
