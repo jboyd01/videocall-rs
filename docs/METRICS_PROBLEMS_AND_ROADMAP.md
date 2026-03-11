@@ -326,7 +326,8 @@ vcprobe connects to NATS and passively observes a meeting. From that position, i
 | Name color (green/yellow/red) | Overall call quality from an observer's perspective |
 | Quality bar (█░) | `call_quality_score` 0–100 |
 | [V][M] badges | Video and audio enabled (from HEARTBEAT packets) |
-| RTT | Self-reported server round-trip time |
+| WT | Transport type: ✓ if WebTransport, blank if WebSocket |
+| RTT | Self-reported server round-trip time (active connection) |
 | Conc/s or "silent" | Audio concealment rate; "silent" means DTX, not loss |
 | FPS | Video frames/sec observed by a peer |
 | kbps | Video bitrate observed by a peer |
