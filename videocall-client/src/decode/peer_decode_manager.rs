@@ -513,16 +513,19 @@ impl PeerDecodeManager {
         }
     }
 
-    pub fn run_peer_monitor(&mut self) {
+    pub fn run_peer_monitor(&mut self) -> Vec<String> {
         let removed = self
             .connected_peers
             .remove_if_and_return(|peer| peer.check_heartbeat());
+        let mut removed_ids = Vec::new();
         for (_session_id, peer) in removed {
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
+            removed_ids.push(peer.sid_str.clone());
             self.on_peer_removed.emit(peer.sid_str);
         }
+        removed_ids
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {

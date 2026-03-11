@@ -746,7 +746,7 @@ impl HealthReporter {
                 .map(|n| n.packets_per_sec)
                 .unwrap_or(0.0);
 
-            if audio_fresh && audio_packets_per_sec >= 2.0 {
+            if audio_fresh && audio_packets_per_sec >= 2.0 && health_data.audio_enabled {
                 let conceal = ps
                     .neteq_stats
                     .as_ref()

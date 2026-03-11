@@ -372,7 +372,16 @@ impl VideoCallClient {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         match inner.try_borrow_mut() {
                             Ok(mut inner) => {
-                                inner.peer_decode_manager.run_peer_monitor();
+                                let removed = inner.peer_decode_manager.run_peer_monitor();
+                                if !removed.is_empty() {
+                                    if let Some(hr) = &inner.health_reporter {
+                                        if let Ok(reporter) = hr.try_borrow() {
+                                            for peer_id in &removed {
+                                                reporter.remove_peer(peer_id);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(_) => {
                                 on_connection_lost.emit(JsValue::from_str(

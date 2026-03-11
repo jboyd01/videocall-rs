@@ -494,12 +494,7 @@ fn participant_row<'a>(p: &'a Participant) -> Row<'a> {
     };
     let (aud_str, aud_color) = fmt_score(p.quality.as_ref().and_then(|q| q.audio_quality_score));
     let (vid_str, vid_color) = fmt_score(p.quality.as_ref().and_then(|q| q.video_quality_score));
-    let (call_str, call_color) = fmt_score(
-        p.quality
-            .as_ref()
-            .and_then(|q| q.call_quality_score)
-            .or_else(|| p.quality_score().map(|s| (1.0 - s) * 100.0)),
-    );
+    let (call_str, call_color) = fmt_score(p.quality.as_ref().and_then(|q| q.call_quality_score));
 
     // Name color-coding driven by call quality score
     let name_color = if stale { Color::DarkGray } else { call_color };
