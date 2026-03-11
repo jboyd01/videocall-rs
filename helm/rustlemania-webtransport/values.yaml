@@ -38,11 +38,11 @@ env:
         key: secret
 resources:
   limits:
-    cpu: "300m"
-    memory: "300Mi"
+    cpu: "1000m"
+    memory: "256Mi"
   requests:
-    cpu: "300m"
-    memory: "300Mi"
+    cpu: "100m"
+    memory: "32Mi"
 podAnnotations:
   prometheus.io/scrape: "true"
   prometheus.io/port: "444"
