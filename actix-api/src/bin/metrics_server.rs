@@ -200,50 +200,20 @@ fn remove_session_metrics(session_info: &SessionInfo) {
 
     // Remove all to_peer series we set for this session
     for to_peer in &session_info.to_peers {
-        // Get peer display name for this to_peer
         let peer_dn = session_info
             .to_peer_display_names
             .get(to_peer)
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        // All per-peer metrics now use 6 labels including display names
-        let labels = [
+        remove_per_peer_metrics(
             &session_info.meeting_id,
             &session_info.session_id,
             &session_info.reporting_user_id,
-            to_peer.as_str(),
+            to_peer,
             &session_info.display_name,
             peer_dn,
-        ];
-
-        let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
-        let _ = PEER_CAN_SEE.remove_label_values(&labels);
-        let _ = VIDEO_FPS.remove_label_values(&labels);
-        let _ = VIDEO_PACKETS_BUFFERED.remove_label_values(&labels);
-        let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
-        let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
-        let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_NORMAL_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_FAST_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_MERGE_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_COMFORT_NOISE_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_DTMF_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = NETEQ_UNDEFINED_OPS_PER_SEC.remove_label_values(&labels);
-        let _ = VIDEO_FRAMES_DROPPED.remove_label_values(&labels);
-        let _ = AUDIO_PACKET_LOSS_PCT.remove_label_values(&labels);
-        let _ = PEER_AUDIO_ENABLED.remove_label_values(&labels);
-        let _ = PEER_VIDEO_ENABLED.remove_label_values(&labels);
-
-        // Quality score metrics also use the same 6 labels
-        let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
-        let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
-        let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
-        let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
-        let _ = VIDEO_BITRATE_KBPS.remove_label_values(&labels);
+        );
     }
 
     // Meeting participants is recomputed on next scrape; no need to force remove
@@ -251,6 +221,53 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         "Removed all series for session {} (meeting: {}, peer: {})",
         session_info.session_id, session_info.meeting_id, session_info.reporting_user_id
     );
+}
+
+/// Remove all per-peer Prometheus metrics for a specific reporter→peer pair.
+/// Used both for session cleanup and for removing stale series when a peer's
+/// display_name changes (e.g., from session_id to real name).
+fn remove_per_peer_metrics(
+    meeting_id: &str,
+    session_id: &str,
+    reporting_user_id: &str,
+    to_peer: &str,
+    reporter_display_name: &str,
+    peer_display_name: &str,
+) {
+    let labels = [
+        meeting_id,
+        session_id,
+        reporting_user_id,
+        to_peer,
+        reporter_display_name,
+        peer_display_name,
+    ];
+
+    let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
+    let _ = PEER_CAN_SEE.remove_label_values(&labels);
+    let _ = VIDEO_FPS.remove_label_values(&labels);
+    let _ = VIDEO_PACKETS_BUFFERED.remove_label_values(&labels);
+    let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
+    let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
+    let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_NORMAL_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_FAST_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_MERGE_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_COMFORT_NOISE_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_DTMF_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = NETEQ_UNDEFINED_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = VIDEO_FRAMES_DROPPED.remove_label_values(&labels);
+    let _ = AUDIO_PACKET_LOSS_PCT.remove_label_values(&labels);
+    let _ = PEER_AUDIO_ENABLED.remove_label_values(&labels);
+    let _ = PEER_VIDEO_ENABLED.remove_label_values(&labels);
+    let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
+    let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
+    let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
+    let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
+    let _ = VIDEO_BITRATE_KBPS.remove_label_values(&labels);
 }
 
 fn process_health_packet_to_metrics_pb(
@@ -501,11 +518,27 @@ fn process_health_packet_to_metrics_pb(
                         .cloned()
                         .unwrap_or_else(|| peer_id.to_string())
                 };
-                // Track peer display name for cleanup
+                // Track peer display name for cleanup; remove stale series if name changed
                 {
                     let mut tracker = session_tracker.lock().unwrap();
                     let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                     if let Some(info) = tracker.get_mut(&key) {
+                        if let Some(old_dn) = info.to_peer_display_names.get(peer_id) {
+                            if old_dn != &peer_dn {
+                                debug!(
+                                    "Peer display name changed: {} -> {} for peer {}",
+                                    old_dn, peer_dn, peer_id
+                                );
+                                remove_per_peer_metrics(
+                                    meeting_id,
+                                    session_id,
+                                    reporting_user_id,
+                                    peer_id,
+                                    reporter_display_name.as_str(),
+                                    old_dn,
+                                );
+                            }
+                        }
                         info.to_peer_display_names
                             .insert(peer_id.to_string(), peer_dn.clone());
                         info.to_peers.insert(peer_id.clone());
