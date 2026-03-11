@@ -90,6 +90,8 @@ grafana:
     default:
       videocall-health:
         file: dashboards/videocall-health.json
+      meeting-investigation:
+        file: dashboards/meeting-investigation.json
       server-connections-analytics:
         file: dashboards/server-connections-analytics.json
       # Standard K8s monitoring dashboards (downloaded from grafana.com at startup)
