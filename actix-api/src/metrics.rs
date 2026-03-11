@@ -96,53 +96,9 @@ lazy_static! {
     )
     .expect("Failed to create neteq_accelerate_ops_per_sec metric");
 
-    /// NetEQ fast accelerate operations per second
-    pub static ref NETEQ_FAST_ACCELERATE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
-        "videocall_neteq_fast_accelerate_ops_per_sec",
-        "Fast accelerate operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
-    )
-    .expect("Failed to create neteq_fast_accelerate_ops_per_sec metric");
-
-    /// NetEQ preemptive expand operations per second
-    pub static ref NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
-        "videocall_neteq_preemptive_expand_ops_per_sec",
-        "Preemptive expand operations per second (time expansion)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
-    )
-    .expect("Failed to create neteq_preemptive_expand_ops_per_sec metric");
-
-    /// NetEQ merge operations per second
-    pub static ref NETEQ_MERGE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
-        "videocall_neteq_merge_ops_per_sec",
-        "Merge operations per second (blending)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
-    )
-    .expect("Failed to create neteq_merge_ops_per_sec metric");
-
-    /// NetEQ comfort noise operations per second
-    pub static ref NETEQ_COMFORT_NOISE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
-        "videocall_neteq_comfort_noise_ops_per_sec",
-        "Comfort noise operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
-    )
-    .expect("Failed to create neteq_comfort_noise_ops_per_sec metric");
-
-    /// NetEQ DTMF operations per second
-    pub static ref NETEQ_DTMF_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
-        "videocall_neteq_dtmf_ops_per_sec",
-        "DTMF operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
-    )
-    .expect("Failed to create neteq_dtmf_ops_per_sec metric");
-
-    /// NetEQ undefined operations per second
-    pub static ref NETEQ_UNDEFINED_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
-        "videocall_neteq_undefined_ops_per_sec",
-        "Undefined operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
-    )
-    .expect("Failed to create neteq_undefined_ops_per_sec metric");
+    // NOTE: Low-value NetEQ operation counters removed for cardinality reduction:
+    // fast_accelerate, preemptive_expand, merge, comfort_noise, dtmf, undefined
+    // These are still collected client-side and visible in vcprobe, just not in Prometheus.
 
     /// Total number of active sessions
     pub static ref ACTIVE_SESSIONS_TOTAL: GaugeVec = register_gauge_vec!(
@@ -167,14 +123,6 @@ lazy_static! {
         &["meeting_id", "peer_id"]
     )
     .expect("Failed to create peer_connections_total metric");
-
-    /// Per-pair video packets buffered in the decoder/jitter buffer
-    pub static ref VIDEO_PACKETS_BUFFERED: GaugeVec = register_gauge_vec!(
-        "videocall_video_packets_buffered",
-        "Number of video packets/frames currently buffered awaiting decode",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
-    )
-    .expect("Failed to create video_packets_buffered metric");
 
     /// Per-pair video framerate as observed by the receiver
     pub static ref VIDEO_FPS: GaugeVec = register_gauge_vec!(

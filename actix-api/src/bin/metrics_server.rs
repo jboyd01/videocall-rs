@@ -48,13 +48,10 @@ use sec_api::metrics::{
     CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
     CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, HEALTH_REPORTS_TOTAL,
     MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_COMFORT_NOISE_OPS_PER_SEC, NETEQ_DTMF_OPS_PER_SEC, NETEQ_EXPAND_OPS_PER_SEC,
-    NETEQ_FAST_ACCELERATE_OPS_PER_SEC, NETEQ_MERGE_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
-    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC,
-    NETEQ_TARGET_DELAY_MS, NETEQ_UNDEFINED_OPS_PER_SEC, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
+    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
+    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
     PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_PACKETS_BUFFERED, VIDEO_QUALITY_SCORE,
+    SELF_VIDEO_ENABLED, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
 };
 
 async fn metrics_handler(
@@ -243,22 +240,18 @@ fn remove_per_peer_metrics(
         peer_display_name,
     ];
 
+    // Per-peer metrics (18 kept, 7 low-value ones removed for cardinality reduction)
     let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
     let _ = PEER_CAN_SEE.remove_label_values(&labels);
-    let _ = VIDEO_FPS.remove_label_values(&labels);
-    let _ = VIDEO_PACKETS_BUFFERED.remove_label_values(&labels);
     let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
+    let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
     let _ = NETEQ_NORMAL_OPS_PER_SEC.remove_label_values(&labels);
     let _ = NETEQ_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
     let _ = NETEQ_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
-    let _ = NETEQ_FAST_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
-    let _ = NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
-    let _ = NETEQ_MERGE_OPS_PER_SEC.remove_label_values(&labels);
-    let _ = NETEQ_COMFORT_NOISE_OPS_PER_SEC.remove_label_values(&labels);
-    let _ = NETEQ_DTMF_OPS_PER_SEC.remove_label_values(&labels);
-    let _ = NETEQ_UNDEFINED_OPS_PER_SEC.remove_label_values(&labels);
+    let _ = VIDEO_FPS.remove_label_values(&labels);
+    let _ = VIDEO_BITRATE_KBPS.remove_label_values(&labels);
     let _ = VIDEO_FRAMES_DROPPED.remove_label_values(&labels);
     let _ = AUDIO_PACKET_LOSS_PCT.remove_label_values(&labels);
     let _ = PEER_AUDIO_ENABLED.remove_label_values(&labels);
@@ -266,8 +259,6 @@ fn remove_per_peer_metrics(
     let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
-    let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
-    let _ = VIDEO_BITRATE_KBPS.remove_label_values(&labels);
 }
 
 fn process_health_packet_to_metrics_pb(
@@ -517,29 +508,30 @@ fn process_health_packet_to_metrics_pb(
 
         // Process peer health data
         if !health_packet.peer_stats.is_empty() {
-            let mut participants_count = 0;
+            // Snapshot display_name_map once (avoids locking per peer in the loop)
+            let peer_display_names: HashMap<String, String> = {
+                let dn_map = display_name_map.lock().unwrap();
+                health_packet
+                    .peer_stats
+                    .keys()
+                    .map(|pid| {
+                        let dn = dn_map.get(pid).cloned().unwrap_or_else(|| pid.to_string());
+                        (pid.clone(), dn)
+                    })
+                    .collect()
+            };
 
-            for (peer_id, peer_data) in &health_packet.peer_stats {
-                participants_count += 1;
-
-                // Compute peer display name once at the top of the loop
-                let peer_dn = {
-                    let dn_map = display_name_map.lock().unwrap();
-                    dn_map
-                        .get(peer_id)
-                        .cloned()
-                        .unwrap_or_else(|| peer_id.to_string())
-                };
-                // Track peer display name for cleanup; remove stale series if name changed
-                {
-                    let mut tracker = session_tracker.lock().unwrap();
-                    let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-                    if let Some(info) = tracker.get_mut(&key) {
+            // Detect display_name changes and remove stale series (one tracker lock)
+            {
+                let mut tracker = session_tracker.lock().unwrap();
+                let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+                if let Some(info) = tracker.get_mut(&key) {
+                    for (peer_id, new_dn) in &peer_display_names {
                         if let Some(old_dn) = info.to_peer_display_names.get(peer_id) {
-                            if old_dn != &peer_dn {
+                            if old_dn != new_dn {
                                 debug!(
                                     "Peer display name changed: {} -> {} for peer {}",
-                                    old_dn, peer_dn, peer_id
+                                    old_dn, new_dn, peer_id
                                 );
                                 remove_per_peer_metrics(
                                     meeting_id,
@@ -552,10 +544,17 @@ fn process_health_packet_to_metrics_pb(
                             }
                         }
                         info.to_peer_display_names
-                            .insert(peer_id.to_string(), peer_dn.clone());
+                            .insert(peer_id.clone(), new_dn.clone());
                         info.to_peers.insert(peer_id.clone());
+                        info.peer_ids.insert(peer_id.clone());
                     }
                 }
+            }
+
+            let participants_count = health_packet.peer_stats.len();
+
+            for (peer_id, peer_data) in &health_packet.peer_stats {
+                let peer_dn = &peer_display_names[peer_id];
                 let peer_labels: [&str; 6] = [
                     meeting_id,
                     session_id,
@@ -565,192 +564,110 @@ fn process_health_packet_to_metrics_pb(
                     peer_dn.as_str(),
                 ];
 
-                // Set peer connection metric
                 PEER_CONNECTIONS_TOTAL
                     .with_label_values(&[meeting_id, peer_id])
                     .set(1.0);
-                // Track peer_id used for connections
-                {
-                    let mut tracker = session_tracker.lock().unwrap();
-                    let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-                    if let Some(info) = tracker.get_mut(&key) {
-                        info.peer_ids.insert(peer_id.clone());
+
+                PEER_CAN_LISTEN
+                    .with_label_values(&peer_labels)
+                    .set(if peer_data.can_listen { 1.0 } else { 0.0 });
+
+                PEER_CAN_SEE
+                    .with_label_values(&peer_labels)
+                    .set(if peer_data.can_see { 1.0 } else { 0.0 });
+
+                // NetEQ metrics
+                if let Some(neteq_stats) = peer_data.neteq_stats.as_ref() {
+                    if neteq_stats.current_buffer_size_ms != 0.0 {
+                        NETEQ_AUDIO_BUFFER_MS
+                            .with_label_values(&peer_labels)
+                            .set(neteq_stats.current_buffer_size_ms);
+                    }
+
+                    NETEQ_TARGET_DELAY_MS
+                        .with_label_values(&peer_labels)
+                        .set(neteq_stats.target_delay_ms);
+
+                    if neteq_stats.packets_awaiting_decode != 0.0 {
+                        NETEQ_PACKETS_AWAITING_DECODE
+                            .with_label_values(&peer_labels)
+                            .set(neteq_stats.packets_awaiting_decode);
+                    }
+
+                    if neteq_stats.packets_per_sec != 0.0 {
+                        NETEQ_PACKETS_PER_SEC
+                            .with_label_values(&peer_labels)
+                            .set(neteq_stats.packets_per_sec);
+                    }
+
+                    // Core NetEQ operation counters (high diagnostic value only)
+                    if let Some(network) = neteq_stats.network.as_ref() {
+                        if let Some(ops) = network.operation_counters.as_ref() {
+                            NETEQ_NORMAL_OPS_PER_SEC
+                                .with_label_values(&peer_labels)
+                                .set(ops.normal_per_sec);
+                            NETEQ_EXPAND_OPS_PER_SEC
+                                .with_label_values(&peer_labels)
+                                .set(ops.expand_per_sec);
+                            NETEQ_ACCELERATE_OPS_PER_SEC
+                                .with_label_values(&peer_labels)
+                                .set(ops.accelerate_per_sec);
+                        }
                     }
                 }
 
-                {
-                    // Process can_listen
-                    {
-                        let can_listen = peer_data.can_listen;
-                        PEER_CAN_LISTEN
+                // Video metrics
+                if let Some(video_stats) = peer_data.video_stats.as_ref() {
+                    if video_stats.fps_received != 0.0 {
+                        VIDEO_FPS
                             .with_label_values(&peer_labels)
-                            .set(if can_listen { 1.0 } else { 0.0 });
+                            .set(video_stats.fps_received);
                     }
-
-                    // Process can_see
-                    {
-                        let can_see = peer_data.can_see;
-                        PEER_CAN_SEE
+                    if video_stats.bitrate_kbps != 0 {
+                        VIDEO_BITRATE_KBPS
                             .with_label_values(&peer_labels)
-                            .set(if can_see { 1.0 } else { 0.0 });
-                    }
-
-                    // Process NetEQ metrics from neteq_stats object
-                    if let Some(neteq_stats) = peer_data.neteq_stats.as_ref() {
-                        if neteq_stats.current_buffer_size_ms != 0.0 {
-                            NETEQ_AUDIO_BUFFER_MS
-                                .with_label_values(&peer_labels)
-                                .set(neteq_stats.current_buffer_size_ms);
-                        }
-
-                        // Target delay (jitter estimate)
-                        NETEQ_TARGET_DELAY_MS
-                            .with_label_values(&peer_labels)
-                            .set(neteq_stats.target_delay_ms);
-
-                        if neteq_stats.packets_awaiting_decode != 0.0 {
-                            NETEQ_PACKETS_AWAITING_DECODE
-                                .with_label_values(&peer_labels)
-                                .set(neteq_stats.packets_awaiting_decode);
-                        }
-
-                        if neteq_stats.packets_per_sec != 0.0 {
-                            NETEQ_PACKETS_PER_SEC
-                                .with_label_values(&peer_labels)
-                                .set(neteq_stats.packets_per_sec);
-                        }
-
-                        // Process NetEQ operation metrics from network.operation_counters
-                        if let Some(network) = neteq_stats.network.as_ref() {
-                            if let Some(operation_counters) = network.operation_counters.as_ref() {
-                                // Normal operations per second
-                                NETEQ_NORMAL_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.normal_per_sec);
-
-                                // Expand operations per second
-                                NETEQ_EXPAND_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.expand_per_sec);
-
-                                // Accelerate operations per second
-                                NETEQ_ACCELERATE_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.accelerate_per_sec);
-
-                                // Fast accelerate operations per second
-                                NETEQ_FAST_ACCELERATE_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.fast_accelerate_per_sec);
-
-                                // Preemptive expand operations per second
-                                NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.preemptive_expand_per_sec);
-
-                                // Merge operations per second
-                                NETEQ_MERGE_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.merge_per_sec);
-
-                                // Comfort noise operations per second
-                                NETEQ_COMFORT_NOISE_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.comfort_noise_per_sec);
-
-                                // DTMF operations per second
-                                NETEQ_DTMF_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.dtmf_per_sec);
-
-                                // Undefined operations per second
-                                NETEQ_UNDEFINED_OPS_PER_SEC
-                                    .with_label_values(&peer_labels)
-                                    .set(operation_counters.undefined_per_sec);
-                            }
-                        }
-                    }
-
-                    // Process video metrics from video_stats object
-                    if let Some(video_stats) = peer_data.video_stats.as_ref() {
-                        if video_stats.fps_received != 0.0 {
-                            VIDEO_FPS
-                                .with_label_values(&peer_labels)
-                                .set(video_stats.fps_received);
-                        }
-
-                        if video_stats.bitrate_kbps != 0 {
-                            VIDEO_BITRATE_KBPS
-                                .with_label_values(&peer_labels)
-                                .set(video_stats.bitrate_kbps as f64);
-                        }
-
-                        if video_stats.frames_buffered != 0.0 {
-                            debug!("Setting VIDEO_PACKETS_BUFFERED for meeting={}, session={}, from_peer={}, to_peer={}, value={}",
-                                   meeting_id, session_id, reporting_user_id, peer_id, video_stats.frames_buffered);
-                            VIDEO_PACKETS_BUFFERED
-                                .with_label_values(&peer_labels)
-                                .set(video_stats.frames_buffered);
-                        }
-                    }
-
-                    // Phase 1 metrics: Decode errors per second (PeerStats level)
-                    // Note: this is decode errors (codec resets), not CPU-pressure frame drops.
-                    if peer_data.frames_dropped_per_sec > 0.0 {
-                        debug!(
-                            "Setting VIDEO_FRAMES_DROPPED for meeting={}, session={}, from_peer={}, to_peer={}, value={:.2}",
-                            meeting_id, session_id, reporting_user_id, peer_id, peer_data.frames_dropped_per_sec
-                        );
-                        VIDEO_FRAMES_DROPPED
-                            .with_label_values(&peer_labels)
-                            .set(peer_data.frames_dropped_per_sec);
-                    }
-
-                    // Phase 1 metrics: Audio packet loss percentage (PeerStats level)
-                    if peer_data.audio_packet_loss_pct > 0.0 {
-                        debug!(
-                            "Setting AUDIO_PACKET_LOSS_PCT for meeting={}, session={}, from_peer={}, to_peer={}, value={:.2}%",
-                            meeting_id, session_id, reporting_user_id, peer_id, peer_data.audio_packet_loss_pct
-                        );
-                        AUDIO_PACKET_LOSS_PCT
-                            .with_label_values(&peer_labels)
-                            .set(peer_data.audio_packet_loss_pct);
-                    }
-
-                    // Quality scores (optional in proto — only set when stream is active)
-                    if let Some(score) = peer_data.audio_quality_score {
-                        AUDIO_QUALITY_SCORE
-                            .with_label_values(&peer_labels)
-                            .set(score);
-                    }
-
-                    if let Some(score) = peer_data.video_quality_score {
-                        VIDEO_QUALITY_SCORE
-                            .with_label_values(&peer_labels)
-                            .set(score);
-                    }
-
-                    if let Some(score) = peer_data.call_quality_score {
-                        CALL_QUALITY_SCORE
-                            .with_label_values(&peer_labels)
-                            .set(score);
-                    }
-
-                    // Process explicit peer status flags if present
-                    {
-                        let audio_enabled = peer_data.audio_enabled;
-                        PEER_AUDIO_ENABLED
-                            .with_label_values(&peer_labels)
-                            .set(if audio_enabled { 1.0 } else { 0.0 });
-                    }
-
-                    {
-                        let video_enabled = peer_data.video_enabled;
-                        PEER_VIDEO_ENABLED
-                            .with_label_values(&peer_labels)
-                            .set(if video_enabled { 1.0 } else { 0.0 });
+                            .set(video_stats.bitrate_kbps as f64);
                     }
                 }
+
+                // Decode errors
+                if peer_data.frames_dropped_per_sec > 0.0 {
+                    VIDEO_FRAMES_DROPPED
+                        .with_label_values(&peer_labels)
+                        .set(peer_data.frames_dropped_per_sec);
+                }
+
+                // Audio packet loss
+                if peer_data.audio_packet_loss_pct > 0.0 {
+                    AUDIO_PACKET_LOSS_PCT
+                        .with_label_values(&peer_labels)
+                        .set(peer_data.audio_packet_loss_pct);
+                }
+
+                // Quality scores
+                if let Some(score) = peer_data.audio_quality_score {
+                    AUDIO_QUALITY_SCORE
+                        .with_label_values(&peer_labels)
+                        .set(score);
+                }
+                if let Some(score) = peer_data.video_quality_score {
+                    VIDEO_QUALITY_SCORE
+                        .with_label_values(&peer_labels)
+                        .set(score);
+                }
+                if let Some(score) = peer_data.call_quality_score {
+                    CALL_QUALITY_SCORE
+                        .with_label_values(&peer_labels)
+                        .set(score);
+                }
+
+                // Peer status flags
+                PEER_AUDIO_ENABLED
+                    .with_label_values(&peer_labels)
+                    .set(if peer_data.audio_enabled { 1.0 } else { 0.0 });
+                PEER_VIDEO_ENABLED
+                    .with_label_values(&peer_labels)
+                    .set(if peer_data.video_enabled { 1.0 } else { 0.0 });
             }
 
             // Update meeting participants count (peers + self)
