@@ -1043,10 +1043,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("          Absent (--) when audio is inactive or data is stale (>5s)."),
         Line::from("          Green: ≥75  Yellow: 40-74  Red: <40"),
         Line::from(""),
-        Line::from("  Vid     Video quality score 0-100 (computed by the observing client)."),
-        Line::from(
-            "          Formula: fps_score(0fps=0, 10fps=50, 20+fps=100) - decode_error_penalty",
-        ),
+        Line::from("  Vid     Video quality score 0-100 (video health, not FPS quality)."),
+        Line::from("          Formula: health(fps>=5→100, fps<5→0–50) - decode_error_penalty"),
         Line::from("          Absent (--) when video is inactive or data is stale (>5s)."),
         Line::from("          Green: ≥75  Yellow: 40-74  Red: <40"),
         Line::from(""),

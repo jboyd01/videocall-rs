@@ -503,7 +503,103 @@ The formula `expand_per_sec / packets_per_sec` counts NetEQ expand operations (w
 
 ---
 
-## 8. Open Work Items
+## 8. Quality Scoring Philosophy (2026-03-11)
+
+### The Core Distinction: Hardware Capability vs. Call Health
+
+The original video quality score answered **"how good is your hardware?"** The call quality score should answer **"is your call working correctly?"** These are different questions.
+
+| Situation | Old Score | New Score | Reason |
+|---|---|---|---|
+| Logitech camera, stable 15fps, audio perfect | 76/100 | ~100/100 | 15fps is hardware capability, not a problem |
+| 30fps camera with 10% packet loss | ~85/100 | ~45/100 | Audio health tanks from loss → call is breaking |
+| Camera near-frozen at 2fps | ~20/100 | ~20/100 | Near-frozen video is a real problem |
+| No video (camera off) | — | — | Absent (not zero) — audio score alone drives call score |
+
+The Logitech case is the archetypal example: a camera with auto-exposure reducing to 15fps in lower light conditions was scored 76/100, implying a degraded call. The call was working perfectly. The score was misleading.
+
+### What Actually Degrades Call Experience
+
+Ranked by user impact:
+
+1. **Audio breaking up** — most disruptive. Users tolerate choppy video; they cannot tolerate choppy audio.
+2. **Network congestion** — high RTT/jitter affects conversational feel (captured via concealment proxy in audio score).
+3. **Video freezing** — not "low fps" but a *sudden drop* or frames being dropped mid-call.
+4. **No video at all** — camera failed or disabled.
+
+**Stable 15fps is not on this list.** A 15fps camera that has delivered 15fps since call start is behaving correctly for its hardware. The browser may auto-reduce FPS for any number of reasons (low light auto-exposure, USB bandwidth, thermal throttling) that are outside the user's control and not indicative of a call problem.
+
+### Why Not Fix the Camera's FPS?
+
+Adding `frameRate: { ideal: 30 }` to `getUserMedia` constraints was considered and rejected for this use case:
+
+- **Low-light auto-exposure**: The camera firmware decides to drop FPS to allow longer exposure time for a brighter image. This is a hardware/driver decision that happens *after* the browser grants the stream. `getUserMedia` hints don't override it.
+- **Could throttle good cameras**: `ideal: 30` might cap 60fps cameras at 30fps (the browser prefers values closest to the stated ideal).
+- **Not the right abstraction layer**: WebRTC systems fix this via adaptive bitrate with RTCP feedback loops. We use WebTransport/WebSocket without that mechanism. The right answer is to not penalize hardware limitation in the quality score.
+
+### Why Not Fix the getUserMedia Frame Rate?
+
+`frameRate: { ideal: 30 }` was considered and rejected:
+
+1. Low-light auto-exposure happens *after* stream negotiation — the camera firmware doesn't honor getUserMedia hints when making exposure decisions.
+2. `ideal: 30` might inadvertently cap 60fps cameras at 30fps.
+3. The score is the correct layer to fix — penalizing hardware capability is the wrong abstraction.
+
+### Revised Scoring Formula
+
+**Audio quality** (unchanged — already correctly reflects call health):
+
+```
+audio_score = 100
+    - min(conceal_per_sec / 10.0, 1.0) * 70    # concealment penalty (max -70)
+    - min(audio_loss_pct   /  5.0, 1.0) * 30    # loss penalty       (max -30)
+```
+
+Gated on `packets_per_sec >= 2.0` (ignores DTX silence) and `audio_fresh` (data < 5s old).
+
+**Video quality** (revised — measures video health, not FPS quality):
+
+```
+video_health = fps >= 5.0 ? 100.0 : fps / 5.0 * 50.0
+decode_penalty = min(decode_errors_per_sec / 10.0, 1.0) * 50.0
+video_score = max(video_health - decode_penalty, 0.0)
+```
+
+Key change: any stable FPS ≥ 5 scores 100. Only near-frozen video (1–4fps) is penalized on a 0–50 scale. Decode errors (codec resets, keyframe misses) still apply a separate penalty.
+
+Gated on `fps > 0.0` and `video_fresh` (data < 5s old).
+
+**Call quality** (unchanged — worst of active streams):
+
+```
+call_score = min(audio_score, video_score)   # when both present
+           = audio_score                      # when video absent (camera off)
+           = video_score                      # when audio absent (mic off)
+```
+
+`min` is deliberate: the call is only as good as the worst active stream. A 100/100 audio score does not compensate for a near-frozen video stream.
+
+### FPS as a Diagnostic, Not a Score Driver
+
+FPS remains displayed in vcprobe as a raw metric — it is **diagnostic context**, not a quality penalty. When an operator sees:
+
+```
+Jay     15fps  45ms  100/100  ✅
+```
+
+They know: Jay's camera delivers 15fps (hardware context), the call is healthy (score). If they want to understand why the FPS is lower than expected, they can drill into the detail panel.
+
+Contrast with a real problem:
+
+```
+Jay      2fps  45ms   20/100  🔴  Video near-frozen
+```
+
+Here, 2fps is below the threshold where it represents a functional call (score 20), and the diagnosis label explains why the score is low.
+
+---
+
+## 9. Open Work Items
 
 | Item | Status | Effort |
 |---|---|---|
@@ -520,7 +616,7 @@ The formula `expand_per_sec / packets_per_sec` counts NetEQ expand operations (w
 
 ---
 
-## 9. Metrics Trust Summary
+## 10. Metrics Trust Summary
 
 | Metric | Was it trustworthy on origin/main? | Status now |
 |---|---|---|

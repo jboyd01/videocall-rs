@@ -779,17 +779,17 @@ impl HealthReporter {
             if video_fresh && fps > 0.0 {
                 let dropped = ps.frames_dropped_per_sec;
 
-                // FPS score: 0 fps→0, 10 fps→50, 20+ fps→100
-                let fps_score = if fps >= 20.0 {
-                    100.0
-                } else if fps >= 10.0 {
-                    50.0 + (fps - 10.0) / 10.0 * 50.0
-                } else {
-                    fps / 10.0 * 50.0
-                };
-                // Drop penalty: 0/s→0, 10+/s→50
+                // Video health: measures whether video is present and stable, not
+                // hardware FPS capability. A 15fps camera in low light is not a
+                // "problem" — it is the camera doing auto-exposure correctly.
+                //
+                // fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
+                // fps 1–4   → 0–50 (near-frozen; something is likely wrong)
+                // fps == 0  → handled by outer guard; score is absent (None)
+                let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
+                // Decode error penalty: 0/s→0, 10+/s→−50
                 let drop_penalty = (dropped / 10.0).min(1.0) * 50.0;
-                let score = (fps_score - drop_penalty).max(0.0).min(100.0);
+                let score = (video_health - drop_penalty).max(0.0).min(100.0);
                 ps.video_quality_score = Some(score);
             }
 
