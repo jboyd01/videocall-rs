@@ -46,25 +46,26 @@ use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, AUDIO_PACKET_LOSS_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE,
     CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES,
     CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
-    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, MEETING_PARTICIPANTS,
-    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC,
-    NETEQ_DTMF_OPS_PER_SEC, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_FAST_ACCELERATE_OPS_PER_SEC,
-    NETEQ_MERGE_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_TARGET_DELAY_MS,
-    NETEQ_UNDEFINED_OPS_PER_SEC, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
-    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PACKETS_BUFFERED,
-    VIDEO_QUALITY_SCORE,
+    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, HEALTH_REPORTS_TOTAL,
+    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
+    NETEQ_COMFORT_NOISE_OPS_PER_SEC, NETEQ_DTMF_OPS_PER_SEC, NETEQ_EXPAND_OPS_PER_SEC,
+    NETEQ_FAST_ACCELERATE_OPS_PER_SEC, NETEQ_MERGE_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC,
+    NETEQ_TARGET_DELAY_MS, NETEQ_UNDEFINED_OPS_PER_SEC, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
+    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED,
+    SELF_VIDEO_ENABLED, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
+    VIDEO_PACKETS_BUFFERED, VIDEO_QUALITY_SCORE,
 };
 
 async fn metrics_handler(
     data: web::Data<HealthDataStore>,
     session_tracker: web::Data<SessionTracker>,
+    display_name_map: web::Data<DisplayNameMap>,
 ) -> Result<HttpResponse> {
     drop(data.lock().unwrap());
 
     // Clean up stale sessions before processing metrics
-    cleanup_stale_sessions(&session_tracker);
+    cleanup_stale_sessions(&session_tracker, &display_name_map);
 
     // Do not mutate metrics here. Metrics are updated only on fresh NATS messages.
 
@@ -87,8 +88,9 @@ async fn metrics_handler(
     }
 }
 
-/// Clean up sessions that haven't reported in the last 30 seconds
-fn cleanup_stale_sessions(session_tracker: &SessionTracker) {
+/// Clean up sessions that haven't reported in the last 30 seconds,
+/// and prune display_name_map entries for sessions no longer active.
+fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &DisplayNameMap) {
     use std::time::Duration;
     let mut tracker = session_tracker.lock().unwrap();
     let now = Instant::now();
@@ -102,16 +104,28 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker) {
         }
     }
 
+    let mut removed_session_ids = Vec::new();
     for key in to_remove {
         if let Some(session_info) = tracker.remove(&key) {
             info!(
                 "Cleaning up stale session: {} (meeting: {}, peer: {})",
                 session_info.session_id, session_info.meeting_id, session_info.reporting_user_id
             );
+            removed_session_ids.push(session_info.session_id.clone());
 
             // Remove all metrics for this session
             remove_session_metrics(&session_info);
         }
+    }
+
+    // Prune display_name_map for removed sessions
+    if !removed_session_ids.is_empty() {
+        let active_session_ids: HashSet<&str> = tracker
+            .values()
+            .map(|info| info.session_id.as_str())
+            .collect();
+        let mut dn_map = display_name_map.lock().unwrap();
+        dn_map.retain(|sid, _| active_session_ids.contains(sid.as_str()));
     }
 }
 
@@ -244,6 +258,8 @@ fn process_health_packet_to_metrics_pb(
     session_tracker: &SessionTracker,
     display_name_map: &DisplayNameMap,
 ) -> anyhow::Result<()> {
+    HEALTH_REPORTS_TOTAL.inc();
+
     let meeting_id = if health_packet.meeting_id.is_empty() {
         "unknown"
     } else {
@@ -692,10 +708,10 @@ fn process_health_packet_to_metrics_pb(
                 }
             }
 
-            // Update meeting participants count
+            // Update meeting participants count (peers + self)
             MEETING_PARTICIPANTS
                 .with_label_values(&[meeting_id])
-                .set(participants_count as f64);
+                .set((participants_count + 1) as f64);
         }
     }
 
@@ -830,6 +846,7 @@ async fn main() -> anyhow::Result<()> {
         App::new()
             .app_data(web::Data::new(health_store.clone()))
             .app_data(web::Data::new(session_tracker.clone()))
+            .app_data(web::Data::new(display_name_map.clone()))
             .route("/metrics", web::get().to(metrics_handler))
             .route(
                 "/health",
@@ -1102,7 +1119,7 @@ mod tests {
         }
 
         // Run cleanup
-        cleanup_stale_sessions(&tracker);
+        cleanup_stale_sessions(&tracker, &Arc::new(Mutex::new(HashMap::new())));
 
         // Verify only the fresh session remains
         {
@@ -1243,9 +1260,13 @@ mod tests {
         {
             let tracker_clone = tracker.clone();
             rt.block_on(async move {
-                let resp =
-                    metrics_handler(web::Data::new(health_store), web::Data::new(tracker_clone))
-                        .await;
+                let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+                let resp = metrics_handler(
+                    web::Data::new(health_store),
+                    web::Data::new(tracker_clone),
+                    web::Data::new(dn_map),
+                )
+                .await;
                 assert!(resp.is_ok());
             });
         }
@@ -1415,7 +1436,7 @@ mod tests {
         }
 
         // Run cleanup
-        cleanup_stale_sessions(&tracker);
+        cleanup_stale_sessions(&tracker, &Arc::new(Mutex::new(HashMap::new())));
 
         // Verify cleanup results
         {
@@ -1619,7 +1640,7 @@ mod tests {
         }
 
         // Run cleanup
-        cleanup_stale_sessions(&tracker);
+        cleanup_stale_sessions(&tracker, &Arc::new(Mutex::new(HashMap::new())));
 
         // Session should be cleaned up (>= 30 seconds is considered stale)
         {

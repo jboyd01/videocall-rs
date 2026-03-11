@@ -168,14 +168,6 @@ lazy_static! {
     )
     .expect("Failed to create peer_connections_total metric");
 
-    /// Overall session quality scores (0.0-1.0)
-    pub static ref SESSION_QUALITY: Histogram = register_histogram!(
-        "videocall_session_quality_score",
-        "Overall session quality scores (0.0-1.0)",
-        vec![0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
-    )
-    .expect("Failed to create session_quality metric");
-
     /// Per-pair video packets buffered in the decoder/jitter buffer
     pub static ref VIDEO_PACKETS_BUFFERED: GaugeVec = register_gauge_vec!(
         "videocall_video_packets_buffered",
