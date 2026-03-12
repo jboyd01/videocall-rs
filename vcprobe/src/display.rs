@@ -203,7 +203,7 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
     let rtt = health.active_server_rtt_ms;
 
     if verbose {
-        // Verbose mode: show full details + Phase 1 metrics
+        // Verbose mode: show full details including browser state
         let tab = if health.is_tab_visible {
             "👁️ "
         } else {
@@ -250,7 +250,7 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
                 .as_ref()
                 .map(|v| v.bitrate_kbps)
                 .unwrap_or(0);
-            // Phase 1 metrics: audio packet loss and frames dropped
+            // Audio packet loss and decode errors
             let audio_loss = if stats.audio_packet_loss_pct > 0.01 {
                 format!(" loss={:.1}%", stats.audio_packet_loss_pct)
             } else {
