@@ -561,12 +561,12 @@ impl HealthReporter {
             pb.active_server_rtt_ms = rtt;
         }
 
-        // Tier 0 metrics: Communication load
+        // Communication load metrics
         pb.send_queue_bytes = send_queue_bytes;
         pb.packets_received_per_sec = packets_received_per_sec;
         pb.packets_sent_per_sec = packets_sent_per_sec;
 
-        // Phase 1 metrics: Tab visibility
+        // Tab visibility and throttling
         #[cfg(target_arch = "wasm32")]
         {
             let tab_hidden = web_sys::window()
@@ -576,7 +576,7 @@ impl HealthReporter {
             pb.is_tab_visible = !tab_hidden;
             pb.is_tab_throttled = tab_hidden;
 
-            // Phase 1 metrics: Memory usage (Chrome only)
+            // Memory usage (Chrome only)
             if let Some(window) = web_sys::window() {
                 if let Some(perf) = window.performance() {
                     // Try to access performance.memory (Chrome extension)
@@ -644,7 +644,7 @@ impl HealthReporter {
                     ns.target_delay_ms = v;
                 }
 
-                // Phase 1: Calculate audio packet loss percentage from WINDOWED rates (not lifetime)
+                // Calculate audio packet loss percentage from WINDOWED rates (not lifetime)
                 // Use expand_per_sec (concealment events/sec) and packets_per_sec (packets/sec)
                 let expand_per_sec = neteq
                     .get("network")

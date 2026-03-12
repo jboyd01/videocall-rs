@@ -144,7 +144,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         &session_info.display_name,
     ]);
 
-    // Phase 1: Remove tab visibility and memory metrics
+    // Remove tab visibility, throttled, memory, send queue, packet rate metrics
     let _ = CLIENT_TAB_VISIBLE.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
@@ -164,7 +164,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         &session_info.display_name,
     ]);
 
-    // P1: Remove send queue, packet rates, tab throttled metrics
+    // Remove send queue, packet rates, tab throttled metrics
     let reporter_labels = [
         &session_info.meeting_id as &str,
         &session_info.session_id,
@@ -423,7 +423,7 @@ fn process_health_packet_to_metrics_pb(
                 0.0
             });
 
-        // Phase 1 metrics: Tab visibility (HealthPacket level)
+        // Tab visibility (HealthPacket level)
         debug!(
             "Setting CLIENT_TAB_VISIBLE for meeting={}, session={}, peer={}, value={}",
             meeting_id, session_id, reporting_user_id, health_packet.is_tab_visible
@@ -441,7 +441,7 @@ fn process_health_packet_to_metrics_pb(
                 0.0
             });
 
-        // Phase 1 metrics: Memory usage (HealthPacket level, Chrome only)
+        // Memory usage (HealthPacket level, Chrome only)
         if let Some(mem_used) = health_packet.memory_used_bytes {
             debug!(
                 "Setting CLIENT_MEMORY_USED_BYTES for meeting={}, session={}, peer={}, value={} bytes",
@@ -472,7 +472,7 @@ fn process_health_packet_to_metrics_pb(
                 .set(mem_total as f64);
         }
 
-        // P1 metrics: send queue, packet rates, tab throttled
+        // Communication and browser state metrics
         let reporter_labels: [&str; 4] = [
             meeting_id,
             session_id,

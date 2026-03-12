@@ -319,7 +319,7 @@ lazy_static! {
     )
     .expect("Failed to create video_bitrate_kbps metric");
 
-    // ===== P1: PREVIOUSLY IGNORED CLIENT HEALTH FIELDS =====
+    // ===== CLIENT COMMUNICATION & BROWSER STATE =====
 
     /// Client send queue bytes (WebSocket bufferedAmount)
     pub static ref CLIENT_SEND_QUEUE_BYTES: GaugeVec = register_gauge_vec!(
