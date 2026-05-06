@@ -37,3 +37,4 @@ mod canvas_generator;
 mod peer_list;
 mod peer_tile;
 pub mod pre_join_settings_card;
+pub mod chat_sidebar;

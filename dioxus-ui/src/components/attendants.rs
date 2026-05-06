@@ -32,8 +32,9 @@ use crate::components::{
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
-        MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
+        MicButton, MockPeersButton, PeerListButton, ScreenShareButton,OpenChatButton
     },
+    chat_sidebar::ChatSidebar
 };
 use crate::console_log_collector::{flush_console_logs, set_console_log_context};
 use crate::constants::actix_websocket_base;
@@ -556,6 +557,7 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut chat_open = use_signal(|| false);
     let mut mock_peers_open = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
@@ -3099,6 +3101,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+
                                     // Primary: Camera button - always visible
                                     {
                                         let mda_cam = mda.clone();
@@ -3129,6 +3132,17 @@ pub fn AttendantsComponent(
                                                     } else {
                                                         video_enabled.set(false);
                                                     }
+                                                },
+                                            }
+                                        }
+                                    }
+                                    {
+                                        let mda_chat = mda.clone();
+                                        let _ = mda_chat;
+                                        rsx! {
+                                            OpenChatButton {
+                                                onclick: move |_| {
+                                                    chat_open.set(!chat_open());
                                                 },
                                             }
                                         }
@@ -3635,6 +3649,12 @@ pub fn AttendantsComponent(
                             }},
                         }
                     }
+                }
+
+                // Chat sidebar
+                ChatSidebar {
+                    is_show: chat_open(),
+                    onclose: move |_| chat_open.set(false),
                 }
 
                 // Waiting room controls (host or admitted participants when allowed)
