@@ -404,3 +404,32 @@ pub fn HangUpButton(onclick: EventHandler<MouseEvent>) -> Element {
         }
     }
 }
+
+// =============================================================================
+// Open Chat Button
+// =============================================================================
+#[component]
+pub fn OpenChatButton(onclick: EventHandler<MouseEvent>) -> Element {
+    rsx! {
+        button {
+            class: "video-control-button",
+            onclick: move |evt| onclick.call(evt),
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                width: "24",
+                height: "24",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { stroke: "none", d: "M0 0h24v24H0z", fill: "none" }
+                path { d: "M8 9h8" }
+                path { d: "M8 13h6" }
+                path { d: "M9 18h-3a3 3 0 0 1 -3 -3v-8a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v8a3 3 0 0 1 -3 3h-3l-3 3l-3 -3" }
+            }
+            span { class: "tooltip", "Open Chat" }
+        }
+    }
+}

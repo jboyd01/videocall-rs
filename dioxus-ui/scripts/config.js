@@ -1,32 +1,25 @@
-// Default runtime configuration. Developers may override individual keys
-// locally by creating dioxus-ui/scripts/config.local.js (gitignored) — see
-// config.local.js.example for a template. In production, this file is
-// replaced wholesale by the Helm chart (helm/videocall-ui/templates/configmap-configjs.yaml).
-window.__APP_CONFIG = ({
+window.__APP_CONFIG = Object.freeze({
   apiBaseUrl: "http://localhost:8081",
-  meetingApiBaseUrl: "http://localhost:8082",
   wsUrl: "ws://localhost:8080",
   webTransportHost: "https://127.0.0.1:4433",
   oauthEnabled: "true",
   e2eeEnabled: "false",
-  webTransportEnabled: "true",
+  webTransportEnabled: "false",
   firefoxEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,
   audioBitrateKbps: 65,
   videoBitrateKbps: 100,
-  screenBitrateKbps: 100,
-  oauthProvider: "",
+  screenBitrateKbps: 1200,
+  oauthProvider: "foundation",
   vadThreshold: 0.02,
   oauthAuthUrl: "",
-  oauthClientId: "",
+  oauthClientId: "client_01KQV3WG023CKND455HPQT37XS",
   oauthRedirectUrl: "http://localhost:3001/auth/callback",
   oauthScopes: "openid email profile",
   oauthTokenUrl: "",
-  oauthIssuer: "",
+  oauthIssuer: "http://host.docker.internal:8071",
   oauthPrompt: "",
-  oauthFlow: "",
-  searchApiBaseUrl: "http://localhost:3000/api/search/v2",
-  consoleLogUploadEnabled: "false",
+  oauthFlow: "pkce",
   mockPeersEnabled: "false"
 });
