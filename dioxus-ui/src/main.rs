@@ -15,6 +15,7 @@ mod provider_config;
 mod routing;
 mod theme;
 mod types;
+mod jmap_service;
 mod util;
 
 use crate::components::search_modal::SearchVisibleCtx;

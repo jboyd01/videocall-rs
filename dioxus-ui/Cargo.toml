@@ -47,6 +47,7 @@ urlencoding = "2.1"
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = { version = "0.2", features = ["js"] }
+chrono = "0.4.44"
 
 [dependencies.web-sys]
 version = "0.3.72"
