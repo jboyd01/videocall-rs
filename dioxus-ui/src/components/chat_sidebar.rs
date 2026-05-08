@@ -13,15 +13,16 @@
 
 //! Chat sidebar component — Google Meet-style in-call chat panel.
 
+use chrono::DateTime;
+use crate::jmap_service::get_messages;
 use dioxus::prelude::*;
-
 // =============================================================================
-// Mock data
+// Display model
 // =============================================================================
 
 #[derive(Clone, PartialEq)]
 struct ChatMessage {
-    id: u32,
+    id: String,
     sender: String,
     initials: String,
     text: String,
@@ -29,49 +30,30 @@ struct ChatMessage {
     is_self: bool,
 }
 
-fn mock_messages() -> Vec<ChatMessage> {
-    vec![
-        ChatMessage {
-            id: 1,
-            sender: "Alice Johnson".to_string(),
-            initials: "AJ".to_string(),
-            text: "Hey everyone, can you hear me okay?".to_string(),
-            timestamp: "10:01 AM".to_string(),
-            is_self: false,
-        },
-        ChatMessage {
-            id: 2,
-            sender: "You".to_string(),
-            initials: "YO".to_string(),
-            text: "Yes, loud and clear! 👍".to_string(),
-            timestamp: "10:02 AM".to_string(),
-            is_self: true,
-        },
-        ChatMessage {
-            id: 3,
-            sender: "Bob Smith".to_string(),
-            initials: "BS".to_string(),
-            text: "Same here. Let me share the agenda doc.".to_string(),
-            timestamp: "10:03 AM".to_string(),
-            is_self: false,
-        },
-        ChatMessage {
-            id: 4,
-            sender: "Carol White".to_string(),
-            initials: "CW".to_string(),
-            text: "Thanks Bob! I've been waiting for that.".to_string(),
-            timestamp: "10:04 AM".to_string(),
-            is_self: false,
-        },
-        ChatMessage {
-            id: 5,
-            sender: "You".to_string(),
-            initials: "YO".to_string(),
-            text: "Could we go over the Q2 goals first?".to_string(),
-            timestamp: "10:05 AM".to_string(),
-            is_self: true,
-        },
-    ]
+/// Extract up to two initials from a display name or user-id string.
+fn initials(name: &str) -> String {
+    let mut parts = name.split_whitespace();
+    let first = parts.next().and_then(|w| w.chars().next());
+    let second = parts.next().and_then(|w| w.chars().next());
+    match (first, second) {
+        (Some(a), Some(b)) => format!("{}{}", a, b).to_uppercase(),
+        (Some(a), None) => a.to_uppercase().to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Pull a display string out of a raw JSON message value.
+fn message_text(m: &serde_json::Value) -> String {
+    if let Some(text) = m["textBody"].as_str() {
+        return text.to_string();
+    }
+    "no content".to_string()
+}
+
+fn format_timestamp(raw: &str) -> String {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.format("%A, %b %-d - %-I:%M %p").to_string())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 // =============================================================================
@@ -81,8 +63,49 @@ fn mock_messages() -> Vec<ChatMessage> {
 #[component]
 pub fn ChatSidebar(is_show: bool, onclose: EventHandler<MouseEvent>) -> Element {
     let mut input_value = use_signal(String::new);
-    let mut messages = use_signal(mock_messages);
-    let mut next_id = use_signal(|| 6u32);
+    // Holds messages shown in the UI (server messages + locally sent ones).
+    let mut messages: Signal<Vec<ChatMessage>> = use_signal(Vec::new);
+    let mut next_local_id = use_signal(|| 0u32);
+    let mut load_error = use_signal(|| None::<String>);
+    let mut is_loading = use_signal(|| true);
+
+    // Fetch messages from the server once on mount.
+    use_effect(move || {
+        wasm_bindgen_futures::spawn_local(async move {
+            match get_messages().await {
+                Ok(server_msgs) => {
+                    let mut display: Vec<ChatMessage> = server_msgs
+                        .into_iter()
+                        .map(|m| {
+                            let sender = m["from"]["displayName"]
+                                .as_str()
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let raw_timestamp = m["sentAt"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            ChatMessage {
+                                id: m["id"].as_str().unwrap_or("").to_string(),
+                                initials: initials(&sender),
+                                text: message_text(&m),
+                                sender,
+                                timestamp: format_timestamp(&raw_timestamp),
+                                is_self: false,
+                            }
+                        })
+                        .collect();
+                    display.reverse();
+                    messages.set(display);
+                    is_loading.set(false);
+                }
+                Err(e) => {
+                    load_error.set(Some(format!("{e:?}")));
+                    is_loading.set(false);
+                }
+            }
+        });
+    });
 
     let container_class = if is_show {
         "chat-sidebar visible"
@@ -90,28 +113,27 @@ pub fn ChatSidebar(is_show: bool, onclose: EventHandler<MouseEvent>) -> Element 
         "chat-sidebar"
     };
 
-    // Shared submit logic — captures signals, works from both keyboard and button.
     let mut do_send = move || {
         let text = input_value().trim().to_string();
         if text.is_empty() {
             return;
         }
-        let id = next_id();
+        let id = next_local_id();
         messages.write().push(ChatMessage {
-            id,
+            id: format!("local-{id}"),
             sender: "You".to_string(),
             initials: "YO".to_string(),
             text,
             timestamp: "Now".to_string(),
             is_self: true,
         });
-        next_id.set(id + 1);
+        next_local_id.set(id + 1);
         input_value.set(String::new());
     };
 
     rsx! {
         div { class: "{container_class}", id: "chat-sidebar",
-            // ── Header ────────────────────────────────────────────────────
+            // ── Header ──────────────────────────────────────────────
             div { class: "sidebar-header",
                 h2 { "In-call messages" }
                 button {
@@ -122,7 +144,7 @@ pub fn ChatSidebar(is_show: bool, onclose: EventHandler<MouseEvent>) -> Element 
                 }
             }
 
-            // ── Notice ────────────────────────────────────────────────────
+            // ── Notice ───────────────────────────────────────────────
             div { class: "chat-notice",
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -141,27 +163,38 @@ pub fn ChatSidebar(is_show: bool, onclose: EventHandler<MouseEvent>) -> Element 
                 span { "Messages can only be seen by people in the call." }
             }
 
-            // ── Message list ──────────────────────────────────────────────
+            // ── Message list ─────────────────────────────────────────
             div { class: "chat-messages",
-                for msg in messages().iter() {
-                    {
-                        let msg = msg.clone();
-                        let item_class = if msg.is_self {
-                            "chat-message chat-message--self"
-                        } else {
-                            "chat-message"
-                        };
-                        rsx! {
-                            div { class: "{item_class}", key: "{msg.id}",
-                                if !msg.is_self {
-                                    div { class: "chat-avatar", "{msg.initials}" }
-                                }
-                                div { class: "chat-bubble-wrapper",
+                if is_loading() {
+                    div { class: "chat-loading", "Loading messages…" }
+                } else if let Some(err) = load_error() {
+                    div { class: "chat-error",
+                        "Failed to load messages: "
+                        span { "{err}" }
+                    }
+                } else if messages().is_empty() {
+                    div { class: "chat-empty", "No messages yet. Be the first to say something!" }
+                } else {
+                    for msg in messages().iter() {
+                        {
+                            let msg = msg.clone();
+                            let item_class = if msg.is_self {
+                                "chat-message chat-message--self"
+                            } else {
+                                "chat-message"
+                            };
+                            rsx! {
+                                div { class: "{item_class}", key: "{msg.id}",
                                     if !msg.is_self {
-                                        span { class: "chat-sender", "{msg.sender}" }
+                                        div { class: "chat-avatar", "{msg.initials}" }
                                     }
-                                    div { class: "chat-bubble", "{msg.text}" }
-                                    span { class: "chat-timestamp", "{msg.timestamp}" }
+                                    div { class: "chat-bubble-wrapper",
+                                        if !msg.is_self {
+                                            span { class: "chat-sender", "{msg.sender}" }
+                                        }
+                                        div { class: "chat-bubble", "{msg.text}" }
+                                        span { class: "chat-timestamp", "{msg.timestamp}" }
+                                    }
                                 }
                             }
                         }
@@ -169,7 +202,7 @@ pub fn ChatSidebar(is_show: bool, onclose: EventHandler<MouseEvent>) -> Element 
                 }
             }
 
-            // ── Input area ────────────────────────────────────────────────
+            // ── Input area ───────────────────────────────────────────
             div { class: "chat-input-area",
                 input {
                     class: "chat-input",
@@ -206,6 +239,3 @@ pub fn ChatSidebar(is_show: bool, onclose: EventHandler<MouseEvent>) -> Element 
         }
     }
 }
-
-
-

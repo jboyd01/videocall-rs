@@ -14,6 +14,7 @@ mod pkce;
 mod provider_config;
 mod routing;
 mod types;
+mod jmap_service;
 
 use crate::components::search_modal::SearchVisibleCtx;
 use crate::routing::Route;
