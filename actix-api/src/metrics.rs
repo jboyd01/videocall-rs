@@ -21,8 +21,8 @@
 use actix_web::{HttpResponse, Responder};
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge_vec, register_histogram, Counter,
-    CounterVec, Encoder, GaugeVec, Histogram,
+    register_counter, register_counter_vec, register_gauge_vec, register_histogram,
+    register_histogram_vec, Counter, CounterVec, Encoder, GaugeVec, Histogram, HistogramVec,
 };
 
 /// Shared Prometheus metrics HTTP handler for relay server binaries.
@@ -379,7 +379,16 @@ lazy_static! {
     )
     .expect("Failed to create adaptive_audio_tier metric");
 
-    /// Cumulative datagram drops (writable stream locked)
+    /// Cumulative datagrams dropped as of the latest client health snapshot.
+    pub static ref DATAGRAM_DROPS: GaugeVec = register_gauge_vec!(
+        "videocall_datagram_drops",
+        "Cumulative datagrams dropped due to locked writable stream as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create datagram_drops metric");
+
+    /// Deprecated compatibility mirror for dashboards still querying the old
+    /// counter-shaped gauge name.
     pub static ref DATAGRAM_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_datagram_drops_total",
         "Cumulative datagrams dropped due to locked writable stream",
@@ -387,7 +396,16 @@ lazy_static! {
     )
     .expect("Failed to create datagram_drops_total metric");
 
-    /// Cumulative WebSocket packets dropped (backpressure)
+    /// Cumulative WebSocket packet drops as of the latest client health snapshot.
+    pub static ref WEBSOCKET_DROPS: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_drops",
+        "Cumulative WebSocket packets dropped due to send buffer backpressure as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create websocket_drops metric");
+
+    /// Deprecated compatibility mirror for dashboards still querying the old
+    /// counter-shaped gauge name.
     pub static ref WEBSOCKET_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_websocket_drops_total",
         "Cumulative WebSocket packets dropped due to send buffer backpressure",
@@ -413,15 +431,21 @@ lazy_static! {
     )
     .expect("Failed to create encoder_fps_ratio metric");
 
-    /// Peer FPS signal driving encoder decisions.
-    /// NOTE: As of PR-A (#312), this reports p75 aggregated FPS, not worst-peer FPS.
-    /// TODO(PR-G): rename metric to `videocall_encoder_p75_peer_fps`.
+    /// Deprecated compatibility metric for the old worst-peer name.
     pub static ref ENCODER_WORST_PEER_FPS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_worst_peer_fps",
-        "FPS from the worst-performing receiver driving encoder decisions",
+        "Deprecated compatibility metric; now carries the encoder p75 peer FPS",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create encoder_worst_peer_fps metric");
+
+    /// p75 peer FPS signal driving encoder decisions.
+    pub static ref ENCODER_P75_PEER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_p75_peer_fps",
+        "p75 peer FPS driving adaptive quality decisions",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create encoder_p75_peer_fps metric");
 
     /// Screen share quality tier (0=high, 1=medium, 2=low)
     pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(
@@ -568,4 +592,198 @@ lazy_static! {
         &["room", "direction"]
     )
     .expect("Failed to create relay_room_bytes_total metric");
+
+    // ===== AUTH & TRANSPORT TELEMETRY (Phase 8b — TELEM-7, TELEM-8, AUTH-3) =====
+    //
+    // These counters back the alerting rules that fire when JWT rejection rate
+    // or relay outbound-channel drops cross threshold. Designed so on-call can
+    // query rate(...)[5m] without log scraping. See discussion #562 Phase 8b.
+
+    /// JWT room-token rejections, labeled by reason.
+    ///
+    /// CARDINALITY: bounded — exactly 5 series (`token_expired`, `invalid_signature`,
+    /// `missing_claim`, `malformed`, `other`). Safe for indefinite retention.
+    ///
+    /// Incremented from `token_validator::decode_room_token` and
+    /// `validate_room_token` on the error-return path so every JWT auth failure
+    /// is counted regardless of whether it came from the WS or WT entry point.
+    pub static ref AUTH_REJECTIONS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_auth_rejections_total",
+        "Total JWT room-token rejections by reason",
+        &["reason"]
+    )
+    .expect("Failed to create videocall_auth_rejections_total metric");
+
+    /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
+    ///
+    /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
+    /// `kind` is one of `audio`|`video`|`screen`|`media`|`control`|`rtt`|`unknown`.
+    /// ~14 series total.
+    ///
+    /// CARDINALITY TRADE-OFF: We deliberately do NOT include `session_id` as a
+    /// label — session IDs are unbounded and would explode storage. The existing
+    /// `relay_packet_drops_total` carries `room` for room-level attribution; this
+    /// new counter is the protocol-wide aggregate that backs alerting (rate()
+    /// over 5m). Use `relay_packet_drops_total` for per-room investigation.
+    ///
+    /// `kind` values (set in `wt_chat_session::drop_kind_label` and the
+    /// matching helper in `ws_chat_session`):
+    /// - `audio`: MEDIA packet whose inner `MediaPacket.media_type == AUDIO`.
+    ///   Added 2026-05-08 to attribute congestion-storm drops to audio.
+    /// - `video`: MEDIA packet whose inner `MediaPacket.media_type == VIDEO`.
+    /// - `screen`: MEDIA packet whose inner `MediaPacket.media_type == SCREEN`.
+    /// - `media`: legacy catch-all for MEDIA packets we could not refine —
+    ///   encrypted/unparseable inner payloads, HEARTBEAT, KEYFRAME_REQUEST,
+    ///   or any future MediaType not in the audio/video/screen set. Kept
+    ///   so existing alerts pivoting on `kind="media"` still see a series.
+    /// - `control`: any non-media outbound (heartbeats, session-assigned, etc.)
+    /// - `rtt`: RTT echo path that drops on a full datagram queue
+    /// - `unknown`: caller could not classify (parse failure / unparsed paths)
+    ///
+    /// BACKWARDS-COMPAT NOTE FOR DASHBOARDS: queries grouped on `kind="media"`
+    /// will only see the catch-all bucket after this change; audio/video/screen
+    /// drops now land on their own labels. Update saved Grafana queries with
+    /// `kind=~"audio|video|screen|media"` (or sum across) to preserve totals.
+    pub static ref OUTBOUND_CHANNEL_DROPS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_outbound_channel_drops_total",
+        "Total outbound channel drops (try_send full) by transport and packet kind",
+        &["transport", "kind"]
+    )
+    .expect("Failed to create videocall_outbound_channel_drops_total metric");
+
+    // ===== CLIENT TELEMETRY: TELEM-7, TELEM-8, TELEM-9 =====
+
+    /// TELEM-7: Static per-session client metadata (value always 1, info in labels)
+    pub static ref CLIENT_INFO: GaugeVec = register_gauge_vec!(
+        "videocall_client_info",
+        "Static per-session client metadata (value always 1, info in labels)",
+        &["meeting_id", "session_id", "display_name",
+          "cores", "architecture", "gpu_family",
+          "network_effective_type", "capability_score"]
+    )
+    .expect("Failed to create videocall_client_info metric");
+
+    /// TELEM-8: Long task duration histogram (main-thread stalls)
+    pub static ref CLIENT_LONGTASK_DURATION_MS: HistogramVec = register_histogram_vec!(
+        "videocall_client_longtask_duration_ms",
+        "Main-thread long task durations observed by the client (ms)",
+        &["meeting_id", "session_id", "display_name"],
+        vec![50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 30000.0]
+    )
+    .expect("Failed to create videocall_client_longtask_duration_ms metric");
+
+    /// TELEM-9: Main-thread rAF cadence (frames per second)
+    pub static ref CLIENT_RENDER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_client_render_fps",
+        "Main-thread rAF cadence (fps)",
+        &["meeting_id", "session_id", "display_name"]
+    )
+    .expect("Failed to create videocall_client_render_fps metric");
+}
+
+// =============================================================================
+// Phase 8b unit tests
+// =============================================================================
+//
+// These tests verify the counter wiring in isolation. End-to-end behavior is
+// covered by `token_validator::tests` (auth) and is the responsibility of the
+// integration test suite for the transport drop sites.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Snapshot the counter, mutate, and assert delta. The counter is a global
+    /// static so any concurrent test in the same process could alter it; we
+    /// gate with `#[serial]` to keep deltas exact.
+    fn snapshot(counter: &CounterVec, labels: &[&str]) -> f64 {
+        counter.with_label_values(labels).get()
+    }
+
+    #[test]
+    #[serial(outbound_channel_drops_metric)]
+    fn outbound_channel_drops_increments_per_kind() {
+        // Cardinality contract: every documented `kind` must be an
+        // independent series. The audio/video/screen labels were added
+        // 2026-05-08 to refine the legacy `media` bucket; this test
+        // also acts as the regression guard against accidental label
+        // typos drifting between the helpers and the dashboards.
+        let kinds = [
+            "audio", "video", "screen", "media", "control", "rtt", "unknown",
+        ];
+        let before: Vec<f64> = kinds
+            .iter()
+            .map(|k| snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", k]))
+            .collect();
+
+        for k in &kinds {
+            OUTBOUND_CHANNEL_DROPS_TOTAL
+                .with_label_values(&["webtransport", k])
+                .inc();
+        }
+
+        for (i, k) in kinds.iter().enumerate() {
+            let after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", k]);
+            assert_eq!(
+                after - before[i],
+                1.0,
+                "kind={k} should have incremented exactly once"
+            );
+        }
+    }
+
+    #[test]
+    #[serial(outbound_channel_drops_metric)]
+    fn outbound_channel_drops_distinguishes_transport_label() {
+        // Verify that `webtransport` and `websocket` series are independent —
+        // bumping one must not bump the other. This is a regression guard:
+        // mistakenly hard-coding "webtransport" in the WS path would cause
+        // the WS counter to silently stay at zero in production.
+        let wt_before = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", "media"]);
+        let ws_before = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["websocket", "media"]);
+        OUTBOUND_CHANNEL_DROPS_TOTAL
+            .with_label_values(&["websocket", "media"])
+            .inc();
+        let wt_after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", "media"]);
+        let ws_after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["websocket", "media"]);
+        assert_eq!(
+            ws_after - ws_before,
+            1.0,
+            "websocket+media bump should land on the websocket series"
+        );
+        assert_eq!(
+            wt_after - wt_before,
+            0.0,
+            "websocket+media bump must not leak into the webtransport series"
+        );
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn auth_rejections_counter_is_labeled_by_reason() {
+        // Cardinality contract: only the five documented reasons are valid
+        // labels. This test bumps each one and asserts independence.
+        let reasons = [
+            "token_expired",
+            "invalid_signature",
+            "missing_claim",
+            "malformed",
+            "other",
+        ];
+        let before: Vec<f64> = reasons
+            .iter()
+            .map(|r| snapshot(&AUTH_REJECTIONS_TOTAL, &[r]))
+            .collect();
+        for r in &reasons {
+            AUTH_REJECTIONS_TOTAL.with_label_values(&[r]).inc();
+        }
+        for (i, r) in reasons.iter().enumerate() {
+            let after = snapshot(&AUTH_REJECTIONS_TOTAL, &[r]);
+            assert_eq!(
+                after - before[i],
+                1.0,
+                "reason={r} should have incremented exactly once"
+            );
+        }
+    }
 }

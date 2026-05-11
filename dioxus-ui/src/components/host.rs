@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
 use crate::context::{TransportPreferenceCtx, VideoCallClientCtx};
@@ -75,6 +76,7 @@ pub fn Host(
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let pre_acquired_stream = use_context::<PreAcquiredScreenStream>();
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -165,6 +167,7 @@ pub fn Host(
             screen_bitrate,
             screen_settings_cb,
             screen_state_cb,
+            camera.screen_sharing_flag(),
         );
 
         // Wire up congestion step-down, PLI keyframe, and re-election flags
@@ -172,11 +175,7 @@ pub fn Host(
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         camera.set_reelection_completed_signal(client.reelection_completed_signal());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
-
-        // Wire up cross-stream bandwidth coordination: the screen encoder sets
-        // this flag when capture starts/stops; the camera encoder reads it to
-        // drop quality and set a ceiling, preventing bandwidth contention.
-        screen.set_screen_sharing_flag(camera.screen_sharing_flag());
+        screen.set_reelection_completed_signal(client.reelection_completed_signal());
 
         // Wire adaptive quality tier indices to health reporter for metrics
         client.set_adaptive_tier_sources(
@@ -187,7 +186,7 @@ pub fn Host(
         // Wire encoder decision inputs + screen tier to health reporter for metrics
         client.set_encoder_metric_sources(
             camera.shared_encoder_fps_ratio(),
-            camera.shared_encoder_worst_peer_fps(),
+            camera.shared_encoder_p75_peer_fps(),
             camera.shared_encoder_bitrate_ratio(),
             camera.shared_encoder_target_bitrate_kbps(),
             screen.shared_screen_tier_index(),
@@ -425,11 +424,24 @@ pub fn Host(
                     initial_tier
                 );
 
-                let state_clone = state.clone();
-                Timeout::new(1000, move || {
-                    state_clone.borrow_mut().screen.start(initial_tier);
-                })
-                .forget();
+                // Check if the onclick handler already acquired a MediaStream
+                // (required for Safari which mandates getDisplayMedia be called
+                // synchronously within a user gesture handler).
+                let maybe_stream = pre_acquired_stream.borrow_mut().take();
+                if let Some(stream) = maybe_stream {
+                    log::info!("Start screen share encoder with pre-acquired stream");
+                    s.screen.start_with_stream(stream, initial_tier);
+                } else {
+                    // Fallback: let the encoder call getDisplayMedia itself.
+                    // This path works on Chrome/Firefox where the gesture
+                    // chain survives the timeout + spawn_local boundaries.
+                    log::info!("Start screen share encoder (encoder-acquired stream)");
+                    let state_clone = state.clone();
+                    Timeout::new(1000, move || {
+                        state_clone.borrow_mut().screen.start(initial_tier);
+                    })
+                    .forget();
+                }
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();

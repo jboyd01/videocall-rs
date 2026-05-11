@@ -215,6 +215,8 @@ Format is `email:display_name`. The email becomes the user ID for meetings and t
 
 **Safety:** The auto-login endpoint returns 404 when OAuth is enabled or `DEV_USER` is not set. It cannot be activated in production. A startup warning is logged when `DEV_USER` is active.
 
+**SearchV2 note:** If you run local dev with both `DEV_USER` auto-login and SearchV2 enabled, search indexing will attribute pushed data to the synthetic dev identity. That is expected, but it can be confusing in shared dev environments, so meeting-api logs an explicit startup warning for this combination.
+
 ### Configuring OAuth
 
 To enable OAuth login (required for production, optional for development):
@@ -477,6 +479,10 @@ Any other value (or unset variable) is treated as `false`.
 
 ## Testing
 
+For an overview of how testing is structured across the repo — including
+Playwright E2E, Dioxus browser integration tests, and backend integration
+tests — see **[docs/TESTING.md](docs/TESTING.md)**.
+
 ### UI Testing (dioxus-ui)
 
 The Dioxus frontend uses a three-layer testing pyramid, all running in a real
@@ -547,6 +553,7 @@ Nix-based dev Dockerfiles as CI. Tests run automatically on pushes to `main` and
 can be triggered manually from the GitHub Actions page.
 
 See the `e2e-*` targets in the `Makefile` for available commands.
+For a broader testing-layer overview, see **[docs/TESTING.md](docs/TESTING.md)**.
 
 ## Roadmap
 
@@ -679,4 +686,3 @@ Start your journey with videocall.rs today. Whether you're building a robot, a d
 ## License
 
 This project is dual licensed under the MIT License and the Apache License 2.0. See the [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) files for details.
-
