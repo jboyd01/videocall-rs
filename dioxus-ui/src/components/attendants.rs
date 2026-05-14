@@ -541,6 +541,7 @@ pub fn AttendantsComponent(
     #[props(default)] admitted_can_admit: bool,
     #[props(default = true)] end_on_host_leave: bool,
     #[props(default = false)] allow_guests: bool,
+    #[props(default)] access_token: Option<String>,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -2268,6 +2269,7 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
+            class:"flex gap-2",
             div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
 
@@ -3080,11 +3082,8 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                // Chat sidebar
-                ChatSidebar {
-                    is_show: chat_open(),
-                    onclose: move |_| chat_open.set(false),
-                }
+
+
 
                 // Waiting room controls (host or admitted participants when allowed)
                 if is_owner || admitted_can_admit_toggle() {
@@ -3198,6 +3197,13 @@ pub fn AttendantsComponent(
                     }
                 }
             }
+            // Chat sidebar
+                ChatSidebar {
+                    is_show: chat_open(),
+                    onclose: move |_| chat_open.set(false),
+                    conv_id: id.clone(),
+                    access_token: access_token.clone(),
+                }
         }
     }
 }

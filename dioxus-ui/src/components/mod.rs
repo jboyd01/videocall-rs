@@ -26,13 +26,14 @@ pub mod peer_list_item;
 pub mod search_modal;
 pub mod signal_quality;
 pub mod toggle_switch;
+
 pub mod top_bar;
 pub mod update_display_name_modal;
 pub mod video_control_buttons;
 pub mod waiting_room;
 
 mod canvas_generator;
+pub mod chat_sidebar;
 mod peer_list;
 mod peer_tile;
 pub mod pre_join_settings_card;
-pub mod chat_sidebar;
