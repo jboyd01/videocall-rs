@@ -9,6 +9,7 @@ use crate::components::search_modal::SearchModal;
 use crate::pages::guest_join::GuestJoinPage;
 use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
+use crate::pages::meeting::MeetingPageWithToken;
 use crate::pages::meeting_settings::MeetingSettingsPage;
 use crate::pages::oauth_callback::OAuthCallback;
 use crate::theme::color as theme_color;
@@ -27,6 +28,9 @@ pub enum Route {
     MeetingSettings { id: String },
     #[route("/meeting/:id/guest")]
     GuestJoin { id: String },
+    // remove this in future shouldn't be used anymore
+    #[route("/meeting/:id?:access_token", MeetingPageWithToken)]
+    MeetingWithToken { id: String, access_token: String },
     #[route("/meeting/:id", MeetingPage)]
     Meeting { id: String },
     #[route("/meeting/:id/:webtransport_enabled", MeetingPage2)]

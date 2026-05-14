@@ -13,6 +13,7 @@ mod pages;
 mod pkce;
 mod provider_config;
 mod routing;
+mod shared;
 mod theme;
 mod types;
 mod jmap_service;

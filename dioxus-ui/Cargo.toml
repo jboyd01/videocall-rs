@@ -47,7 +47,7 @@ urlencoding = "2.1"
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = { version = "0.2", features = ["js"] }
-chrono = "0.4.44"
+chrono = { version = "0.4.44", features = ["serde"] }
 
 [dependencies.web-sys]
 version = "0.3.72"
@@ -95,8 +95,13 @@ features = [
     "ResizeObserverEntry",
     "Storage",
     "MediaQueryList",
+    "Url",
+    "UrlSearchParams",
     "Window",
     "console",
+    "EventSource",
+    "EventSourceInit",
+    "MessageEvent",
 ]
 
 [dev-dependencies]
