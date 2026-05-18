@@ -22,3 +22,4 @@ pub mod routing;
 pub mod shared;
 pub mod theme;
 pub mod types;
+pub mod util;

@@ -17,6 +17,8 @@ mod routing;
 mod shared;
 mod theme;
 mod types;
+mod util;
+
 use crate::components::search_modal::SearchVisibleCtx;
 use crate::routing::Route;
 use context::{

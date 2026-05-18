@@ -90,6 +90,7 @@ features = [
     "OscillatorNode",
     "OscillatorType",
     "Performance",
+    "PointerEvent",
     "Storage",
     "MediaQueryList",
     "Url",
