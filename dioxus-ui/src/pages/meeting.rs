@@ -56,17 +56,8 @@ pub enum MeetingStatus {
     Error(String),
 }
 
-/// Thin wrapper used by the `MeetingWithToken` route — receives `access_token`
-/// from the URL query param and forwards it straight to `MeetingPage`.
 #[component]
-pub fn MeetingPageWithToken(id: String, access_token: String) -> Element {
-    rsx! {
-        MeetingPage { id, access_token: Some(access_token) }
-    }
-}
-
-#[component]
-pub fn MeetingPage(id: String, #[props(default)] access_token: Option<String>) -> Element {
+pub fn MeetingPage(id: String) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut auth_checked = use_signal(|| false);
@@ -264,7 +255,9 @@ pub fn MeetingPage(id: String, #[props(default)] access_token: Option<String>) -
                                     let determined_host_uid = response.host_user_id.clone();
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
-                                    log::info!("Join response on meeting activation: {response:#?}");
+                                    log::info!(
+                                        "Join response on meeting activation: {response:#?}"
+                                    );
                                     match response.status.as_str() {
                                         "admitted" => {
                                             if let Some(token) = response.room_token {
@@ -575,7 +568,6 @@ pub fn MeetingPage(id: String, #[props(default)] access_token: Option<String>) -
                     admitted_can_admit: *admitted_can_admit,
                     end_on_host_leave: *end_on_host_leave,
                     allow_guests: true,
-                    access_token: access_token.clone(),
                 }
             },
             (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {

@@ -20,6 +20,7 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
     capability_check::{assess_capability, CapabilityVerdict},
+    chat_sidebar::ChatSidebar,
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
@@ -31,9 +32,8 @@ use crate::components::{
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
-        MicButton, MockPeersButton, PeerListButton, ScreenShareButton,OpenChatButton
+        MicButton, MockPeersButton, OpenChatButton, PeerListButton, ScreenShareButton,
     },
-    chat_sidebar::ChatSidebar
 };
 use crate::console_log_collector::{flush_console_logs, set_console_log_context};
 use crate::constants::actix_websocket_base;
@@ -515,7 +515,6 @@ pub fn AttendantsComponent(
     #[props(default)] admitted_can_admit: bool,
     #[props(default = true)] end_on_host_leave: bool,
     #[props(default = false)] allow_guests: bool,
-    #[props(default)] access_token: Option<String>,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -3320,7 +3319,6 @@ pub fn AttendantsComponent(
                     is_show: chat_open(),
                     onclose: move |_| chat_open.set(false),
                     conv_id: id.clone(),
-                    access_token: access_token.clone(),
                 }
         }
     }
