@@ -13,9 +13,10 @@
 
 //! Chat sidebar component — Google Meet-style in-call chat panel.
 
+use crate::auth::{check_session, get_user_profile};
+use crate::constants::oauth_enabled;
 use crate::jmap_service::{
-    current_user_id_from_token, get_jmap_token, get_messages, send_message, subscribe_chat_sse,
-    SseHandle,
+    current_user_id, get_messages, send_message, subscribe_chat_sse, SseHandle,
 };
 use chrono::DateTime;
 use dioxus::prelude::*;
@@ -122,12 +123,7 @@ fn parse_chat_message(m: &serde_json::Value, my_user_id: &Option<String>) -> Cha
 }
 
 #[component]
-pub fn ChatSidebar(
-    is_show: bool,
-    onclose: EventHandler<MouseEvent>,
-    conv_id: String,
-    #[props(default)] access_token: Option<String>,
-) -> Element {
+pub fn ChatSidebar(is_show: bool, onclose: EventHandler<MouseEvent>, conv_id: String) -> Element {
     let mut input_value = use_signal(String::new);
     // Holds messages shown in the UI (server messages + locally sent ones).
     let mut messages: Signal<Vec<ChatMessage>> = use_signal(Vec::new);
@@ -144,33 +140,33 @@ pub fn ChatSidebar(
     }
     // Resolve the bearer token: use the prop when provided, fall back to the
     // environment / hardcoded token so the component works without a URL param.
-    let token: String = access_token.unwrap_or_else(get_jmap_token);
 
-    // Resolve the current user's ID once from the resolved token.
-    let my_user_id = use_signal(|| current_user_id_from_token(&token));
+    // Resolve the current user's ID: prefer OAuth profile when enabled,
+    // fall back to decoding the stored JWT token.
+    let mut my_user_id: Signal<Option<String>> = use_signal(|| None);
 
-    // Log the conv_id and resolved token once on mount.
-    {
-        let cid = conv_id.clone();
-        let tok = token.clone();
-        use_effect(move || {
-            log::info!(
-                "ChatSidebar mounted: conv_id={}, access_token={}",
-                cid,
-                tok
-            );
+    use_effect(move || {
+        wasm_bindgen_futures::spawn_local(async move {
+            if oauth_enabled().unwrap_or(false) {
+                if check_session().await.is_ok() {
+                    if let Ok(profile) = get_user_profile().await {
+                        my_user_id.set(Some(profile.user_id));
+                        return;
+                    }
+                }
+            }
+            // Fallback: decode from stored JWT token
+            my_user_id.set(current_user_id());
         });
-    }
+    });
 
     // Fetch messages from the server once on mount.
     let conv_id_effect = conv_id.clone();
-    let token_effect = token.clone();
     use_effect(move || {
         let conv_id = conv_id_effect.clone();
-        let token = token_effect.clone();
         let uid = my_user_id();
         wasm_bindgen_futures::spawn_local(async move {
-            match get_messages(conv_id, token).await {
+            match get_messages(conv_id).await {
                 Ok(server_msgs) => {
                     let mut display: Vec<ChatMessage> = server_msgs
                         .iter()
@@ -193,45 +189,38 @@ pub fn ChatSidebar(
     let mut sse_handle: Signal<Option<SseHandle>> = use_signal(|| None);
 
     let conv_id_sse = conv_id.clone();
-    let token_sse = token.clone();
     use_effect(move || {
         let conv_id = conv_id_sse.clone();
-        let token = token_sse.clone();
         let uid = my_user_id();
         // When a ChatMessage state-change arrives, re-fetch all messages.
-        let handle = subscribe_chat_sse(
-            conv_id.clone(),
-            move |cid| {
-                log::info!("🪝 SSE on_change fired for conv_id={}", cid);
-                let uid = uid.clone();
-                let token = token.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    log::info!("📥 Re-fetching messages…");
-                    match get_messages(cid, token).await {
-                        Ok(server_msgs) => {
-                            log::info!(
-                                "✅ Re-fetch returned {} messages, updating signal",
-                                server_msgs.len()
-                            );
-                            gloo_timers::future::TimeoutFuture::new(0).await;
-                            scroll_chat_to_bottom();
-                            show_jump_button.set(false);
-                            let mut display: Vec<ChatMessage> = server_msgs
-                                .iter()
-                                .map(|m| parse_chat_message(m, &uid))
-                                .collect();
-                            display.reverse();
-                            messages.set(display);
-                            log::info!("🎨 messages signal updated");
-                        }
-                        Err(e) => {
-                            log::error!("❌ SSE re-fetch failed: {e:?}");
-                        }
+        let handle = subscribe_chat_sse(conv_id.clone(), move |cid| {
+            log::info!("🪝 SSE on_change fired for conv_id={}", cid);
+            let uid = uid.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                log::info!("📥 Re-fetching messages…");
+                match get_messages(cid).await {
+                    Ok(server_msgs) => {
+                        log::info!(
+                            "✅ Re-fetch returned {} messages, updating signal",
+                            server_msgs.len()
+                        );
+                        gloo_timers::future::TimeoutFuture::new(0).await;
+                        scroll_chat_to_bottom();
+                        show_jump_button.set(false);
+                        let mut display: Vec<ChatMessage> = server_msgs
+                            .iter()
+                            .map(|m| parse_chat_message(m, &uid))
+                            .collect();
+                        display.reverse();
+                        messages.set(display);
+                        log::info!("🎨 messages signal updated");
                     }
-                });
-            },
-            token_sse.clone(),
-        );
+                    Err(e) => {
+                        log::error!("❌ SSE re-fetch failed: {e:?}");
+                    }
+                }
+            });
+        });
         match handle {
             Ok(h) => sse_handle.set(Some(h)),
             Err(e) => log::error!("❌ Failed to open SSE: {e}"),
@@ -311,9 +300,8 @@ pub fn ChatSidebar(
 
         // Send the message to the server via JMAP
         let cid = conv_id.clone();
-        let tok = token.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = send_message(&cid, &text, None, &tok).await {
+            if let Err(e) = send_message(&cid, &text, None).await {
                 log::error!("❌ Failed to send message: {}", e);
             }
         });

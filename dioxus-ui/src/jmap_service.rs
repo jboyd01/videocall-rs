@@ -1,3 +1,4 @@
+use crate::auth::get_stored_access_token;
 use crate::shared::*;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -12,9 +13,6 @@ const JMAP_ACCOUNT_ID: &str = "acc1";
 /// Exported so `ChatSidebar` can use it as a fallback when no `access_token`
 /// prop is provided.
 /// Change to get access token from idp service in the future when idp service finishes implement with videocall
-pub fn get_jmap_token() -> String {
-    std::env::var("JMAP_TOKEN").unwrap_or_else(|_| "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLWYyMDRkNWViLTcwMzEtNGJkMy1hMGI4LTI5NjBiMGI1ODkzZSIsInByZWZlcnJlZF91c2VybmFtZSI6ImFkbWluIiwiZXhwIjoxNzc4ODE3ODE3LCJpYXQiOjE3Nzg3MzE0MTcsImlzcyI6IjAuMC4wLjA6ODQ0MyIsImVtYWlsIjpudWxsLCJuYW1lIjpudWxsLCJ0ZW5hbnRfaWQiOiJkZWZhdWx0IiwiYXV0aF90eXBlIjoidXNlciIsImp0aSI6bnVsbCwiZ3Vlc3RfY29udmVyc2F0aW9uX2lkIjpudWxsLCJpbnZpdGVfaWQiOm51bGwsIm9yZ191bml0X2lkIjoib3Vfcm9vdCJ9.vbaYR4eog4MGVOKRaerk5r3ukzXkkukcbYPGCeXNnD0".to_string())
-}
 
 /// Decode the JWT payload (without signature verification) and return the
 /// `sub` claim for the given token string.
@@ -31,39 +29,35 @@ pub fn current_user_id_from_token(token: &str) -> Option<String> {
 
 /// Convenience wrapper — decodes the `sub` claim from the environment token.
 pub fn current_user_id() -> Option<String> {
-    current_user_id_from_token(&get_jmap_token())
+    current_user_id_from_token(&get_stored_access_token().unwrap_or_default())
 }
 
-
-pub async fn get_messages(conv_id: String, token: String) -> Result<Vec<serde_json::Value>, String> {
-    let response = jmap_call(
-        vec![
-            (
-                "ChatMessage/query".to_string(),
-                json!({
-                    "accountId": JMAP_ACCOUNT_ID,
-                    "conversationId": conv_id,
-                    "limit": 20,
-                    "position": -1,
-                    "preview": false,
-                }),
-                "0".to_string(),
-            ),
-            (
-                "ChatMessage/get".to_string(),
-                json!({
-                    "#ids": {
-                        "name": "ChatMessage/query",
-                        "path": "/ids",
-                        "resultOf": "0",
-                    },
-                    "accountId": JMAP_ACCOUNT_ID,
-                }),
-                "1".to_string(),
-            ),
-        ],
-        &token,
-    )
+pub async fn get_messages(conv_id: String) -> Result<Vec<serde_json::Value>, String> {
+    let response = jmap_call(vec![
+        (
+            "ChatMessage/query".to_string(),
+            json!({
+                "accountId": JMAP_ACCOUNT_ID,
+                "conversationId": conv_id,
+                "limit": 20,
+                "position": -1,
+                "preview": false,
+            }),
+            "0".to_string(),
+        ),
+        (
+            "ChatMessage/get".to_string(),
+            json!({
+                "#ids": {
+                    "name": "ChatMessage/query",
+                    "path": "/ids",
+                    "resultOf": "0",
+                },
+                "accountId": JMAP_ACCOUNT_ID,
+            }),
+            "1".to_string(),
+        ),
+    ])
     .await?;
 
     extract_chat_messages(response)
@@ -73,8 +67,8 @@ pub async fn send_message(
     conv_id: &str,
     text_body: &str,
     body_values: Option<&str>,
-    token: &str,
 ) -> Result<JmapResponse, String> {
+    let token = get_stored_access_token().unwrap_or_default();
     let temp_id = format!(
         "temp-{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         (js_sys::Math::random() * 0xFFFF_FFFFu32 as f64) as u32,
@@ -92,26 +86,23 @@ pub async fn send_message(
         }
     };
 
-    let sender_id = current_user_id_from_token(token).unwrap_or_default();
+    let sender_id = current_user_id_from_token(&token).unwrap_or_default();
 
-    let response = jmap_call(
-        vec![(
-            "ChatMessage/set".to_string(),
-            json!({
-                "create": {
-                    temp_id: {
-                        "bodyValues": body_val,
-                        "conversationId": conv_id,
-                        "messageType": "user",
-                        "textBody": text_body,
-                    }
-                },
-                "senderId": sender_id,
-            }),
-            "0".to_string(),
-        )],
-        token,
-    )
+    let response = jmap_call(vec![(
+        "ChatMessage/set".to_string(),
+        json!({
+            "create": {
+                temp_id: {
+                    "bodyValues": body_val,
+                    "conversationId": conv_id,
+                    "messageType": "user",
+                    "textBody": text_body,
+                }
+            },
+            "senderId": sender_id,
+        }),
+        "0".to_string(),
+    )])
     .await?;
 
     Ok(response)
@@ -133,8 +124,8 @@ fn extract_chat_messages(response: JmapResponse) -> Result<Vec<serde_json::Value
 
 async fn jmap_call(
     method_calls: Vec<(String, serde_json::Value, String)>,
-    token: &str,
 ) -> Result<JmapResponse, String> {
+    let token = get_stored_access_token().unwrap_or_default();
     let request = JmapRequest {
         using: vec![
             "urn:ietf:params:jmap:core".to_string(),
@@ -153,7 +144,7 @@ async fn jmap_call(
         .post(format!("{}/jmap", base_url))
         .header(reqwest::header::ACCEPT, "*/*")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .body(body.clone())
         .send()
         .await
@@ -218,8 +209,8 @@ impl Drop for SseHandle {
 pub fn subscribe_chat_sse(
     conv_id: String,
     on_change: impl Fn(String) + 'static,
-    token: String,
 ) -> Result<SseHandle, String> {
+    let token = get_stored_access_token().unwrap_or_default();
     let base_url =
         std::env::var("JMAP_BASE_URL").unwrap_or_else(|_| "https://127.0.0.1:8443".to_string());
 
@@ -234,8 +225,8 @@ pub fn subscribe_chat_sse(
     // which `onmessage` alone does NOT receive — those require explicit
     // `addEventListener` calls per event-name.
     let conv_id_clone = conv_id.clone();
-    let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-        move |event: web_sys::MessageEvent| {
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             let evt_type = event.type_();
             let data = event.data();
             if let Some(text) = data.as_string() {
@@ -264,8 +255,7 @@ pub fn subscribe_chat_sse(
                     on_change(conv_id_clone.clone());
                 }
             }
-        },
-    );
+        });
 
     let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
         log::warn!("⚠️ SSE connection error – browser will auto-reconnect");
@@ -298,4 +288,3 @@ pub fn subscribe_chat_sse(
         _on_open: on_open,
     })
 }
-
