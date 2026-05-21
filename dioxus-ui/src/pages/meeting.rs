@@ -569,7 +569,7 @@ pub fn MeetingPage(id: String) -> Element {
                     waiting_room_enabled: *waiting_room_enabled,
                     admitted_can_admit: *admitted_can_admit,
                     end_on_host_leave: *end_on_host_leave,
-                    allow_guests: true,
+                    allow_guests:*allow_guests,
                 }
             },
             (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {
