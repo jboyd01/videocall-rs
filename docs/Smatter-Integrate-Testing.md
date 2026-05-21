@@ -1,7 +1,7 @@
 To test the smatter chat with access_token get from identity service, follow these steps:
 
 Clone cc7 repo switch to branch <strong>feat/integrate-video-call</strong> open <b>cc7/src/features/auth/services/service.rs</b> 
-```rust
+```
   oidc_providers.insert(
             "cc7-keycloak".to_string(),
             OidcProvider {
