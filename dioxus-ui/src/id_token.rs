@@ -133,7 +133,6 @@ pub(crate) fn decode_and_validate_id_token(
 ) -> Result<IdTokenClaims, String> {
     // JWT is three base64url segments separated by `.`.
     let mut parts = id_token.splitn(3, '.');
-    println!("id_token: {}", id_token);
     let _ = parts.next(); // header — skip
     let payload_b64 = parts
         .next()
