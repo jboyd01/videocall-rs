@@ -232,7 +232,7 @@ pub fn MeetingPage(id: String) -> Element {
                     move |_| {
                         log::info!("Meeting activated push received, re-joining...");
                         let meeting_id = meeting_id.clone();
-                        let display_name = "Admin".to_string();
+                        let display_name = display_name.clone();
                         // Use spawn_local instead of dioxus::spawn because
                         // this callback fires from a WebSocket message
                         // handler (Inner::on_inbound_media) which runs
@@ -255,9 +255,6 @@ pub fn MeetingPage(id: String) -> Element {
                                     let determined_host_uid = response.host_user_id.clone();
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
-                                    log::info!(
-                                        "Join response on meeting activation: {response:#?}"
-                                    );
                                     match response.status.as_str() {
                                         "admitted" => {
                                             if let Some(token) = response.room_token {

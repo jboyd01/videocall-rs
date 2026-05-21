@@ -90,7 +90,7 @@ const PROFILE_DISPLAY_NAME_KEY: &str = "vc_profile_display_name";
 /// Session-storage key for the stable guest participant ID (`guest:<uuid>`)
 /// that is reused across re-joins within the same browser tab.
 const GUEST_SESSION_ID_KEY: &str = "vc_guest_session_id";
-const CHAT_ACCESS_TOKEN_KEY: &str = "vc_chat_access_token";
+
 /// Read the stable guest session ID for the current tab, if any.
 pub fn get_guest_session_id() -> Option<String> {
     SessionStorage::get::<Option<String>>(&GUEST_SESSION_ID_KEY.to_string()).flatten()
@@ -156,17 +156,7 @@ pub fn get_stored_access_token() -> Option<String> {
 pub fn store_access_token(token: &str) {
     SessionStorage::set(ACCESS_TOKEN_KEY.to_string(), &Some(token.to_string()));
 }
-pub fn store_chat_access_token(token: &str) {
-    SessionStorage::set(CHAT_ACCESS_TOKEN_KEY.to_string(), &Some(token.to_string()));
-}
-pub fn clear_chat_access_token() {
-    SessionStorage::set(CHAT_ACCESS_TOKEN_KEY.to_string(), &None::<String>);
-}
-pub fn get_stored_chat_access_token() -> Option<String> {
-    SessionStorage::get::<Option<String>>(&CHAT_ACCESS_TOKEN_KEY.to_string())
-        .flatten()
-        .filter(|t| !t.is_empty())
-}
+
 /// Clear the stored access token from session-scoped storage.
 ///
 /// Called on logout so subsequent requests are unauthenticated immediately,
