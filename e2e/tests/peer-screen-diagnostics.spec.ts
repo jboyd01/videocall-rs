@@ -200,15 +200,10 @@ test.describe("Peer screen-share diagnostics", () => {
       const hostPage = members[0].page;
       const guestPage = members[1].page;
 
-      // Allow peer discovery to propagate through signaling before
-      // asserting on remote tiles.
-      await hostPage.waitForTimeout(5000);
-
-      // Wait for mesh to settle so the host has the guest tile + diagnostics flow.
-      await hostPage.waitForTimeout(8000);
-
+      // Wait for peer discovery + mesh settlement — the assertion timeout
+      // covers the full propagation window without redundant hardcoded waits.
       await expect(hostPage.locator("#grid-container .canvas-container")).toHaveCount(1, {
-        timeout: 30_000,
+        timeout: 45_000,
       });
 
       // Guest starts screen-share. If the wasm-level mock could not produce a
@@ -372,18 +367,37 @@ test.describe("Peer screen-share diagnostics", () => {
       if (!causeLine) {
         throw new Error(`Tooltip did not contain a 'Cause:' line:\n${tooltipHtml2}`);
       }
-      // Compact (post-tightening) format pieces:
-      //   * `1200kbps` — bitrate joined to its unit, no space.
-      //   * `tier 'medium'` — bare tier cue, kept so users can read
-      //     'medium' as a tier name and not a generic adjective.
-      //   * `bitrate-limited` — the cause_hint the publisher seeds when
-      //     AQ boots below the top tier.
-      expect(causeLine).toMatch(/1200kbps/);
-      expect(causeLine).toMatch(/tier 'medium'/);
-      expect(causeLine).toMatch(/bitrate-limited/);
+      // The cause line must contain a bitrate value (NNNNkbps format).
+      // Tier and cause_hint fields are optional — they depend on whether
+      // AQ has classified the stream by the time diagnostics are captured.
+      expect(causeLine).toMatch(/\d+kbps/);
       // Wordy phrasing from the pre-tightening prototype must be gone.
       expect(causeLine).not.toMatch(/encoder target/);
       expect(causeLine).not.toMatch(/limited by/);
+
+      // HCL follow-up #939: a separate, longer-running assertion verifies that
+      // the publisher actually emits BOTH `tier '<name>'` and a recognized
+      // cause-hint value within a generous (~30s) window. Keeps the fast
+      // `\d+kbps` assertion above as the liveness check while still catching
+      // a regression where the publisher silently stops emitting tier or
+      // cause_hint (the loosening in PR #938 swallowed that signal).
+      //
+      // Cause-hint vocabulary (from
+      // `videocall-client/src/encode/screen_encoder.rs::cause_hint_from_trigger`):
+      //   - bitrate-limited (trigger=bitrate)
+      //   - cpu-pressure   (trigger=fps)
+      //   - network-rtt    (trigger=congestion)
+      //   - manual-cap     (trigger=coordination)
+      // Empty hint ("") is the proto3 default — the renderer skips the
+      // line in that case, so the poll body would not find a Cause line
+      // and `.toPass()` would keep retrying until a non-default hint
+      // lands.
+      await expect(async () => {
+        const html = await tooltip.innerHTML();
+        const line = html.split(/<br\s*\/?>|\n/i).find((l) => /Cause:/.test(l)) ?? "";
+        expect(line).toMatch(/tier '[^']+'/);
+        expect(line).toMatch(/(bitrate-limited|cpu-pressure|network-rtt|manual-cap)/);
+      }).toPass({ timeout: 30_000 });
 
       // The legend help text must describe the Cause line shape so the
       // wording stays in sync with the renderer. The previous placeholder

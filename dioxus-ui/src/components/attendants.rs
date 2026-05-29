@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
@@ -46,7 +47,8 @@ use crate::context::{
     save_density_mode, save_display_name_to_storage, save_dock_autohide, save_dock_position,
     validate_display_name, AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DensityModeCtx,
     DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -805,6 +807,14 @@ pub fn AttendantsComponent(
     // up departed peers' histories. Provided as context alongside PeerStatusMap.
     let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
 
+    // HCL bug #8 + #9: per-(peer, mode) signal-popup state map, owned by
+    // the parent so PeerTile remounts (peer leaves, layout switches) do
+    // not unmount the popup containers and accidentally close every
+    // other peer's open popup. Cleaned up alongside
+    // `peer_signal_history_map` when peers leave so we don't leak
+    // entries for departed peers.
+    let signal_popup_state_map: SignalPopupStateMap = use_signal(HashMap::new);
+
     // Per-tile crop state — created early so on_peer_removed can clean up.
     let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
 
@@ -984,6 +994,11 @@ pub fn AttendantsComponent(
                 // map does not grow unboundedly over long meetings.
                 let mut hist_map = peer_signal_history_map;
                 hist_map.write().remove(&peer_id);
+                // HCL bug #8: drop only this peer's open signal-meter popup
+                // entries; every other peer's popup state stays intact so
+                // their popups remain visible across the parent re-render.
+                let mut popup_map = signal_popup_state_map;
+                popup_map.write().retain(|(pid, _mode), _| pid != &peer_id);
                 let mut speech_map = peer_speech_priority;
                 speech_map.write().remove(&peer_id);
                 let mut jt_map = peer_join_time;
@@ -1707,6 +1722,11 @@ pub fn AttendantsComponent(
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
 
+    // HCL bug #8 + #9: provide the popup-state map so PeerTile can look up
+    // each popup's open/free-position state. Surviving the parent re-render
+    // is what makes peer leaves stop tearing down every other open popup.
+    use_context_provider(|| signal_popup_state_map);
+
     // Per-tile crop state — signal created early (near peer_status_map) so
     // on_peer_removed can clean up; context provided here for child access.
     use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
@@ -2115,6 +2135,15 @@ pub fn AttendantsComponent(
         stack.last().cloned()
     };
     let has_screen_share = active_screen_sharer.is_some();
+    // HCL bug #2: display name of the active screen sharer (if any), so
+    // every peer-mode signal-meter popup can surface a small
+    // "Sharing: <name>" header line. Computed once per render so the
+    // PeerTile for-loop avoids repeating the lookup.
+    let active_screen_sharer_name: Option<String> = active_screen_sharer.as_ref().map(|sid| {
+        client
+            .get_peer_display_name(sid)
+            .unwrap_or_else(|| sid.clone())
+    });
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     // The right panel uses a 2-column grid of compact tiles. We compute how
@@ -2223,7 +2252,8 @@ pub fn AttendantsComponent(
 
     // Tile count drives the `participants-N` class modifier on the grid
     // container, which lets CSS branch layout behavior (see
-    // `.participants-2` rule in global.css that disables the 3:2 cap).
+    // `.participants-1 .grid-item.full-bleed` rule in style.css that drops
+    // the 3:2 cap on the lone tile for the 2-peer meeting case — HCL #7).
     let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
 
     let container_style = if has_screen_share {
@@ -2244,12 +2274,19 @@ pub fn AttendantsComponent(
         // surplus to distribute. Using a wider ratio here would leave
         // `tw - th * TILE_AR` of internal padding on every cell.
         let th = tw / TILE_AR;
-        // 2-peer case: let tiles stretch to fill their half (CSS rule in
-        // global.css disables the 3:2 cap on `.participants-2 .grid-item`).
-        // 3+ peers: size tracks to the natural tile dimensions and pack
-        // left/top so surplus viewport width sits on the right edge as
-        // empty space instead of being distributed between tiles.
-        let (track_cols, track_rows, pack) = if tile_count <= 2 {
+        // 1-tile case (HCL #7, 2-peer meeting): let the lone remote tile
+        // stretch to fill the entire grid area. The `.participants-1
+        // .grid-item.full-bleed` CSS rule drops the 3:2 cap on this lone
+        // tile so the remote peer fills the viewport — combined with `1fr`
+        // tracks and `stretch` packing, the tile reaches edge-to-edge.
+        // 2+ tiles (HCL #6): size tracks to the natural 3:2 tile dimensions
+        // and pack left/top so surplus viewport width sits on the right
+        // edge as empty space instead of being distributed between tiles.
+        // This is the only way to guarantee the 3:2 aspect holds in narrow
+        // viewports where `1fr` cells would be taller than `cell_w * 2/3`
+        // and `.grid-item { height: 100% }` would otherwise stretch the
+        // tile vertically. See HCL bug report for the 3-peer-aspect issue.
+        let (track_cols, track_rows, pack) = if tile_count == 1 {
             (
                 format!("repeat({cols}, 1fr)"),
                 format!("repeat({rows}, 1fr)"),
@@ -2276,8 +2313,11 @@ pub fn AttendantsComponent(
         )
     };
 
-    // `participants-N` modifier; CSS uses `.participants-2` to disable the
-    // 3:2 aspect-ratio cap so tiles fill their half of the viewport.
+    // `participants-N` modifier; CSS uses `.participants-1 .grid-item.full-bleed`
+    // (HCL #7) to drop the 3:2 cap on the lone remote tile in a 2-peer
+    // meeting so it fills the viewport. 2+ tiles keep the cap and the tile
+    // size is driven by `--tile-w` / `--tile-h` (set above) — see the
+    // `tile_count == 1` branch in `container_style`.
     let container_class = format!("participants-{tile_count}");
 
     let meeting_link = {
@@ -2541,6 +2581,11 @@ pub fn AttendantsComponent(
             // Provide MeetingTime context
             // Provide VideoCallClient context
             div { id: "main-container", class: "meeting-page",
+                onclick: move |_| {
+                    dock_menu_open.set(false);
+                    density_open.set(false);
+                    mock_peers_open.set(false);
+                },
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
@@ -2822,6 +2867,9 @@ pub fn AttendantsComponent(
                                             render_mode: TileMode::ScreenOnly,
                                             my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
+                                            // HCL bug #2: the shared-content tile shows
+                                            // ONLY the screen-share metric in its popup.
+                                            meter_mode: SignalMeterMode::ScreenOnly,
                                             on_toggle_pin: toggle_pin.clone(),
                                         }
                                     }
@@ -2834,15 +2882,34 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — 1 or 2-column grid of compact peer tiles
+                                // Right panel — 1 or 2-column grid of compact peer tiles.
+                                //
+                                // HCL issues #3 + #4: columns are sized to the tile's natural
+                                // 3:2 width (`ss_tile_h * 1.5`), NOT `1fr`. `1fr` columns made
+                                // the grid stretch each cell to fill `right_pct%`, leaving the
+                                // 3:2-capped `.split-peer-tile` centered with surplus on both
+                                // sides — visually "centered with too-large column gaps" on a
+                                // wide right panel. Pairing fixed `var(--ss-tile-w)` cells
+                                // with `justify-content: start` packs the tiles to the left
+                                // edge and keeps the inter-tile gap exactly `8px`, matching
+                                // the non-share grid feel. Tiles still hold their 3:2 cap
+                                // (enforced by `.split-peer-tile { aspect-ratio: 3 / 2 }`),
+                                // so wide-screen viewports leave empty space on the right
+                                // edge of the panel instead of stretching the tiles.
                                 div {
                                     style: {
-                                        let grid_cols = if ss_cols > 1.0 { "1fr 1fr" } else { "1fr" };
+                                        let ss_tile_w = (ss_tile_h * TILE_AR).round();
+                                        let grid_cols = if ss_cols > 1.0 {
+                                            format!("repeat(2, {ss_tile_w:.0}px)")
+                                        } else {
+                                            format!("{ss_tile_w:.0}px")
+                                        };
                                         format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
                                                 display: grid; grid-template-columns: {grid_cols}; \
                                                 grid-auto-rows: {ss_tile_h:.0}px; \
                                                 gap: 8px; padding: 6px; \
-                                                align-content: start; overflow: visible;")
+                                                justify-content: start; align-content: start; \
+                                                overflow: visible;")
                                     },
                                     for tile_id in ss_tiles.iter() {
                                         {
@@ -2872,6 +2939,10 @@ pub fn AttendantsComponent(
                                                         on_toggle_pin: toggle_pin.clone(),
                                                         room_id: Some(id.clone()),
                                                         is_current_user_host: is_owner,
+                                                        // HCL bug #2: peer popups suppress the
+                                                        // screen metric and surface a header note
+                                                        // pointing at whoever is sharing right now.
+                                                        sharing_peer_name: active_screen_sharer_name.clone(),
                                                     }
                                                 }
                                             }
@@ -2919,6 +2990,12 @@ pub fn AttendantsComponent(
                                             on_toggle_pin: toggle_pin.clone(),
                                             room_id: Some(id.clone()),
                                             is_current_user_host: is_owner,
+                                            // HCL bug #2: grid layout never reaches the split
+                                            // path, but a screen share may still be live in
+                                            // the publisher's own grid tile — forward the
+                                            // active sharer name so each peer popup can show
+                                            // the "Sharing: <name>" indicator.
+                                            sharing_peer_name: active_screen_sharer_name.clone(),
                                         }
                                     }
                                 }
@@ -3639,11 +3716,8 @@ pub fn AttendantsComponent(
 
                 // Mock peers popover (only shown when env-gated)
                 if mock_peers_enabled() && mock_peers_open() {
-                    div {
-                        class: "popover-backdrop",
-                        onclick: move |_| mock_peers_open.set(false),
-                    }
                     div { class: "mock-peers-popover",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
                         div { class: "mock-peers-popover-header",
                             span { "Mock Peers" }
                             button {
@@ -3687,21 +3761,10 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                // Dock menu backdrop (rendered outside action bar so click-outside works)
-                if dock_menu_open() {
-                    div {
-                        class: "popover-backdrop",
-                        onclick: move |_| dock_menu_open.set(false),
-                    }
-                }
-
                 // Density mode popover
                 if !has_screen_share && density_open() {
-                    div {
-                        class: "popover-backdrop",
-                        onclick: move |_| density_open.set(false),
-                    }
                     div { class: "density-popover",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
                         for mode in DENSITY_MODES {
                             div {
                                 key: "{mode.label()}",
