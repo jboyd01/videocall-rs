@@ -331,7 +331,7 @@ pub const STEP_DOWN_REACTION_TIME_MS: u64 = 1500;
 
 /// Minimum time between any two tier transitions (milliseconds).
 /// Prevents rapid toggling even if thresholds are crossed quickly.
-pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 3000;
+pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 1500;
 
 /// Warmup grace period after the quality manager is created (milliseconds).
 ///
@@ -447,7 +447,16 @@ pub const PID_FPS_HISTORY_SIZE: usize = 10;
 
 /// Only apply a bitrate change if it exceeds this ratio of the current bitrate.
 /// Prevents tiny fluctuations from causing unnecessary encoder reconfigurations.
-pub const BITRATE_CHANGE_THRESHOLD: f64 = 0.20;
+/// Smaller drifts apply gradually rather than accumulating into larger jumps
+/// that force encoder keyframes on each reconfigure.
+pub const BITRATE_CHANGE_THRESHOLD: f64 = 0.10;
+
+/// Maximum rate at which the AQ controller may change its output bitrate, in
+/// kbps per second. Prevents the controller from jumping between very low and
+/// very high bitrates within one tick, which would force the encoder to
+/// reconfigure (and emit a keyframe) on every cycle. Set conservatively to
+/// match VP9 realtime's ability to adapt rate-control state smoothly.
+pub const MAX_BITRATE_SLEW_KBPS_PER_SEC: u32 = 500;
 
 // ---------------------------------------------------------------------------
 // Keyframe & Error Recovery

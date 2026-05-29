@@ -261,6 +261,8 @@ pub struct AppearanceSettings {
     pub glow_color: GlowColor,
     pub glow_brightness: f32,     // 0.0–1.0 scale factor
     pub inner_glow_strength: f32, // 0.0–1.0 scale factor
+    pub show_join_leave_notifications: bool,
+    pub play_join_leave_sounds: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -270,6 +272,8 @@ impl Default for AppearanceSettings {
             glow_color: GlowColor::MintGreen,
             glow_brightness: 1.0,
             inner_glow_strength: 1.0,
+            show_join_leave_notifications: true,
+            play_join_leave_sounds: true,
         }
     }
 }
@@ -282,6 +286,8 @@ const APPEARANCE_GLOW_ENABLED_STORAGE_KEY: &str = "vc_appearance_glow_enabled";
 const APPEARANCE_COLOR_STORAGE_KEY: &str = "vc_appearance_glow_color";
 const APPEARANCE_BRIGHTNESS_STORAGE_KEY: &str = "vc_appearance_glow_brightness";
 const APPEARANCE_INNER_STORAGE_KEY: &str = "vc_appearance_inner_glow_strength";
+const APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY: &str = "vc_appearance_join_leave_notifications";
+const APPEARANCE_JOIN_LEAVE_SOUNDS_KEY: &str = "vc_appearance_join_leave_sounds";
 const CUSTOM_COLORS_STORAGE_KEY: &str = "vc_appearance_custom_colors";
 
 pub const MAX_CUSTOM_COLORS: usize = 10;
@@ -312,6 +318,17 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
         settings.inner_glow_strength = value.clamp(0.0, 1.0);
     }
 
+    if let Some(value) =
+        LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string())
+    {
+        settings.show_join_leave_notifications = value != "false";
+    }
+
+    if let Some(value) = LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string())
+    {
+        settings.play_join_leave_sounds = value != "false";
+    }
+
     settings
 }
 
@@ -332,6 +349,14 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
     LocalStorage::set(
         APPEARANCE_INNER_STORAGE_KEY.to_string(),
         &settings.inner_glow_strength.clamp(0.0, 1.0),
+    );
+    LocalStorage::set(
+        APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string(),
+        &settings.show_join_leave_notifications.to_string(),
+    );
+    LocalStorage::set(
+        APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string(),
+        &settings.play_join_leave_sounds.to_string(),
     );
 }
 
@@ -411,6 +436,22 @@ pub type PeerSignalHistoryMap = Signal<
     std::collections::HashMap<
         String,
         Rc<RefCell<crate::components::signal_quality::PeerSignalHistory>>,
+    >,
+>;
+
+/// HCL bug #8 / #9: per-(peer, mode) signal-quality popup state, lifted out
+/// of `PeerTile`'s per-component lifecycle so a peer leaving the meeting (or
+/// a layout switch between grid / split / full-bleed) does not unmount every
+/// open popup. Only the popup whose anchored peer left is dropped; all other
+/// open popups survive untouched.
+///
+/// Bug #9 also stores the user's drag-and-drop position here so that
+/// switching layouts (grid → split when a peer starts screen sharing, etc.)
+/// keeps the popup pinned to wherever the user dragged it.
+pub type SignalPopupStateMap = Signal<
+    std::collections::HashMap<
+        (String, crate::components::signal_quality::SignalMeterMode),
+        crate::components::signal_quality::SignalPopupState,
     >,
 >;
 
@@ -567,23 +608,39 @@ pub fn migrate_legacy_storage() {
 ///
 /// Stored in `localStorage` under `vc_transport_preference` and read at
 /// connection time to override the server-provided WebTransport flag.
+///
+/// **Semantics:**
+///
+/// - `WebTransport` (default): attempt WebTransport first; if WebTransport is
+///   unavailable, blocked by a firewall, or fails its handshake, automatically
+///   fall back to WebSocket. This is what the legacy `Auto` variant did and is
+///   the recommended setting for nearly all users.
+/// - `WebSocket`: use WebSocket only — no WebTransport attempt is made.
+///
+/// **Migration**: a persisted value of `"auto"` (the legacy default) is
+/// transparently coerced to `WebTransport` by [`FromStr`]. The first time
+/// [`load_transport_preference`] sees such a value it logs the migration so
+/// operators can verify the upgrade path. The migration is one-shot — on the
+/// next storage write the value is canonical.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TransportPreference {
-    /// Honour the server-side `webTransportEnabled` flag (default behaviour).
+    /// Attempt WebTransport with automatic WebSocket fallback.
+    ///
+    /// Both URL lists are advertised to the connection manager, which runs
+    /// an election preferring WebTransport candidates. When WebTransport is
+    /// unavailable (browser support, UDP blocked, server returns non-2xx,
+    /// handshake timeout) the manager falls back to the WebSocket candidates.
     #[default]
-    Auto,
-    /// Force WebTransport — WebSocket URLs are cleared.
-    WebTransportOnly,
-    /// Force WebSocket — WebTransport is disabled.
-    WebSocketOnly,
+    WebTransport,
+    /// Use WebSocket exclusively — no WebTransport attempt.
+    WebSocket,
 }
 
 impl std::fmt::Display for TransportPreference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            TransportPreference::Auto => "auto",
-            TransportPreference::WebTransportOnly => "webtransport",
-            TransportPreference::WebSocketOnly => "websocket",
+            TransportPreference::WebTransport => "webtransport",
+            TransportPreference::WebSocket => "websocket",
         };
         f.write_str(s)
     }
@@ -594,9 +651,11 @@ impl std::str::FromStr for TransportPreference {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "auto" => Ok(TransportPreference::Auto),
-            "webtransport" => Ok(TransportPreference::WebTransportOnly),
-            "websocket" => Ok(TransportPreference::WebSocketOnly),
+            // Legacy "auto" value — migrate to WebTransport. The new
+            // WebTransport variant carries the WT-with-WS-fallback semantics
+            // that "auto" used to mean.
+            "auto" | "webtransport" => Ok(TransportPreference::WebTransport),
+            "websocket" => Ok(TransportPreference::WebSocket),
             _ => Err(()),
         }
     }
@@ -623,7 +682,14 @@ const TRANSPORT_SESSION_KEY: &str = "vc_transport_session";
 ///    session value is set when the user changes the protocol without ticking
 ///    "remember", so the change survives the page reload triggered by the
 ///    select but is forgotten on tab close.
-/// 3. Otherwise: `Auto`.
+/// 3. Otherwise: `WebTransport` (the new default — was `Auto` before the
+///    protocol-settings simplification).
+///
+/// **Legacy "auto" migration**: when this function reads `"auto"` from
+/// storage (the previous default value), it logs the migration once and
+/// canonicalises the stored value to `"webtransport"`. The new
+/// `WebTransport` variant carries the WT-with-WS-fallback semantics that
+/// `Auto` used to mean, so user behaviour is unchanged.
 pub fn load_transport_preference() -> TransportPreference {
     let local_storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
     let session_storage = web_sys::window().and_then(|w| w.session_storage().ok().flatten());
@@ -635,11 +701,24 @@ pub fn load_transport_preference() -> TransportPreference {
         .unwrap_or(false);
 
     if sticky {
-        return local_storage
-            .as_ref()
-            .and_then(|s| s.get_item(TRANSPORT_PREF_KEY).ok().flatten())
-            .and_then(|val| val.parse::<TransportPreference>().ok())
-            .unwrap_or_default();
+        if let Some(storage) = local_storage.as_ref() {
+            if let Ok(Some(raw)) = storage.get_item(TRANSPORT_PREF_KEY) {
+                let parsed = raw.parse::<TransportPreference>().ok().unwrap_or_default();
+                // Canonicalise the persisted value if it came in as legacy
+                // "auto" — the variant is gone, but the stored string would
+                // linger otherwise.
+                if raw == "auto" {
+                    log::info!(
+                        "Migrating persisted transport preference \"auto\" -> \"{}\" \
+                         (Auto removed in favour of WebTransport-with-WS-fallback)",
+                        parsed
+                    );
+                    let _ = storage.set_item(TRANSPORT_PREF_KEY, &parsed.to_string());
+                }
+                return parsed;
+            }
+        }
+        return TransportPreference::default();
     }
 
     // Backward-compat: silently drop a stale persistent preference left over
@@ -649,10 +728,21 @@ pub fn load_transport_preference() -> TransportPreference {
         let _ = storage.remove_item(TRANSPORT_PREF_KEY);
     }
 
-    session_storage
-        .and_then(|s| s.get_item(TRANSPORT_SESSION_KEY).ok().flatten())
-        .and_then(|val| val.parse::<TransportPreference>().ok())
-        .unwrap_or_default()
+    if let Some(storage) = session_storage.as_ref() {
+        if let Ok(Some(raw)) = storage.get_item(TRANSPORT_SESSION_KEY) {
+            let parsed = raw.parse::<TransportPreference>().ok().unwrap_or_default();
+            if raw == "auto" {
+                log::info!(
+                    "Migrating session transport preference \"auto\" -> \"{}\" \
+                     (Auto removed in favour of WebTransport-with-WS-fallback)",
+                    parsed
+                );
+                let _ = storage.set_item(TRANSPORT_SESSION_KEY, &parsed.to_string());
+            }
+            return parsed;
+        }
+    }
+    TransportPreference::default()
 }
 
 /// Persist the transport preference to `localStorage` (the sticky path).
@@ -691,9 +781,9 @@ pub fn save_transport_sticky(sticky: bool) {
 
 /// Reset all transport-preference storage entries — both the persistent
 /// (`localStorage`) keys and the per-session (`sessionStorage`) value — so
-/// the next page load resolves to `Auto`.
+/// the next page load resolves to the default (`WebTransport`).
 ///
-/// This is the single source of truth for "go back to Auto" so callers
+/// This is the single source of truth for "go back to default" so callers
 /// don't have to know about the three keys involved.
 pub fn clear_transport_sticky_and_pref() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
@@ -709,6 +799,19 @@ pub fn clear_transport_sticky_and_pref() {
 /// the server-provided WebTransport flag.
 ///
 /// Returns `(enable_webtransport, websocket_urls, webtransport_urls)`.
+///
+/// **WebTransport-with-WS-fallback**: when the user has selected
+/// `WebTransport` (the default), BOTH URL lists are returned. The
+/// connection manager creates candidates for every URL and runs an election
+/// — if any WebTransport candidate completes its handshake it wins, but if
+/// every WT candidate fails (browser support missing, UDP blocked, server
+/// rejected the handshake) the WS candidates become the only ones that can
+/// be elected and the client automatically uses WebSocket. The fallback is
+/// thus structural, not a separate retry: see
+/// `videocall-client/src/connection/connection_manager.rs::create_all_connections`.
+///
+/// `WebSocket` forces a single-transport configuration with the WT list
+/// emptied — there is no fallback in that mode by design.
 pub fn resolve_transport_config(
     pref: TransportPreference,
     server_wt_enabled: bool,
@@ -716,9 +819,13 @@ pub fn resolve_transport_config(
     wt_urls: Vec<String>,
 ) -> (bool, Vec<String>, Vec<String>) {
     match pref {
-        TransportPreference::Auto => (server_wt_enabled, ws_urls, wt_urls),
-        TransportPreference::WebTransportOnly => (true, vec![], wt_urls),
-        TransportPreference::WebSocketOnly => (false, ws_urls, vec![]),
+        // WebTransport selection ≡ legacy Auto: surface BOTH URL lists so
+        // the manager's election can fall back to WebSocket if every WT
+        // candidate fails. The `server_wt_enabled` flag still gates whether
+        // the manager will attempt the WT URLs at all (e.g. when runtime
+        // config hasn't loaded yet) — this is unchanged from Auto behaviour.
+        TransportPreference::WebTransport => (server_wt_enabled, ws_urls, wt_urls),
+        TransportPreference::WebSocket => (false, ws_urls, vec![]),
     }
 }
 
@@ -731,12 +838,14 @@ pub fn resolve_transport_config(
 ///
 /// Routing rules:
 ///
-/// - `Auto` selected: clear every transport-preference storage key. Auto is
-///   the implicit default and never needs to be remembered.
-/// - Non-Auto, `sticky == true`: write to `localStorage` so the choice
-///   persists across browser sessions.
-/// - Non-Auto, `sticky == false`: write to `sessionStorage` so the choice
-///   survives the imminent page reload but evaporates when the tab closes.
+/// - The default (`WebTransport`) selected with `sticky == false`: clear every
+///   transport-preference storage key so the next load resolves to the default
+///   without needing a remembered choice.
+/// - Selecting any value with `sticky == true`: write to `localStorage` so the
+///   choice persists across browser sessions.
+/// - Non-default selection with `sticky == false`: write to `sessionStorage`
+///   so the choice survives the imminent page reload but evaporates when the
+///   tab closes.
 ///
 /// Custom controls (like the settings modal glass dropdown) are state-driven
 /// and naturally re-render with the current value when the user cancels.
@@ -762,13 +871,16 @@ pub fn confirm_transport_change(
         })
         .unwrap_or(false);
     if confirmed {
-        match pref {
-            TransportPreference::Auto => clear_transport_sticky_and_pref(),
-            _ if sticky => {
+        let is_default = pref == TransportPreference::default();
+        match (is_default, sticky) {
+            // Default + not sticky: clear all storage — implicit default
+            // doesn't need to be remembered.
+            (true, false) => clear_transport_sticky_and_pref(),
+            (_, true) => {
                 save_transport_preference(pref);
                 save_transport_sticky(true);
             }
-            _ => save_transport_preference_session(pref),
+            (false, false) => save_transport_preference_session(pref),
         }
         if let Some(w) = web_sys::window() {
             let _ = w.location().reload();

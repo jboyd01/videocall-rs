@@ -5,8 +5,11 @@
 ##
 ## Usage:
 ##   docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
-##   cd e2e && npx playwright test
+##   cd e2e && npx playwright test --project=dioxus
 ##   docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down -v
+##
+## --project=dioxus selects the full 207-test suite. See playwright.config.ts
+## for the bvt0/bvt1 smoke-subset projects.
 ##
 
 services:
@@ -149,6 +152,14 @@ services:
       - KEY_PATH=certs/localhost.key
       - FEATURE_MEETING_MANAGEMENT=true
       - JWT_SECRET=dev-jwt-secret-change-me
+      # Dev cert preflight: enforces that the on-disk dev cert is shaped how
+      # Chromium's `serverCertificateHashes` API requires (ECDSA P-256,
+      # <=14d validity, SAN includes 127.0.0.1 + localhost). If a developer
+      # ends up with a stale or mismatched cert (e.g. legacy RSA, or one
+      # regenerated >14 days ago), the server fails fast with a remediation
+      # message instead of starting silently and breaking every QUIC
+      # handshake at runtime. See actix-api/src/webtransport/cert_preflight.rs.
+      - WT_DEV_CERT_PREFLIGHT=true
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
     ports:
@@ -157,6 +168,13 @@ services:
       # (see e2e/playwright.config.ts) so the browser resolves the wasm
       # client's `https://127.0.0.1:4433` target to this UDP listener.
       - "4433:4433/udp"
+      # TCP — health/metrics HTTP server bound by `webtransport_server` from
+      # `HEALTH_LISTEN_URL` (see `actix-api/src/bin/webtransport_server.rs`).
+      # Exposed so `e2e/helpers/wait-for-services.ts` can probe
+      # `http://localhost:5321/healthz` before any spec runs. A UDP socket
+      # has no portable "is it bound" readiness probe; the TCP health
+      # endpoint is the supported signal that the WT server is up.
+      - "5321:5321"
     volumes:
       - type: bind
         source: ../
@@ -199,6 +217,7 @@ services:
       - E2EE_ENABLED=false
       - FIREFOX_ENABLED=false
       - USERS_ALLOWED_TO_STREAM=
+      - DIOXUS_SERVE_MODE=${DIOXUS_SERVE_MODE:-dev}
       - CARGO_TARGET_DIR=/app/dioxus-ui/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false

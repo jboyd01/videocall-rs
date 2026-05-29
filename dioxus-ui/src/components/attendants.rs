@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
@@ -26,7 +27,7 @@ use crate::components::{
     host::Host,
     host_controls::HostControls,
     meeting_ended_overlay::MeetingEndedOverlay,
-    peer_list::PeerList,
+    peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
@@ -47,7 +48,8 @@ use crate::context::{
     save_density_mode, save_display_name_to_storage, save_dock_autohide, save_dock_position,
     validate_display_name, AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DensityModeCtx,
     DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -82,6 +84,21 @@ pub enum ScreenShareState {
     /// begin encoding via `ScreenEncoder::start_with_stream()`.
     StreamReady,
     Active,
+}
+
+/// UI state of the screen-share visibility toast (HCL issue 893). @token-exempt
+///
+/// Walks through `Starting` -> `SuccessfullyShared` (on the first
+/// `PEER_EVENT(screen_decode_started)` ack from any peer) or
+/// `Failed(message)` (on a 10s timeout with no ack).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScreenShareToastState {
+    /// Local screen-share has started but no peer has confirmed visibility yet.
+    Starting,
+    /// At least one peer has acknowledged decoding our screen-share.
+    SuccessfullyShared,
+    /// The visibility window elapsed without any peer ack.
+    Failed(String),
 }
 
 /// Shared cell that holds a pre-acquired `MediaStream` from `getDisplayMedia()`.
@@ -402,8 +419,17 @@ fn schedule_reconnect_no_jwt(
     .forget();
 }
 
+/// Aspect ratio of a rendered tile in the participant grid.
+///
+/// Must match `.grid-item { aspect-ratio: 3 / 2; }` in `static/style.css`
+/// (and the `.full-bleed` / `.split-peer-tile` overrides which use the
+/// same 3:2 cap). If this drifts from the CSS the grid cell will be wider
+/// than the tile and `place-self: center` will surface as visible internal
+/// padding around every tile.
+const TILE_AR: f64 = 3.0 / 2.0;
+
 /// Google Meet–style layout: try every column count, compute the maximum
-/// 16:9 tile size for each, and pick the variant with the largest tile area.
+/// 3:2 tile size for each, and pick the variant with the largest tile area.
 /// Returns `(cols, rows, tile_width)`.
 fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     if n == 0 {
@@ -413,7 +439,7 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     let mut best_rows = 1_usize;
     let mut best_area = 0.0_f64;
     let mut best_tw = 0.0_f64;
-    let ar: f64 = 16.0 / 9.0;
+    let ar: f64 = TILE_AR;
 
     for cols in 1..=n {
         let rows = n.div_ceil(cols);
@@ -524,6 +550,8 @@ pub fn AttendantsComponent(
 
     // --- State signals ---
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
+    let screen_share_toast_state: Signal<Option<ScreenShareToastState>> = use_signal(|| None);
+    let screen_share_toast_timer: Signal<Option<Timeout>> = use_signal(|| None);
 
     let mut mic_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
@@ -781,6 +809,14 @@ pub fn AttendantsComponent(
     // up departed peers' histories. Provided as context alongside PeerStatusMap.
     let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
 
+    // HCL bug #8 + #9: per-(peer, mode) signal-popup state map, owned by
+    // the parent so PeerTile remounts (peer leaves, layout switches) do
+    // not unmount the popup containers and accidentally close every
+    // other peer's open popup. Cleaned up alongside
+    // `peer_signal_history_map` when peers leave so we don't leak
+    // entries for departed peers.
+    let signal_popup_state_map: SignalPopupStateMap = use_signal(HashMap::new);
+
     // Per-tile crop state — created early so on_peer_removed can clean up.
     let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
 
@@ -788,6 +824,9 @@ pub fn AttendantsComponent(
     // be called inside the hook closure).
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let transport_pref = (transport_pref_ctx.0)();
+
+    // Create the appearance settings signal on_peer_joined / on_peer_left callbacks
+    let appearance_settings = use_signal(load_appearance_settings_from_storage);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -832,6 +871,7 @@ pub fn AttendantsComponent(
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
+        let client_for_kick = client_for_reconnect.clone();
 
         let user_id_for_display_name_changed = user_id.clone();
 
@@ -956,6 +996,11 @@ pub fn AttendantsComponent(
                 // map does not grow unboundedly over long meetings.
                 let mut hist_map = peer_signal_history_map;
                 hist_map.write().remove(&peer_id);
+                // HCL bug #8: drop only this peer's open signal-meter popup
+                // entries; every other peer's popup state stays intact so
+                // their popups remain visible across the parent re-render.
+                let mut popup_map = signal_popup_state_map;
+                popup_map.write().retain(|(pid, _mode), _| pid != &peer_id);
                 let mut speech_map = peer_speech_priority;
                 speech_map.write().remove(&peer_id);
                 let mut jt_map = peer_join_time;
@@ -1002,8 +1047,18 @@ pub fn AttendantsComponent(
                     log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
                     let mut meeting_start_time_server = meeting_start_time_server;
                     let mut meeting_ended_message = meeting_ended_message;
+                    let mut mic_enabled = mic_enabled;
+                    let mut video_enabled = video_enabled;
+                    let mut pending_mic_enable = pending_mic_enable;
+                    let mut pending_video_enable = pending_video_enable;
+                    let mut screen_share_state = screen_share_state;
                     meeting_start_time_server.set(Some(end_time_ms));
                     meeting_ended_message.set(Some(message));
+                    mic_enabled.set(false);
+                    video_enabled.set(false);
+                    pending_mic_enable.set(false);
+                    pending_video_enable.set(false);
+                    screen_share_state.set(ScreenShareState::Idle);
                 },
             )),
             on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
@@ -1109,54 +1164,128 @@ pub fn AttendantsComponent(
                     })));
                 }))
             },
+            on_participant_kicked: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    let mut meeting_ended_message = meeting_ended_message;
+                    let mut mic_enabled = mic_enabled;
+                    let mut video_enabled = video_enabled;
+                    let mut pending_mic_enable = pending_mic_enable;
+                    let mut pending_video_enable = pending_video_enable;
+                    let mut screen_share_state = screen_share_state;
+                    meeting_ended_message.set(Some(
+                        "You have been removed from the meeting by the host.".to_string(),
+                    ));
+                    mic_enabled.set(false);
+                    video_enabled.set(false);
+                    pending_mic_enable.set(false);
+                    pending_video_enable.set(false);
+                    screen_share_state.set(ScreenShareState::Idle);
+                    log::info!("PARTICIPANT_KICKED: removed from meeting by host");
+                    if let Some(client) = client_for_kick.borrow().as_ref() {
+                        if let Err(e) = client.disconnect() {
+                            log::warn!("PARTICIPANT_KICKED: disconnect failed: {e}");
+                        }
+                    }
+                }))
+            },
+            on_peer_event: Some(VcCallback::from(
+                move |(source_user_id, event_type, _stream_id): (String, String, String)| {
+                    if event_type != videocall_client::PEER_EVENT_SCREEN_DECODE_STARTED {
+                        log::debug!("Ignoring PEER_EVENT with unknown event_type: {event_type}");
+                        return;
+                    }
+                    log::info!("PEER_EVENT screen_decode_started received from {source_user_id}");
+                    let mut screen_share_toast_state = screen_share_toast_state;
+                    let mut screen_share_toast_timer = screen_share_toast_timer;
+                    if !matches!(
+                        screen_share_toast_state.peek().as_ref(),
+                        Some(ScreenShareToastState::Starting)
+                    ) {
+                        return;
+                    }
+                    screen_share_toast_state.set(Some(ScreenShareToastState::SuccessfullyShared));
+                    screen_share_toast_timer.set(Some(Timeout::new(4_000, move || {
+                        let mut s = screen_share_toast_state;
+                        if matches!(
+                            s.peek().as_ref(),
+                            Some(ScreenShareToastState::SuccessfullyShared)
+                        ) {
+                            s.set(None);
+                        }
+                    })));
+                },
+            )),
             on_peer_left: {
                 Some(VcCallback::from(
-                    move |(display_name, user_id): (String, String)| {
+                    move |(display_name, user_id, _session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
 
-                        let mut toast_counter = toast_counter;
-                        let mut peer_toasts = peer_toasts;
-                        let mut toast_version = toast_version;
-                        let id = *toast_counter.peek();
-                        toast_counter.set(id + 1);
-                        let mut current = peer_toasts.peek().clone();
-                        current.push((id, display_name, user_id, false));
-                        peer_toasts.set(current);
-                        {
-                            let v = *toast_version.peek();
-                            toast_version.set(v + 1);
-                        }
-                        // Defer the leave sound: only play if the toast still exists
-                        // after 500ms (i.e. no join event cancelled it).
-                        Timeout::new(500, move || {
-                            if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
-                                play_user_left();
-                            }
-                        })
-                        .forget();
-                        // Schedule toast removal after 8 seconds.
-                        Timeout::new(8_000, move || {
-                            let updated: Vec<_> = peer_toasts
-                                .peek()
-                                .iter()
-                                .filter(|(tid, _, _, _)| *tid != id)
-                                .cloned()
-                                .collect();
-                            peer_toasts.set(updated);
+                        let settings = appearance_settings.peek();
+                        let show_toast = settings.show_join_leave_notifications;
+                        let play_sound = settings.play_join_leave_sounds;
+                        drop(settings);
+
+                        if show_toast {
+                            let mut toast_counter = toast_counter;
+                            let mut peer_toasts = peer_toasts;
+                            let mut toast_version = toast_version;
+                            let id = *toast_counter.peek();
+                            toast_counter.set(id + 1);
+                            let mut current = peer_toasts.peek().clone();
+                            current.push((id, display_name, user_id, false));
+                            peer_toasts.set(current);
                             {
                                 let v = *toast_version.peek();
                                 toast_version.set(v + 1);
                             }
-                        })
-                        .forget();
+                            // Defer the leave sound: only play if the toast still exists
+                            // after 500ms (i.e. no join event cancelled it).
+                            Timeout::new(500, move || {
+                                if play_sound
+                                    && peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id)
+                                {
+                                    play_user_left();
+                                }
+                            })
+                            .forget();
+                            // Schedule toast removal after 8 seconds.
+                            Timeout::new(8_000, move || {
+                                let updated: Vec<_> = peer_toasts
+                                    .peek()
+                                    .iter()
+                                    .filter(|(tid, _, _, _)| *tid != id)
+                                    .cloned()
+                                    .collect();
+                                peer_toasts.set(updated);
+                                {
+                                    let v = *toast_version.peek();
+                                    toast_version.set(v + 1);
+                                }
+                            })
+                            .forget();
+                        } else if play_sound {
+                            play_user_left();
+                        }
                     },
                 ))
             },
             on_peer_joined: {
                 let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
-                    move |(display_name, user_id): (String, String)| {
-                        log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                    move |(display_name, user_id, session_id): (String, String, String)| {
+                        log::debug!(
+                            "TOAST-RX: peer joined: {} ({}, session={})",
+                            display_name,
+                            user_id,
+                            session_id
+                        );
+
+                        let settings = appearance_settings.peek();
+                        let show_toast = settings.show_join_leave_notifications;
+                        let play_sound = settings.play_join_leave_sounds;
+                        drop(settings);
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
@@ -1165,9 +1294,30 @@ pub fn AttendantsComponent(
                                     user_id
                                 );
                                 true
-                            } else if client.has_peer_with_user_id(&user_id) {
+                            } else if !session_id.is_empty()
+                                && client.has_peer_with_session_id(&session_id)
+                            {
+                                // Suppress when THIS exact session is already
+                                // tracked — e.g. a reconnect replays the
+                                // PARTICIPANT_JOINED for an existing session
+                                // we still hold in the peer list. Sibling
+                                // same-user sessions have a distinct
+                                // session_id and therefore still surface a
+                                // toast (HCL issue 828).
                                 log::debug!(
-                                    "Suppressing join toast for {} (already in peer list)",
+                                    "Suppressing join toast for {} (session {} already in peer list)",
+                                    user_id,
+                                    session_id
+                                );
+                                true
+                            } else if session_id.is_empty()
+                                && client.has_peer_with_user_id(&user_id)
+                            {
+                                // Legacy fallback: if the server didn't stamp
+                                // a session_id, fall back to user-id-only
+                                // suppression to preserve pre-issue-828 behaviour.
+                                log::debug!(
+                                    "Suppressing join toast for {} (already in peer list, no session_id)",
                                     user_id
                                 );
                                 true
@@ -1184,8 +1334,10 @@ pub fn AttendantsComponent(
                         let mut current = peer_toasts.peek().clone();
                         current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
-                        if !suppress_toast {
-                            play_user_joined();
+                        if !suppress_toast && show_toast {
+                            if play_sound {
+                                play_user_joined();
+                            }
                             let id = *toast_counter.peek();
                             toast_counter.set(id + 1);
                             current.push((id, display_name, user_id, true));
@@ -1209,6 +1361,9 @@ pub fn AttendantsComponent(
                             })
                             .forget();
                         } else {
+                            if !suppress_toast && play_sound {
+                                play_user_joined();
+                            }
                             peer_toasts.set(current);
                         }
 
@@ -1219,53 +1374,92 @@ pub fn AttendantsComponent(
                     },
                 ))
             },
-            on_display_name_changed: Some(VcCallback::from(
-                move |(changed_user_id, new_display_name): (String, String)| {
+            on_display_name_changed: Some(VcCallback::from({
+                // The client is installed into this cell after
+                // `VideoCallClient::new` returns, so it is guaranteed to be
+                // `Some` by the time any DISPLAY_NAME_CHANGED broadcast arrives.
+                let client_cell = client_for_reconnect.clone();
+                move |(changed_user_id, new_display_name, event_session_id): (
+                    String,
+                    String,
+                    u64,
+                )| {
                     log::info!(
-                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\"",
+                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\" session_id={}",
                         changed_user_id,
                         new_display_name,
+                        event_session_id,
                     );
 
                     if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
                     {
-                        match validate_display_name(&new_display_name) {
-                            Ok(validated_name) => {
-                                log::info!(
-                                    "DIOXUS-UI: Local user display name confirmed by server: {}",
-                                    validated_name
-                                );
-                                save_display_name_to_storage(&validated_name);
-                                let mut current_display_name = current_display_name;
-                                current_display_name.set(validated_name.clone());
-                                let mut dn_ctx = display_name_ctx_signal;
-                                dn_ctx.set(Some(validated_name));
-                                log::debug!("DIOXUS-UI: current_display_name signal updated");
+                        // Resolve the local tab's own session_id (assigned by
+                        // SESSION_ASSIGNED). Parsed to u64 to compare against
+                        // the wire-format session_id from the meeting packet.
+                        let own_session_id: Option<u64> = client_cell
+                            .borrow()
+                            .as_ref()
+                            .and_then(|c| c.get_own_session_id())
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok());
+
+                        // Gate the local-self update on session_id so sibling
+                        // tabs of the same authenticated user don't overwrite
+                        // their own self display name. `event_session_id == 0`
+                        // is the legacy broadcast (applies to all sessions).
+                        let is_for_this_session = if event_session_id == 0 {
+                            true
+                        } else {
+                            own_session_id == Some(event_session_id)
+                        };
+
+                        if is_for_this_session {
+                            match validate_display_name(&new_display_name) {
+                                Ok(validated_name) => {
+                                    log::info!(
+                                        "DIOXUS-UI: Local user display name confirmed by server (session match): {}",
+                                        validated_name
+                                    );
+                                    save_display_name_to_storage(&validated_name);
+                                    let mut current_display_name = current_display_name;
+                                    current_display_name.set(validated_name.clone());
+                                    let mut dn_ctx = display_name_ctx_signal;
+                                    dn_ctx.set(Some(validated_name));
+                                    log::debug!("DIOXUS-UI: current_display_name signal updated");
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
+                                        new_display_name,
+                                        e
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                log::warn!(
-                                    "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
-                                    new_display_name,
-                                    e
-                                );
-                            }
+                        } else {
+                            log::info!(
+                                "DIOXUS-UI: Skipping local-self update — rename event \
+                                 targets sibling session {} (our session: {:?})",
+                                event_session_id,
+                                own_session_id,
+                            );
                         }
                     }
 
                     let mut v = peer_display_name_version;
                     v.set(v() + 1);
                     log::debug!("DIOXUS-UI: peer_display_name_version bumped");
-                },
-            )),
+                }
+            })),
             // Full call participant: decode and play all inbound media.
             decode_media: true,
             // Honour user transport preference: only allow the connection
             // manager's post-rebase re-election retry when the user is on
-            // the default `Auto` mode. Manual `WebTransportOnly` /
-            // `WebSocketOnly` selections must not be overridden by an
-            // automatic retry — the single-candidate state in those modes is
+            // the default `WebTransport` mode (which advertises BOTH URL
+            // lists to the manager). A manual `WebSocket` selection is a
+            // deliberate single-transport choice and the retry must not
+            // override it — the single-candidate state in that mode is
             // intentional, not a recoverable system condition.
-            allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
+            allow_post_rebase_retry: transport_pref == TransportPreference::WebTransport,
             // Phase 3 / AUTH-2 — discussion 562: let the connection
             // manager preempt token expiry from inside its internal
             // re-election. Without this, the manager re-uses the cached
@@ -1446,12 +1640,14 @@ pub fn AttendantsComponent(
     });
 
     // Re-check permissions when the window regains focus, mirroring Yew behavior.
+    // Only fires for users already in-meeting who had a prior denial — on the
+    // pre-join screen (meeting_joined=false) this is a no-op.
     {
         let mda = mda.clone();
         use_effect(move || {
             let value = mda.clone();
             let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-                if session_loaded() || connecting() {
+                if !meeting_joined() || session_loaded() || connecting() {
                     return;
                 }
 
@@ -1484,7 +1680,6 @@ pub fn AttendantsComponent(
     use_context_provider(|| meeting_time_signal);
     let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
     let _ = local_audio_level_ctx.0;
-    let appearance_settings = use_signal(load_appearance_settings_from_storage);
     use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
     let appearance_save_timeout: Rc<RefCell<Option<Timeout>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
@@ -1528,6 +1723,11 @@ pub fn AttendantsComponent(
     // (or create) their history entry. This survives PeerTile remounts caused
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
+
+    // HCL bug #8 + #9: provide the popup-state map so PeerTile can look up
+    // each popup's open/free-position state. Surviving the parent re-render
+    // is what makes peer leaves stop tearing down every other open popup.
+    use_context_provider(|| signal_popup_state_map);
 
     // Per-tile crop state — signal created early (near peer_status_map) so
     // on_peer_removed can clean up; context provided here for child access.
@@ -1898,13 +2098,19 @@ pub fn AttendantsComponent(
     // The visible portion of the unified tile list (used by the normal grid layout).
     let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
 
-    // Map session IDs to user IDs for display (peer list sidebar — real peers only).
-    let peers_for_display: Vec<String> = display_peers
+    // Build the peer-list sidebar entries keyed by `session_id` so each open
+    // browser tab is its own row. `user_id` is carried alongside only for
+    // host-action callbacks (mute / disable video), which remain per-user.
+    let peers_for_display: Vec<PeerListEntry> = display_peers
         .iter()
         .map(|session_id| {
-            client
+            let user_id = client
                 .get_peer_user_id(session_id)
-                .unwrap_or_else(|| session_id.clone())
+                .unwrap_or_else(|| session_id.clone());
+            PeerListEntry {
+                session_id: session_id.clone(),
+                user_id,
+            }
         })
         .collect();
 
@@ -1931,6 +2137,15 @@ pub fn AttendantsComponent(
         stack.last().cloned()
     };
     let has_screen_share = active_screen_sharer.is_some();
+    // HCL bug #2: display name of the active screen sharer (if any), so
+    // every peer-mode signal-meter popup can surface a small
+    // "Sharing: <name>" header line. Computed once per render so the
+    // PeerTile for-loop avoids repeating the lookup.
+    let active_screen_sharer_name: Option<String> = active_screen_sharer.as_ref().map(|sid| {
+        client
+            .get_peer_display_name(sid)
+            .unwrap_or_else(|| sid.clone())
+    });
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     // The right panel uses a 2-column grid of compact tiles. We compute how
@@ -2037,6 +2252,12 @@ pub fn AttendantsComponent(
         }
     }
 
+    // Tile count drives the `participants-N` class modifier on the grid
+    // container, which lets CSS branch layout behavior (see
+    // `.participants-1 .grid-item.full-bleed` rule in style.css that drops
+    // the 3:2 cap on the lone tile for the 2-peer meeting case — HCL #7).
+    let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
+
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
         "position: absolute; inset: 0; width: 100%; height: 100%; \
@@ -2049,9 +2270,37 @@ pub fn AttendantsComponent(
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
         // Explicitly reset all flex properties so the transition from
         // screen-share (flex) back to normal (grid) is clean.
-        let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
         let (cols, rows, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
-        let th = tw / (16.0 / 9.0);
+        // Cell height tracks the same 3:2 ratio `.grid-item` is capped at, so
+        // the cell exactly fits the tile and `place-self: center` has no
+        // surplus to distribute. Using a wider ratio here would leave
+        // `tw - th * TILE_AR` of internal padding on every cell.
+        let th = tw / TILE_AR;
+        // 1-tile case (HCL #7, 2-peer meeting): let the lone remote tile
+        // stretch to fill the entire grid area. The `.participants-1
+        // .grid-item.full-bleed` CSS rule drops the 3:2 cap on this lone
+        // tile so the remote peer fills the viewport — combined with `1fr`
+        // tracks and `stretch` packing, the tile reaches edge-to-edge.
+        // 2+ tiles (HCL #6): size tracks to the natural 3:2 tile dimensions
+        // and pack left/top so surplus viewport width sits on the right
+        // edge as empty space instead of being distributed between tiles.
+        // This is the only way to guarantee the 3:2 aspect holds in narrow
+        // viewports where `1fr` cells would be taller than `cell_w * 2/3`
+        // and `.grid-item { height: 100% }` would otherwise stretch the
+        // tile vertically. See HCL bug report for the 3-peer-aspect issue.
+        let (track_cols, track_rows, pack) = if tile_count == 1 {
+            (
+                format!("repeat({cols}, 1fr)"),
+                format!("repeat({rows}, 1fr)"),
+                "justify-content: stretch; align-content: stretch;",
+            )
+        } else {
+            (
+                format!("repeat({cols}, var(--tile-w))"),
+                format!("repeat({rows}, var(--tile-h))"),
+                "justify-content: start; align-content: start;",
+            )
+        };
         format!(
             "display: grid; \
              position: absolute; inset: 0; \
@@ -2060,10 +2309,18 @@ pub fn AttendantsComponent(
              box-sizing: border-box; overflow: hidden; \
              flex-direction: unset; flex-wrap: unset; align-items: unset; \
              width: 100%; height: 100%; \
-             grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr); \
+             grid-template-columns: {track_cols}; grid-template-rows: {track_rows}; \
+             {pack} \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
         )
     };
+
+    // `participants-N` modifier; CSS uses `.participants-1 .grid-item.full-bleed`
+    // (HCL #7) to drop the 3:2 cap on the lone remote tile in a 2-peer
+    // meeting so it fills the viewport. 2+ tiles keep the cap and the tile
+    // size is driven by `--tile-w` / `--tile-h` (set above) — see the
+    // `tile_count == 1` branch in `container_style`.
+    let container_class = format!("participants-{tile_count}");
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -2260,6 +2517,15 @@ pub fn AttendantsComponent(
         meeting_start_time: meeting_start_time_server(),
     });
 
+    // Snapshot the local session_id once per render so every PeerTile can pin
+    // self-identification on session_id instead of user_id. Two tabs of the
+    // same authenticated user share a user_id but always have distinct
+    // session_ids — a user-id compare collapses sibling tabs into one "self"
+    // tile in split layouts and screen-share paths (HCL issue 828). May be `None`
+    // before SESSION_ASSIGNED is received; in that case no tile is treated as
+    // self until the assignment arrives.
+    let my_session_id: Option<String> = client.get_own_session_id();
+
     info!("Rendering meeting view with {} peers", display_peers.len());
 
     // Clear stale pin: if the pinned peer left the meeting, reset to None so
@@ -2318,11 +2584,116 @@ pub fn AttendantsComponent(
             // Provide VideoCallClient context
             class:"flex gap-2",
             div { id: "main-container", class: "meeting-page",
+                onclick: move |_| {
+                    dock_menu_open.set(false);
+                    density_open.set(false);
+                    mock_peers_open.set(false);
+                },
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
-                if !peer_toasts().is_empty() || show_muted_toast() || show_video_off_toast() {
+                if !peer_toasts().is_empty()
+                    || show_muted_toast()
+                    || show_video_off_toast()
+                    || screen_share_toast_state().is_some()
+                {
                     div { class: "peer-toasts",
+                        // Screen-share visibility toast (HCL issue 893). @token-exempt
+                        // Rendered first so it sits above other transient toasts.
+                        {
+                            let toast = screen_share_toast_state.read().clone();
+                            match toast {
+                                Some(ScreenShareToastState::Starting) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-loading screen-share-toast",
+                                        role: "status",
+                                        aria_live: "polite",
+                                        aria_label: "Starting to share content",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                path { d: "M21 12a9 9 0 1 1-6.219-8.56" }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name",
+                                                "Starting to share content..."
+                                            }
+                                        }
+                                    }
+                                },
+                                Some(ScreenShareToastState::SuccessfullyShared) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-success screen-share-toast",
+                                        role: "status",
+                                        aria_live: "polite",
+                                        aria_label: "Others can now see your shared content",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                polyline { points: "20 6 9 17 4 12" }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name",
+                                                "Others can now see your shared content"
+                                            }
+                                        }
+                                    }
+                                },
+                                Some(ScreenShareToastState::Failed(msg)) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-error screen-share-toast",
+                                        role: "alert",
+                                        aria_live: "assertive",
+                                        aria_label: "Screen share visibility error",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: "12", cy: "12", r: "10" }
+                                                line {
+                                                    x1: "12",
+                                                    y1: "8",
+                                                    x2: "12",
+                                                    y2: "12",
+                                                }
+                                                line {
+                                                    x1: "12",
+                                                    y1: "16",
+                                                    x2: "12.01",
+                                                    y2: "16",
+                                                }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name", "{msg}" }
+                                        }
+                                    }
+                                },
+                                None => rsx! {},
+                            }
+                        }
                         if show_muted_toast() {
                             div { class: "peer-toast toast-left",
                                 span { class: "toast-icon",
@@ -2445,7 +2816,7 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                div { id: "grid-container", style: "{container_style}",
+                div { id: "grid-container", class: "{container_class}", style: "{container_style}",
                     onmousemove: move |evt| {
                         if ss_resizing() {
                             let native = evt.as_web_event();
@@ -2497,8 +2868,11 @@ pub fn AttendantsComponent(
                                             full_bleed: true,
                                             host_user_id: host_user_id.clone(),
                                             render_mode: TileMode::ScreenOnly,
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
+                                            // HCL bug #2: the shared-content tile shows
+                                            // ONLY the screen-share metric in its popup.
+                                            meter_mode: SignalMeterMode::ScreenOnly,
                                             on_toggle_pin: toggle_pin.clone(),
                                         }
                                     }
@@ -2511,15 +2885,34 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — 1 or 2-column grid of compact peer tiles
+                                // Right panel — 1 or 2-column grid of compact peer tiles.
+                                //
+                                // HCL issues #3 + #4: columns are sized to the tile's natural
+                                // 3:2 width (`ss_tile_h * 1.5`), NOT `1fr`. `1fr` columns made
+                                // the grid stretch each cell to fill `right_pct%`, leaving the
+                                // 3:2-capped `.split-peer-tile` centered with surplus on both
+                                // sides — visually "centered with too-large column gaps" on a
+                                // wide right panel. Pairing fixed `var(--ss-tile-w)` cells
+                                // with `justify-content: start` packs the tiles to the left
+                                // edge and keeps the inter-tile gap exactly `8px`, matching
+                                // the non-share grid feel. Tiles still hold their 3:2 cap
+                                // (enforced by `.split-peer-tile { aspect-ratio: 3 / 2 }`),
+                                // so wide-screen viewports leave empty space on the right
+                                // edge of the panel instead of stretching the tiles.
                                 div {
                                     style: {
-                                        let grid_cols = if ss_cols > 1.0 { "1fr 1fr" } else { "1fr" };
+                                        let ss_tile_w = (ss_tile_h * TILE_AR).round();
+                                        let grid_cols = if ss_cols > 1.0 {
+                                            format!("repeat(2, {ss_tile_w:.0}px)")
+                                        } else {
+                                            format!("{ss_tile_w:.0}px")
+                                        };
                                         format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
                                                 display: grid; grid-template-columns: {grid_cols}; \
                                                 grid-auto-rows: {ss_tile_h:.0}px; \
                                                 gap: 8px; padding: 6px; \
-                                                align-content: start; overflow: visible;")
+                                                justify-content: start; align-content: start; \
+                                                overflow: visible;")
                                     },
                                     for tile_id in ss_tiles.iter() {
                                         {
@@ -2532,7 +2925,7 @@ pub fn AttendantsComponent(
                                                         full_bleed: false,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
-                                                        my_peer_id: user_id.clone(),
+                                                        my_session_id: my_session_id.clone(),
                                                         on_toggle_pin: move |_: String| {},
                                                     }
                                                 }
@@ -2544,11 +2937,15 @@ pub fn AttendantsComponent(
                                                         full_bleed: false,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
-                                                        my_peer_id: user_id.clone(),
+                                                        my_session_id: my_session_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
                                                         on_toggle_pin: toggle_pin.clone(),
                                                         room_id: Some(id.clone()),
                                                         is_current_user_host: is_owner,
+                                                        // HCL bug #2: peer popups suppress the
+                                                        // screen metric and surface a header note
+                                                        // pointing at whoever is sharing right now.
+                                                        sharing_peer_name: active_screen_sharer_name.clone(),
                                                     }
                                                 }
                                             }
@@ -2580,7 +2977,7 @@ pub fn AttendantsComponent(
                                             peer_id: tile_id.clone(),
                                             full_bleed: false,
                                             host_user_id: host_user_id.clone(),
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             on_toggle_pin: move |_: String| {},
                                         }
                                     }
@@ -2591,11 +2988,17 @@ pub fn AttendantsComponent(
                                             peer_id: tile_id.clone(),
                                             full_bleed,
                                             host_user_id: host_user_id.clone(),
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
                                             room_id: Some(id.clone()),
                                             is_current_user_host: is_owner,
+                                            // HCL bug #2: grid layout never reaches the split
+                                            // path, but a screen share may still be live in
+                                            // the publisher's own grid tile — forward the
+                                            // active sharer name so each peer popup can show
+                                            // the "Sharing: <name>" indicator.
+                                            sharing_peer_name: active_screen_sharer_name.clone(),
                                         }
                                     }
                                 }
@@ -2886,9 +3289,14 @@ pub fn AttendantsComponent(
                                         PeerListButton {
                                             open: peer_list_open(),
                                             onclick: move |_| {
-                                                peer_list_open.set(!peer_list_open());
-                                                if peer_list_open() {
+                                                let opening = !peer_list_open();
+                                                peer_list_open.set(opening);
+                                                if opening {
                                                     diagnostics_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
                                         }
@@ -2896,25 +3304,160 @@ pub fn AttendantsComponent(
                                             DensityModeButton {
                                                 label: density_mode().label().to_string(),
                                                 open: density_open(),
-                                                onclick: move |_| {
-                                                    density_open.set(!density_open());
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    let opening = !density_open();
+                                                    density_open.set(opening);
+                                                    if opening {
+                                                        dock_menu_open.set(false);
+                                                        mock_peers_open.set(false);
+
+                                                    }
                                                 },
+                                            }
+                                        }
+                                        // (а) Dock position dropdown — grouped with the tile-layout (density)
+                                        // button because both control how the meeting view is arranged.
+                                        // Keeping them adjacent so users see "view / layout" preferences
+                                        // together. The popup menu escapes the controls-secondary overflow
+                                        // clip via CSS (`overflow: visible` on the expanded state).
+                                        div { class: "dock-position-wrapper",
+                                            div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
+                                                button {
+                                                    class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
+                                                    title: "Dock position",
+                                                    r#type: "button",
+                                                    "aria-haspopup": "listbox",
+                                                    "aria-expanded": if dock_menu_open() { "true" } else { "false" },
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        let opening = !dock_menu_open();
+                                                        dock_menu_open.set(opening);
+                                                        if opening {
+                                                            density_open.set(false);
+                                                            mock_peers_open.set(false);
+
+                                                        }
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "20",
+                                                        height: "20",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        // Horizontal bar outline
+                                                        rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
+                                                        // Three dots inside the bar
+                                                        circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                    }
+                                                }
+                                                if dock_menu_open() {
+                                                    div {
+                                                        class: "glass-select-menu",
+                                                        role: "listbox",
+                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Bottom);
+                                                                save_dock_position(DockPosition::Bottom);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Bottom"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Left);
+                                                                save_dock_position(DockPosition::Left);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Left"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Right);
+                                                                save_dock_position(DockPosition::Right);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Right"
+                                                        }
+                                                        // Separator
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let new_val = !autohide_enabled();
+                                                                autohide_enabled.set(new_val);
+                                                                save_dock_autohide(new_val);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            if autohide_enabled() {
+                                                                "Turn Hiding Off"
+                                                            } else {
+                                                                "Turn Hiding On"
+                                                            }
+                                                        }
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                device_settings_initial_section
+                                                                    .set(Some("appearance".to_string()));
+                                                                device_settings_generation
+                                                                    .set(device_settings_generation() + 1);
+                                                                device_settings_open.set(true);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Dock Settings\u{2026}"
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         if mock_peers_enabled() {
                                             MockPeersButton {
                                                 open: mock_peers_open(),
-                                                onclick: move |_| {
-                                                    mock_peers_open.set(!mock_peers_open());
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    let opening = !mock_peers_open();
+                                                    mock_peers_open.set(opening);
+                                                    if opening {
+                                                        density_open.set(false);
+                                                        dock_menu_open.set(false);
+
+                                                    }
                                                 },
                                             }
                                         }
                                         DiagnosticsButton {
                                             open: diagnostics_open(),
                                             onclick: move |_| {
-                                                diagnostics_open.set(!diagnostics_open());
-                                                if diagnostics_open() {
+                                                let opening = !diagnostics_open();
+                                                diagnostics_open.set(opening);
+                                                if opening {
                                                     peer_list_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
                                         }
@@ -2929,114 +3472,12 @@ pub fn AttendantsComponent(
                                                         .set(device_settings_generation() + 1);
                                                     peer_list_open.set(false);
                                                     diagnostics_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
-                                        }
-                                    }
-                                    // (а) Dock position dropdown — glass-select style
-                                    div { class: "dock-position-wrapper",
-                                        div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
-                                            button {
-                                                class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
-                                                title: "Dock position",
-                                                r#type: "button",
-                                                "aria-haspopup": "listbox",
-                                                "aria-expanded": if dock_menu_open() { "true" } else { "false" },
-                                                onclick: move |e| {
-                                                    e.stop_propagation();
-                                                    dock_menu_open.set(!dock_menu_open());
-                                                },
-                                                svg {
-                                                    xmlns: "http://www.w3.org/2000/svg",
-                                                    width: "20",
-                                                    height: "20",
-                                                    view_box: "0 0 24 24",
-                                                    fill: "none",
-                                                    stroke: "currentColor",
-                                                    stroke_width: "2",
-                                                    stroke_linecap: "round",
-                                                    stroke_linejoin: "round",
-                                                    // Horizontal bar outline
-                                                    rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
-                                                    // Three dots inside the bar
-                                                    circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                    circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                    circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                }
-                                            }
-                                            if dock_menu_open() {
-                                                div {
-                                                    class: "glass-select-menu",
-                                                    role: "listbox",
-                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Bottom);
-                                                            save_dock_position(DockPosition::Bottom);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Bottom"
-                                                    }
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Left);
-                                                            save_dock_position(DockPosition::Left);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Left"
-                                                    }
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Right);
-                                                            save_dock_position(DockPosition::Right);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Right"
-                                                    }
-                                                    // Separator
-                                                    div { class: "glass-select-separator" }
-                                                    div {
-                                                        class: "glass-select-option",
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            let new_val = !autohide_enabled();
-                                                            autohide_enabled.set(new_val);
-                                                            save_dock_autohide(new_val);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        if autohide_enabled() {
-                                                            "Turn Hiding Off"
-                                                        } else {
-                                                            "Turn Hiding On"
-                                                        }
-                                                    }
-                                                    div { class: "glass-select-separator" }
-                                                    div {
-                                                        class: "glass-select-option",
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            device_settings_initial_section
-                                                                .set(Some("appearance".to_string()));
-                                                            device_settings_generation
-                                                                .set(device_settings_generation() + 1);
-                                                            device_settings_open.set(true);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Dock Settings\u{2026}"
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
                                     {
@@ -3132,16 +3573,48 @@ pub fn AttendantsComponent(
                                     },
                                     on_screen_share_state: move |event: ScreenShareEvent| {
                                         log::info!("Screen share state changed: {event:?}");
+                                        let mut screen_share_toast_state = screen_share_toast_state;
+                                        let mut screen_share_toast_timer = screen_share_toast_timer;
                                         match event {
                                             ScreenShareEvent::Started(_stream) => {
                                                 screen_share_state.set(ScreenShareState::Active);
+                                                screen_share_toast_state
+                                                    .set(Some(ScreenShareToastState::Starting));
+                                                screen_share_toast_timer.set(Some(Timeout::new(
+                                                    10_000,
+                                                    move || {
+                                                        let mut s = screen_share_toast_state;
+                                                        if matches!(
+                                                            s.peek().as_ref(),
+                                                            Some(ScreenShareToastState::Starting)
+                                                        ) {
+                                                            s.set(Some(ScreenShareToastState::Failed(
+                                                                "No peers received the shared content within 10 seconds."
+                                                                    .to_string(),
+                                                            )));
+                                                            let mut t = screen_share_toast_timer;
+                                                            t.set(Some(Timeout::new(
+                                                                6_000,
+                                                                move || {
+                                                                    let mut s2 =
+                                                                        screen_share_toast_state;
+                                                                    s2.set(None);
+                                                                },
+                                                            )));
+                                                        }
+                                                    },
+                                                )));
                                             }
                                             ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
                                                 screen_share_state.set(ScreenShareState::Idle);
+                                                screen_share_toast_state.set(None);
+                                                screen_share_toast_timer.set(None);
                                             }
                                             ScreenShareEvent::Failed(ref msg) => {
                                                 log::error!("Screen share failed: {msg}");
                                                 screen_share_state.set(ScreenShareState::Idle);
+                                                screen_share_toast_state.set(None);
+                                                screen_share_toast_timer.set(None);
                                                 user_error.set(Some(format!("Screen share failed: {msg}")));
                                             }
                                         }
@@ -3214,6 +3687,16 @@ pub fn AttendantsComponent(
                     UpdateDisplayNameModal {
                         current_display_name: current_display_name(),
                         meeting_id: id.clone(),
+                        // HCL issue 828 follow-up: parse the local session_id
+                        // (a numeric string from the client) into u64 so the
+                        // rename REST request can identify this tab. Falls back
+                        // to None when the session has not yet been assigned or
+                        // the value is unparseable — the server then renames
+                        // every session of the caller's user_id (legacy
+                        // behaviour).
+                        session_id: my_session_id
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok()),
                         on_close: move |_| {
                             display_name_modal_open.set(false);
                         },
@@ -3252,6 +3735,7 @@ pub fn AttendantsComponent(
                 // Mock peers popover (only shown when env-gated)
                 if mock_peers_enabled() && mock_peers_open() {
                     div { class: "mock-peers-popover",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
                         div { class: "mock-peers-popover-header",
                             span { "Mock Peers" }
                             button {
@@ -3298,6 +3782,7 @@ pub fn AttendantsComponent(
                 // Density mode popover
                 if !has_screen_share && density_open() {
                     div { class: "density-popover",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
                         for mode in DENSITY_MODES {
                             div {
                                 key: "{mode.label()}",
@@ -3528,77 +4013,68 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_auto_with_wt_enabled_returns_both_lists() {
-        // Auto pref + server says WT enabled: both lists must come through.
-        // This is the scenario the dioxus-ui hits on a normal reconnect once
-        // runtime config has loaded.
+    fn current_transport_urls_webtransport_with_wt_enabled_returns_both_lists() {
+        // WebTransport pref + server says WT enabled: both lists must come
+        // through. This is the WT-with-WS-fallback shape — the connection
+        // manager creates candidates for every URL and the election prefers
+        // WT, but if every WT candidate fails the WS candidates remain
+        // available for the manager to elect. This is the scenario the
+        // dioxus-ui hits on a normal reconnect once runtime config has
+        // loaded.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
         let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             true,
             ws.clone(),
             wt.clone(),
         );
-        assert!(enable_wt, "Auto+server-WT-enabled must enable WT");
-        assert_eq!(ws_out, ws, "WS list passed through unchanged");
+        assert!(enable_wt, "WebTransport+server-WT-enabled must enable WT");
+        assert_eq!(
+            ws_out, ws,
+            "WebTransport must keep the WS list — it's the fallback if every \
+             WT candidate fails its handshake"
+        );
         assert_eq!(wt_out, wt, "WT list passed through unchanged");
     }
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_auto_with_wt_disabled_returns_only_ws() {
-        // Auto pref + runtime config hasn't loaded (or WT disabled): the WT
-        // list is dropped from the effective config, mirroring how `Auto`
-        // collapses to WS-only in this state. This is the *initial* shape
-        // that strands the user before the reconnect path re-evaluates.
+    fn current_transport_urls_webtransport_with_wt_disabled_returns_only_ws() {
+        // WebTransport pref + runtime config hasn't loaded (or WT disabled
+        // at the server): the WT list is dropped from the effective config,
+        // collapsing to WS-only. This is the *initial* shape that strands
+        // the user before the reconnect path re-evaluates.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
         let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             false,
             ws.clone(),
             wt.clone(),
         );
-        assert!(!enable_wt, "Auto+server-WT-disabled must disable WT");
+        assert!(
+            !enable_wt,
+            "WebTransport+server-WT-disabled must disable WT"
+        );
         assert_eq!(ws_out, ws, "WS list still populated");
         assert_eq!(
             wt_out, wt,
-            "Auto preserves the WT list shape (resolve_transport_config returns it as-is); \
+            "WebTransport preserves the WT list shape (resolve_transport_config returns it as-is); \
              the manager's enable_webtransport=false is what gates use of WT"
         );
     }
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_websocket_only_drops_wt_list() {
-        // Explicit WebSocketOnly preference: WT list must always be empty,
+    fn current_transport_urls_websocket_drops_wt_list() {
+        // Explicit WebSocket preference: WT list must always be empty,
         // regardless of what the server-side flag says.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::WebSocketOnly,
-            true,
-            ws.clone(),
-            wt,
-        );
-        assert!(!enable_wt, "WebSocketOnly must report WT disabled");
+        let (enable_wt, ws_out, wt_out) =
+            current_transport_urls_from_lists(TransportPreference::WebSocket, true, ws.clone(), wt);
+        assert!(!enable_wt, "WebSocket must report WT disabled");
         assert_eq!(ws_out, ws);
-        assert!(wt_out.is_empty(), "WebSocketOnly must drop the WT list");
-    }
-
-    #[wasm_bindgen_test]
-    fn current_transport_urls_webtransport_only_drops_ws_list() {
-        // Explicit WebTransportOnly preference: WS list must always be empty.
-        let ws = vec!["wss://ws-1".to_string()];
-        let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::WebTransportOnly,
-            false, // server says WT disabled, but user override wins
-            ws,
-            wt.clone(),
-        );
-        assert!(enable_wt, "WebTransportOnly must report WT enabled");
-        assert!(ws_out.is_empty(), "WebTransportOnly must drop the WS list");
-        assert_eq!(wt_out, wt);
+        assert!(wt_out.is_empty(), "WebSocket must drop the WT list");
     }
 
     #[wasm_bindgen_test]
@@ -3614,22 +4090,26 @@ mod tests {
 
         // Initial call (runtime config still loading)
         let (init_enable_wt, init_ws, _init_wt) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             false,
             ws.clone(),
             wt.clone(),
         );
         assert!(!init_enable_wt);
         assert_eq!(init_ws, ws);
-        // Note: `Auto` keeps the wt list value; it's the bool that gates use.
+        // Note: `WebTransport` keeps the wt list value; it's the bool that gates use.
         // The recovery story is that `init_enable_wt == false` makes the manager
         // treat the WT list as unusable even though it's present in the vec —
         // see `resolve_transport_config`. The bool is the real signal, not the
         // list contents.
 
         // Reconnect call (runtime config now loaded — WT enabled)
-        let (reconn_enable_wt, reconn_ws, reconn_wt) =
-            current_transport_urls_from_lists(TransportPreference::Auto, true, ws.clone(), wt);
+        let (reconn_enable_wt, reconn_ws, reconn_wt) = current_transport_urls_from_lists(
+            TransportPreference::WebTransport,
+            true,
+            ws.clone(),
+            wt,
+        );
         assert!(reconn_enable_wt, "reconnect path now has WT enabled");
         assert_eq!(reconn_ws, ws, "WS list still populated");
         assert!(

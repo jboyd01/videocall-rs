@@ -296,10 +296,10 @@ pub struct ConnectionManagerOptions {
     ///
     /// The dioxus-ui passes `true` only when the user's
     /// [`TransportPreference`](https://github01.hclpnp.com/labs-projects/videocall)
-    /// is `Auto` — i.e. the single-candidate state is system-side, not a
-    /// deliberate user choice. Manual `WebTransportOnly` / `WebSocketOnly`
-    /// selections set this to `false` so the retry never fires and the user's
-    /// transport choice is respected.
+    /// is the default `WebTransport` (WT-with-WS-fallback) mode — i.e. the
+    /// single-candidate state is system-side, not a deliberate user choice.
+    /// A manual `WebSocket` selection sets this to `false` so the retry
+    /// never fires and the user's transport choice is respected.
     pub allow_post_rebase_retry: bool,
 
     /// Optional async callback that refreshes the room token before the
@@ -2729,10 +2729,10 @@ impl ConnectionManager {
     //
     // The retry only fires when `options.allow_post_rebase_retry == true`.
     // The dioxus-ui sets this to `true` only when the user's
-    // `TransportPreference` is `Auto` (i.e. the single-candidate state is
-    // system-side, not the user's deliberate choice). Manual `WebTransportOnly`
-    // / `WebSocketOnly` selections set this to `false` so the retry never
-    // overrides an explicit user choice.
+    // `TransportPreference` is the default `WebTransport` (WT-with-WS-fallback)
+    // mode — i.e. the single-candidate state is system-side, not the user's
+    // deliberate choice. A manual `WebSocket` selection sets this to `false`
+    // so the retry never overrides an explicit user choice.
     // -----------------------------------------------------------------------
 
     /// Schedules the post-rebase re-election retry timer if and only if the
@@ -2745,9 +2745,9 @@ impl ConnectionManager {
     /// counter is below the cap actually spawns a timer.
     fn maybe_schedule_post_rebase_retry(&mut self) {
         if !self.options.allow_post_rebase_retry {
-            // The user explicitly chose a single transport (WebTransportOnly /
-            // WebSocketOnly). Respect that choice — single-candidate state is
-            // intentional, not a recoverable system condition.
+            // The user explicitly chose `WebSocket`. Respect that choice —
+            // single-candidate state is intentional, not a recoverable
+            // system condition.
             debug!(
                 "Post-rebase retry suppressed: user transport preference forbids it \
                  (allow_post_rebase_retry=false)"
@@ -3036,6 +3036,40 @@ impl ConnectionManager {
             "main_thread_drift_ms",
             *self.main_thread_drift_ms.borrow()
         ));
+
+        // Chrome-only: report WASM heap usage for memory pressure diagnosis.
+        // Firefox/Safari don't expose performance.memory, so this gracefully
+        // produces no metrics on those browsers.
+        #[cfg(target_arch = "wasm32")]
+        {
+            use js_sys::Reflect;
+            use wasm_bindgen::JsValue;
+            if let Some(window) = web_sys::window() {
+                if let Some(perf) = window.performance() {
+                    let perf_js: &JsValue = perf.as_ref();
+                    if let Ok(memory) = Reflect::get(perf_js, &JsValue::from_str("memory")) {
+                        if !memory.is_undefined() {
+                            if let Ok(used) =
+                                Reflect::get(&memory, &JsValue::from_str("usedJSHeapSize"))
+                            {
+                                if let Some(bytes) = used.as_f64() {
+                                    metrics
+                                        .push(metric!("heap_used_mb", bytes / (1024.0 * 1024.0)));
+                                }
+                            }
+                            if let Ok(limit) =
+                                Reflect::get(&memory, &JsValue::from_str("jsHeapSizeLimit"))
+                            {
+                                if let Some(bytes) = limit.as_f64() {
+                                    metrics
+                                        .push(metric!("heap_limit_mb", bytes / (1024.0 * 1024.0)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         metrics
     }
@@ -4235,10 +4269,9 @@ mod tests {
 
     #[test]
     fn post_rebase_retry_not_scheduled_when_user_pref_forbids() {
-        // User explicitly chose WebSocketOnly (or WebTransportOnly) — the
-        // single-candidate state is intentional. The rebase path must NOT
-        // bump the retry counter, because the spawn_local schedule path is
-        // gated on the preference.
+        // User explicitly chose `WebSocket` — the single-candidate state is
+        // intentional. The rebase path must NOT bump the retry counter,
+        // because the spawn_local schedule path is gated on the preference.
         let mut mgr = make_test_manager();
         mgr.options.webtransport_urls = vec!["https://only-server".into()];
         mgr.options.allow_post_rebase_retry = false;

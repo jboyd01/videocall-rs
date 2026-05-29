@@ -316,6 +316,8 @@ pub fn MeetingPage(id: String) -> Element {
                 on_meeting_settings_updated: None,
                 on_host_mute: None,
                 on_host_disable_video: None,
+                on_participant_kicked: None,
+                on_peer_event: None,
                 on_speaking_changed: None,
                 on_audio_level_changed: None,
                 vad_threshold: None,
@@ -579,7 +581,11 @@ pub fn MeetingPage(id: String) -> Element {
                 }
             },
             (Some(_), MeetingStatus::WaitingForMeeting { .. }) => rsx! {
-                div { class: "waiting-room-container",
+                // `data-testid` added for the bots-app waiting-room detection
+                // path (see e2e/bots-app/src/meeting-join.ts). The bot uses it
+                // to distinguish "host hasn't started the meeting yet" from
+                // the post-admit grid. Behaviourally inert.
+                div { class: "waiting-room-container", "data-testid": "meeting-waiting-for-host",
                     div { class: "waiting-room-card card-apple",
                         div { class: "waiting-room-icon",
                             div { class: "loading-spinner", style: "width: 48px; height: 48px;" }
@@ -601,7 +607,11 @@ pub fn MeetingPage(id: String) -> Element {
                 }
             },
             (Some(_), MeetingStatus::Rejected) => rsx! {
-                div { class: "rejected-container",
+                // `data-testid` for bots-app rejection detection
+                // (see e2e/bots-app/src/meeting-join.ts). Lets the bot
+                // exit cleanly with `JoinRejectedError` instead of the
+                // misleading "join button reappeared" diagnostic.
+                div { class: "rejected-container", "data-testid": "meeting-rejected",
                     div { class: "rejected-card card-apple",
                         svg {
                             xmlns: "http://www.w3.org/2000/svg",
@@ -640,7 +650,13 @@ pub fn MeetingPage(id: String) -> Element {
                 }
             },
             (Some(_), MeetingStatus::Error(error)) => rsx! {
-                div { class: "error-container",
+                // `data-testid` for bots-app meeting-error detection
+                // (see e2e/bots-app/src/meeting-join.ts). The base
+                // `.error-container` class is shared with non-meeting
+                // screens (config_error.rs, browser_compatibility.rs),
+                // so the bot relies on this attribute for an
+                // unambiguous selector.
+                div { class: "error-container", "data-testid": "meeting-error",
                     div { class: "error-card card-apple",
                         svg {
                             xmlns: "http://www.w3.org/2000/svg",
