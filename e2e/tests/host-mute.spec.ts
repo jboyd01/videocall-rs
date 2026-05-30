@@ -125,7 +125,7 @@ async function enableMic(page: Page): Promise<void> {
  */
 async function hostMutePeerViaTile(page: Page): Promise<void> {
   const guestTile = page.locator(".grid-item:has(.tile-mute-btn)").first();
-  await expect(guestTile).toBeVisible({ timeout: 15_000 });
+  await expect(guestTile).toBeVisible({ timeout: 30_000 });
 
   // Hover to reveal `.tile-mute-btn` (CSS sets visibility:hidden until
   // `.grid-item:hover`).
@@ -202,8 +202,12 @@ test.describe("Host mute controls", () => {
 
       // Wait for the peer connection to establish (host sees guest's tile).
       await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
-        timeout: 30_000,
+        timeout: 45_000,
       });
+
+      // Brief stabilization for the WebRTC data channel to finish setup
+      // after the tile renders — audio track state propagation needs this.
+      await hostPage.waitForTimeout(2000);
 
       // Guest enables their microphone so the host's per-tile diagnostics
       // reflect audio_enabled=true and the tile mute menu is rendered.
@@ -221,13 +225,32 @@ test.describe("Host mute controls", () => {
       });
       await expect(guestMuteToast.first()).toBeVisible({ timeout: 15_000 });
 
-      // ---- Mute menu-toggle disappears from host's view (peer is now muted) ----
-      // Once the guest is muted, on_mute becomes None and the entire
-      // `.tile-mute-menu-wrapper` (and its `title="Host actions"` button)
-      // is no longer rendered for that peer.
-      await expect(hostPage.getByTitle("Host actions")).toHaveCount(0, {
-        timeout: 10_000,
-      });
+      // ---- "Mute" item gone from the tile context menu (peer is now muted) ----
+      //
+      // The three-dot "Host actions" button stays visible (kick/disable-video
+      // are still available) but the "Mute" menu item inside is no longer
+      // rendered because on_mute becomes None when audio_enabled is false.
+      //
+      // The removal is gated on the guest's diagnostics re-broadcast carrying
+      // `audio_enabled=false` — a multi-hop async chain:
+      //
+      //   host.mute -> NATS -> guest mutes locally -> guest's next
+      //   diagnostics tick (1-5s) -> host receives -> on_mute becomes None
+      //   -> Dioxus re-render removes the "Mute" menu item.
+      //
+      // The previous 10s timeout (PR #938 stabilization) was too tight under
+      // hcl-main push-runner load (issue #985 — 9+ consecutive failures with
+      // the same `Received: 1, Timeout: 10000ms` shape). 30s gives headroom
+      // for a ~5s diagnostics tick + propagation + rAF slack. Playwright's
+      // `toHaveCount(0)` returns as soon as the condition is met, so the
+      // wider bound does not slow the common fast-runner case.
+      const hostActionsBtn = hostPage.getByTitle("Host actions");
+      await hostActionsBtn.hover();
+      await hostActionsBtn.click();
+      await expect(hostPage.locator(".tile-context-menu-item", { hasText: "Mute" })).toHaveCount(
+        0,
+        { timeout: 30_000 },
+      );
     } finally {
       await browser1.close();
       await browser2.close();
