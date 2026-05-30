@@ -354,7 +354,6 @@ pub fn generate_for_peer(
     // through the bundle.
     let signal_transport = signal_info.transport;
     let signal_meter_mode = signal_info.meter_mode;
-    let signal_sharing_peer_name = signal_info.sharing_peer_name;
     // Bundled popup handlers (lifted out of per-tile state for bugs #8 + #9).
     let SignalPopupHandlers {
         show: show_signal_popup,
@@ -435,7 +434,15 @@ pub fn generate_for_peer(
         // so this popup and the matching peer-tile popup coexist without
         // collision. Anchor on the screen-share div so the portal positioner
         // tracks it through layout reflows.
-        let ss_anchor_id = (*ss_div_id).clone();
+        // HCL follow-up 957 (@token-exempt): anchor the signal-meter
+        // popup directly on the signal-quality button so the popup reads
+        // as "growing out of" the button on first open. The button id is
+        // stable (`<tile-div-id>-signal-btn`), unique per tile, and ASCII
+        // safe — mirrors the existing `<tile-div-id>-name` pattern from
+        // PR 952.
+        let ss_name_id = format!("{}-name", &*ss_div_id);
+        let ss_signal_btn_id = format!("{}-signal-btn", &*ss_div_id);
+        let ss_anchor_id = ss_signal_btn_id.clone();
         let ss_split_class = if show_signal_popup {
             "split-screen-tile signal-popup-open"
         } else {
@@ -445,10 +452,12 @@ pub fn generate_for_peer(
             div {
                 id: "{ss_div_id}",
                 class: "{ss_split_class}",
+                "data-tile-root": "true",
                 div {
                     class: "canvas-container video-on",
                     ScreenCanvas { peer_id: key.clone() }
                     h4 {
+                        id: "{ss_name_id}",
                         class: "floating-name",
                         title: "{ss_name_title}",
                         dir: "auto",
@@ -465,6 +474,7 @@ pub fn generate_for_peer(
                         // icon). Toggles the SCREEN-ONLY popup for this
                         // publisher.
                         button {
+                            id: "{ss_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show screen-share signal quality",
                             onclick: move |_| on_toggle_signal_popup.call(()),
@@ -497,7 +507,6 @@ pub fn generate_for_peer(
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_anchor = ss_anchor_id.clone();
-                        let popup_sharing = signal_sharing_peer_name.clone();
                         rsx! {
                             SignalQualityPopup {
                                 peer_id: popup_peer_id,
@@ -507,7 +516,6 @@ pub fn generate_for_peer(
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
-                                sharing_peer_name: popup_sharing,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -548,15 +556,22 @@ pub fn generate_for_peer(
         } else {
             "split-peer-tile"
         };
-        // Anchor id for the signal-quality popup's portal positioning.
-        // Same id we attach to the outer tile div below; the popup uses it
-        // to read the tile's bounding rect through ResizeObserver / window
-        // listeners and follow the tile across grid reflows.
-        let split_anchor_id = (*peer_video_div_id).clone();
+        // HCL follow-up 957 (@token-exempt): the signal-meter popup
+        // anchors directly on the signal-quality button (id below) so
+        // the popup overlays the button's top-left corner on first open.
+        // The portal positioner reads the button's bounding rect through
+        // ResizeObserver / window listeners so the popup stays glued to
+        // the button through grid reflows. `split_name_id` is still
+        // emitted on the `<h4>` so the fallback walker has a stable
+        // tile-relative anchor if the button id lookup ever misses.
+        let split_name_id = format!("{}-name", &*peer_video_div_id);
+        let split_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
+        let split_anchor_id = split_signal_btn_id.clone();
         return rsx! {
             div {
                 class: "{split_peer_class}{vo_speaking}",
                 id: "{peer_video_div_id}",
+                "data-tile-root": "true",
                 style: "{vo_tile_style}",
                 div {
                     class: "{grid_class}",
@@ -575,6 +590,7 @@ pub fn generate_for_peer(
                         }
                     }
                     h4 {
+                        id: "{split_name_id}",
                         class: "floating-name",
                         title: "{title_vo}",
                         dir: "auto",
@@ -596,6 +612,7 @@ pub fn generate_for_peer(
                         }
                         // Signal icon (always visible, clickable)
                         button {
+                            id: "{split_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show signal quality",
                             onclick: move |_| on_toggle_signal_popup.call(()),
@@ -754,7 +771,6 @@ pub fn generate_for_peer(
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_anchor = split_anchor_id.clone();
-                        let popup_sharing = signal_sharing_peer_name.clone();
                         rsx! {
                             SignalQualityPopup {
                                 peer_id: popup_peer_id,
@@ -764,7 +780,6 @@ pub fn generate_for_peer(
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
-                                sharing_peer_name: popup_sharing,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -801,13 +816,19 @@ pub fn generate_for_peer(
         } else {
             "grid-item full-bleed"
         };
-        // Anchor id for the signal-quality popup's portal positioning;
-        // shared with the outer tile div's id below.
-        let fb_anchor_id = (*peer_video_div_id).clone();
+        // HCL follow-up 957 (@token-exempt): anchor the popup on the
+        // tile's signal-quality button (id below) so the popup overlays
+        // the button's top-left corner on first open. `fb_name_id` is
+        // kept so the fallback walker still has a tile-relative
+        // `.floating-name` to land on if the button lookup misses.
+        let fb_name_id = format!("{}-name", &*peer_video_div_id);
+        let fb_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
+        let fb_anchor_id = fb_signal_btn_id.clone();
         return rsx! {
             div {
                 class: "{full_bleed_grid_class}{speaking_class}",
                 id: "{peer_video_div_id}",
+                "data-tile-root": "true",
                 style: "{tile_style}",
                 div {
                     class: "{full_bleed_class}",
@@ -829,6 +850,7 @@ pub fn generate_for_peer(
                         }
                     }
                     h4 {
+                        id: "{fb_name_id}",
                         class: "floating-name",
                         title: "{title}",
                         dir: "auto",
@@ -850,6 +872,7 @@ pub fn generate_for_peer(
                         }
                         // Signal icon (always visible, clickable)
                         button {
+                            id: "{fb_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show signal quality",
                             onclick: move |_| on_toggle_signal_popup.call(()),
@@ -1004,7 +1027,6 @@ pub fn generate_for_peer(
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_anchor = fb_anchor_id.clone();
-                        let popup_sharing = signal_sharing_peer_name.clone();
                         rsx! {
                             SignalQualityPopup {
                                 peer_id: popup_peer_id,
@@ -1014,7 +1036,6 @@ pub fn generate_for_peer(
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
-                                sharing_peer_name: popup_sharing,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -1118,13 +1139,19 @@ pub fn generate_for_peer(
             } else {
                 "grid-item"
             };
-            // Anchor id for the signal-quality popup's portal positioning;
-            // shared with the outer grid-item div's id below.
-            let grid_anchor_id = (*peer_video_div_id).clone();
+            // HCL follow-up 957 (@token-exempt): anchor the popup on
+            // the tile's signal-quality button (id below) so the popup
+            // overlays the button's top-left corner on first open.
+            // `grid_name_id` is still emitted on the `<h4>` for the
+            // fallback walker.
+            let grid_name_id = format!("{}-name", &*peer_video_div_id);
+            let grid_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
+            let grid_anchor_id = grid_signal_btn_id.clone();
             rsx! {
                 div {
                     class: "{grid_item_class}{grid_speaking}",
                     id: "{peer_video_div_id}",
+                    "data-tile-root": "true",
                     style: "{grid_tile_style}",
                     // One canvas for the User Video
                     div {
@@ -1143,6 +1170,7 @@ pub fn generate_for_peer(
                             }
                         }
                         h4 {
+                            id: "{grid_name_id}",
                             class: "floating-name",
                             title: "{title_grid}",
                             dir: "auto",
@@ -1164,6 +1192,7 @@ pub fn generate_for_peer(
                             }
                             // Signal icon (always visible, clickable)
                             button {
+                                id: "{grid_signal_btn_id}",
                                 class: "signal-indicator",
                                 "aria-label": "Show signal quality",
                                 onclick: move |_| on_toggle_signal_popup.call(()),
@@ -1318,7 +1347,6 @@ pub fn generate_for_peer(
                             let popup_peer_name = peer_display_name.clone();
                             let popup_transport = signal_transport.clone();
                             let popup_anchor = grid_anchor_id.clone();
-                            let popup_sharing = signal_sharing_peer_name.clone();
                             rsx! {
                                 SignalQualityPopup {
                                     peer_id: popup_peer_id,
@@ -1328,7 +1356,6 @@ pub fn generate_for_peer(
                                     transport: popup_transport,
                                     anchor_id: popup_anchor,
                                     meter_mode: signal_meter_mode,
-                                    sharing_peer_name: popup_sharing,
                                     free_position: signal_free_position,
                                     on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                     on_reanchor: move |_| on_reanchor_signal_popup.call(()),

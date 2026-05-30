@@ -2135,15 +2135,6 @@ pub fn AttendantsComponent(
         stack.last().cloned()
     };
     let has_screen_share = active_screen_sharer.is_some();
-    // HCL bug #2: display name of the active screen sharer (if any), so
-    // every peer-mode signal-meter popup can surface a small
-    // "Sharing: <name>" header line. Computed once per render so the
-    // PeerTile for-loop avoids repeating the lookup.
-    let active_screen_sharer_name: Option<String> = active_screen_sharer.as_ref().map(|sid| {
-        client
-            .get_peer_display_name(sid)
-            .unwrap_or_else(|| sid.clone())
-    });
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     // The right panel uses a 2-column grid of compact tiles. We compute how
@@ -2939,10 +2930,6 @@ pub fn AttendantsComponent(
                                                         on_toggle_pin: toggle_pin.clone(),
                                                         room_id: Some(id.clone()),
                                                         is_current_user_host: is_owner,
-                                                        // HCL bug #2: peer popups suppress the
-                                                        // screen metric and surface a header note
-                                                        // pointing at whoever is sharing right now.
-                                                        sharing_peer_name: active_screen_sharer_name.clone(),
                                                     }
                                                 }
                                             }
@@ -2990,12 +2977,6 @@ pub fn AttendantsComponent(
                                             on_toggle_pin: toggle_pin.clone(),
                                             room_id: Some(id.clone()),
                                             is_current_user_host: is_owner,
-                                            // HCL bug #2: grid layout never reaches the split
-                                            // path, but a screen share may still be live in
-                                            // the publisher's own grid tile — forward the
-                                            // active sharer name so each peer popup can show
-                                            // the "Sharing: <name>" indicator.
-                                            sharing_peer_name: active_screen_sharer_name.clone(),
                                         }
                                     }
                                 }
