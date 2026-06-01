@@ -69,14 +69,7 @@ pub async fn send_message(
     body_values: Option<&str>,
 ) -> Result<JmapResponse, String> {
     let token = get_stored_access_token().unwrap_or_default();
-    let temp_id = format!(
-        "temp-{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (js_sys::Math::random() * 0xFFFF_FFFFu32 as f64) as u32,
-        (js_sys::Math::random() * 0xFFFFu16 as f64) as u16,
-        (js_sys::Math::random() * 0xFFFFu16 as f64) as u16,
-        (js_sys::Math::random() * 0xFFFFu16 as f64) as u16,
-        (js_sys::Math::random() * 0xFFFF_FFFF_FFFFu64 as f64) as u64,
-    );
+    let temp_id = format!("temp-{}", uuid::Uuid::new_v4());
 
     let body_val = match body_values {
         Some(bv) => bv.to_string(),
@@ -288,3 +281,234 @@ pub fn subscribe_chat_sse(
         _on_open: on_open,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    // ── helpers ─────────────────────────────────────────────────────
+
+    /// Build a fake JWT (header.payload.signature) with the given JSON payload.
+    /// The signature is a constant placeholder — these tests don't verify signatures.
+    fn make_jwt(payload: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        format!("{}.{}.signature", header, payload_b64)
+    }
+
+    fn make_response(
+        method_responses: Vec<(String, serde_json::Value, String)>,
+    ) -> JmapResponse {
+        JmapResponse {
+            method_responses,
+            created_ids: None,
+            session_state: "state-1".to_string(),
+            not_found: None,
+        }
+    }
+
+    // ── current_user_id_from_token() ────────────────────────────────
+
+    #[test]
+    fn current_user_id_from_token_extracts_sub_claim() {
+        let token = make_jwt(json!({ "sub": "user-123", "email": "u@x.com" }));
+        assert_eq!(current_user_id_from_token(&token), Some("user-123".to_string()));
+    }
+
+    #[test]
+    fn current_user_id_from_token_returns_none_when_sub_missing() {
+        let token = make_jwt(json!({ "email": "u@x.com" }));
+        assert_eq!(current_user_id_from_token(&token), None);
+    }
+
+    #[test]
+    fn current_user_id_from_token_returns_none_when_sub_not_a_string() {
+        let token = make_jwt(json!({ "sub": 12345 }));
+        assert_eq!(current_user_id_from_token(&token), None);
+    }
+
+    #[test]
+    fn current_user_id_from_token_returns_none_for_empty_string() {
+        assert_eq!(current_user_id_from_token(""), None);
+    }
+
+    #[test]
+    fn current_user_id_from_token_returns_none_for_non_jwt_string() {
+        assert_eq!(current_user_id_from_token("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn current_user_id_from_token_returns_none_when_wrong_part_count() {
+        // Only two parts — missing signature segment.
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"user-123"}"#);
+        let token = format!("{}.{}", header, payload);
+        assert_eq!(current_user_id_from_token(&token), None);
+    }
+
+    #[test]
+    fn current_user_id_from_token_returns_none_for_invalid_base64_payload() {
+        let token = "header.!!!not-base64!!!.sig".to_string();
+        assert_eq!(current_user_id_from_token(&token), None);
+    }
+
+    #[test]
+    fn current_user_id_from_token_returns_none_for_invalid_json_payload() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(b"not-json");
+        let token = format!("{}.{}.sig", header, payload);
+        assert_eq!(current_user_id_from_token(&token), None);
+    }
+
+    #[test]
+    fn current_user_id_from_token_returns_empty_string_when_sub_is_empty() {
+        let token = make_jwt(json!({ "sub": "" }));
+        assert_eq!(current_user_id_from_token(&token), Some(String::new()));
+    }
+
+    // ── extract_chat_messages() ─────────────────────────────────────
+
+    #[test]
+    fn extract_chat_messages_returns_list_when_present() {
+        let response = make_response(vec![
+            (
+                "ChatMessage/query".to_string(),
+                json!({ "ids": ["m1", "m2"] }),
+                "0".to_string(),
+            ),
+            (
+                "ChatMessage/get".to_string(),
+                json!({
+                    "list": [
+                        { "id": "m1", "textBody": "hi" },
+                        { "id": "m2", "textBody": "yo" },
+                    ]
+                }),
+                "1".to_string(),
+            ),
+        ]);
+
+        let msgs = extract_chat_messages(response).expect("should extract list");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["id"], "m1");
+        assert_eq!(msgs[1]["textBody"], "yo");
+    }
+
+    #[test]
+    fn extract_chat_messages_returns_empty_list_when_list_is_empty() {
+        let response = make_response(vec![(
+            "ChatMessage/get".to_string(),
+            json!({ "list": [] }),
+            "0".to_string(),
+        )]);
+
+        let msgs = extract_chat_messages(response).expect("should extract empty list");
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn extract_chat_messages_finds_get_among_other_responses() {
+        let response = make_response(vec![
+            (
+                "Something/else".to_string(),
+                json!({ "list": ["should-be-ignored"] }),
+                "0".to_string(),
+            ),
+            (
+                "ChatMessage/get".to_string(),
+                json!({ "list": [{ "id": "m1" }] }),
+                "1".to_string(),
+            ),
+        ]);
+
+        let msgs = extract_chat_messages(response).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["id"], "m1");
+    }
+
+    #[test]
+    fn extract_chat_messages_errors_when_get_response_missing() {
+        let response = make_response(vec![(
+            "ChatMessage/query".to_string(),
+            json!({ "ids": ["m1"] }),
+            "0".to_string(),
+        )]);
+
+        let err = extract_chat_messages(response).unwrap_err();
+        assert!(err.contains("ChatMessage/get"));
+    }
+
+    #[test]
+    fn extract_chat_messages_errors_when_method_responses_empty() {
+        let response = make_response(vec![]);
+        let err = extract_chat_messages(response).unwrap_err();
+        assert!(err.contains("ChatMessage/get"));
+    }
+
+    #[test]
+    fn extract_chat_messages_errors_when_list_field_missing() {
+        let response = make_response(vec![(
+            "ChatMessage/get".to_string(),
+            json!({ "notFound": [] }),
+            "0".to_string(),
+        )]);
+
+        let err = extract_chat_messages(response).unwrap_err();
+        assert!(err.contains("list of messages"));
+    }
+
+    #[test]
+    fn extract_chat_messages_errors_when_list_field_not_an_array() {
+        let response = make_response(vec![(
+            "ChatMessage/get".to_string(),
+            json!({ "list": "not-an-array" }),
+            "0".to_string(),
+        )]);
+
+        let err = extract_chat_messages(response).unwrap_err();
+        assert!(err.contains("list of messages"));
+    }
+
+    #[test]
+    fn extract_chat_messages_picks_first_get_when_duplicated() {
+        let response = make_response(vec![
+            (
+                "ChatMessage/get".to_string(),
+                json!({ "list": [{ "id": "first" }] }),
+                "0".to_string(),
+            ),
+            (
+                "ChatMessage/get".to_string(),
+                json!({ "list": [{ "id": "second" }] }),
+                "1".to_string(),
+            ),
+        ]);
+
+        let msgs = extract_chat_messages(response).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["id"], "first");
+    }
+
+    #[test]
+    fn extract_chat_messages_preserves_created_ids_unused_field() {
+        // Sanity check: a response carrying created_ids/not_found doesn't
+        // affect ChatMessage/get extraction.
+        let mut response = make_response(vec![(
+            "ChatMessage/get".to_string(),
+            json!({ "list": [{ "id": "m1" }] }),
+            "0".to_string(),
+        )]);
+        let mut ids = HashMap::new();
+        ids.insert("client-1".to_string(), "server-1".to_string());
+        response.created_ids = Some(ids);
+        response.not_found = Some(vec!["missing".to_string()]);
+
+        let msgs = extract_chat_messages(response).unwrap();
+        assert_eq!(msgs.len(), 1);
+    }
+}
+
