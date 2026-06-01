@@ -8810,6 +8810,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "urlencoding",
+ "uuid 1.21.0",
  "videocall-client",
  "videocall-diagnostics",
  "videocall-meeting-client",

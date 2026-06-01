@@ -2573,7 +2573,7 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
-            class:"flex gap-2",
+            style:"display:flex;gap:0.5rem",
             div { id: "main-container", class: "meeting-page",
                 onclick: move |_| {
                     dock_menu_open.set(false);

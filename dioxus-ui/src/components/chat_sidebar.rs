@@ -464,3 +464,250 @@ pub fn ChatSidebar(is_show: bool, onclose: EventHandler<MouseEvent>, conv_id: St
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── initials() ──────────────────────────────────────────────────
+    #[test]
+    fn initials_two_words_returns_two_uppercase_chars() {
+        assert_eq!(initials("john doe"), "JD");
+    }
+
+    #[test]
+    fn initials_single_word_returns_one_uppercase_char() {
+        assert_eq!(initials("alice"), "A");
+    }
+
+    #[test]
+    fn initials_more_than_two_words_uses_only_first_two() {
+        assert_eq!(initials("john michael doe"), "JM");
+    }
+
+    #[test]
+    fn initials_already_uppercase_stays_uppercase() {
+        assert_eq!(initials("John Doe"), "JD");
+    }
+
+    #[test]
+    fn initials_empty_string_returns_question_mark() {
+        assert_eq!(initials(""), "?");
+    }
+
+    #[test]
+    fn initials_whitespace_only_returns_question_mark() {
+        assert_eq!(initials("   "), "?");
+    }
+
+    #[test]
+    fn initials_handles_extra_whitespace_between_words() {
+        assert_eq!(initials("  john    doe  "), "JD");
+    }
+
+    #[test]
+    fn initials_handles_unicode_characters() {
+        assert_eq!(initials("élise martin"), "ÉM");
+    }
+
+    // ── message_text() ──────────────────────────────────────────────
+    #[test]
+    fn message_text_returns_text_body_when_present() {
+        let m = json!({ "textBody": "hello world" });
+        assert_eq!(message_text(&m), "hello world");
+    }
+
+    #[test]
+    fn message_text_returns_no_content_when_text_body_missing() {
+        let m = json!({});
+        assert_eq!(message_text(&m), "no content");
+    }
+
+    #[test]
+    fn message_text_returns_no_content_when_text_body_not_a_string() {
+        let m = json!({ "textBody": 123 });
+        assert_eq!(message_text(&m), "no content");
+    }
+
+    #[test]
+    fn message_text_returns_empty_string_when_text_body_is_empty() {
+        let m = json!({ "textBody": "" });
+        assert_eq!(message_text(&m), "");
+    }
+
+    // ── format_timestamp() ──────────────────────────────────────────
+    #[test]
+    fn format_timestamp_formats_valid_rfc3339() {
+        // 2026-01-15T14:30:00Z → Thursday, Jan 15 - 2:30 PM
+        let formatted = format_timestamp("2026-01-15T14:30:00Z");
+        assert_eq!(formatted, "Thursday, Jan 15 - 2:30 PM");
+    }
+
+    #[test]
+    fn format_timestamp_handles_timezone_offset() {
+        // 2026-01-15T14:30:00+07:00 keeps the local components.
+        let formatted = format_timestamp("2026-01-15T14:30:00+07:00");
+        assert_eq!(formatted, "Thursday, Jan 15 - 2:30 PM");
+    }
+
+    #[test]
+    fn format_timestamp_returns_raw_string_when_invalid() {
+        assert_eq!(format_timestamp("not-a-timestamp"), "not-a-timestamp");
+    }
+
+    #[test]
+    fn format_timestamp_returns_raw_string_when_empty() {
+        assert_eq!(format_timestamp(""), "");
+    }
+
+    #[test]
+    fn format_timestamp_morning_uses_am() {
+        let formatted = format_timestamp("2026-01-15T09:05:00Z");
+        assert_eq!(formatted, "Thursday, Jan 15 - 9:05 AM");
+    }
+
+    // ── parse_chat_message() ────────────────────────────────────────
+    #[test]
+    fn parse_chat_message_marks_self_when_sender_id_matches() {
+        let raw = json!({
+            "id": "msg-1",
+            "from": { "id": "user-123", "displayName": "John Doe" },
+            "textBody": "hi there",
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let me = Some("user-123".to_string());
+        let parsed = parse_chat_message(&raw, &me);
+
+        assert_eq!(parsed.id, "msg-1");
+        assert_eq!(parsed.sender, "John Doe");
+        assert_eq!(parsed.initials, "JD");
+        assert_eq!(parsed.text, "hi there");
+        assert_eq!(parsed.timestamp, "Thursday, Jan 15 - 2:30 PM");
+        assert!(parsed.is_self);
+    }
+
+    #[test]
+    fn parse_chat_message_is_not_self_when_sender_id_differs() {
+        let raw = json!({
+            "id": "msg-2",
+            "from": { "id": "user-999", "displayName": "Jane Smith" },
+            "textBody": "hello",
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let me = Some("user-123".to_string());
+        let parsed = parse_chat_message(&raw, &me);
+
+        assert!(!parsed.is_self);
+        assert_eq!(parsed.sender, "Jane Smith");
+        assert_eq!(parsed.initials, "JS");
+    }
+
+    #[test]
+    fn parse_chat_message_falls_back_to_user_id_field() {
+        let raw = json!({
+            "id": "msg-3",
+            "from": { "userId": "user-123", "displayName": "John Doe" },
+            "textBody": "hi",
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let me = Some("user-123".to_string());
+        let parsed = parse_chat_message(&raw, &me);
+
+        assert!(parsed.is_self);
+    }
+
+    #[test]
+    fn parse_chat_message_falls_back_to_sender_id_field() {
+        let raw = json!({
+            "id": "msg-4",
+            "from": { "displayName": "John Doe" },
+            "senderId": "user-123",
+            "textBody": "hi",
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let me = Some("user-123".to_string());
+        let parsed = parse_chat_message(&raw, &me);
+
+        assert!(parsed.is_self);
+    }
+
+    #[test]
+    fn parse_chat_message_is_not_self_when_my_user_id_is_none() {
+        let raw = json!({
+            "id": "msg-5",
+            "from": { "id": "user-123", "displayName": "John Doe" },
+            "textBody": "hi",
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let parsed = parse_chat_message(&raw, &None);
+
+        assert!(!parsed.is_self);
+    }
+
+    #[test]
+    fn parse_chat_message_is_not_self_when_no_sender_id_in_payload() {
+        let raw = json!({
+            "id": "msg-6",
+            "from": { "displayName": "John Doe" },
+            "textBody": "hi",
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let me = Some("user-123".to_string());
+        let parsed = parse_chat_message(&raw, &me);
+
+        assert!(!parsed.is_self);
+    }
+
+    #[test]
+    fn parse_chat_message_uses_unknown_when_display_name_missing() {
+        let raw = json!({
+            "id": "msg-7",
+            "from": {},
+            "textBody": "hi",
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let parsed = parse_chat_message(&raw, &None);
+
+        assert_eq!(parsed.sender, "Unknown");
+        assert_eq!(parsed.initials, "U");
+    }
+
+    #[test]
+    fn parse_chat_message_handles_missing_text_body() {
+        let raw = json!({
+            "id": "msg-8",
+            "from": { "displayName": "John Doe" },
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let parsed = parse_chat_message(&raw, &None);
+
+        assert_eq!(parsed.text, "no content");
+    }
+
+    #[test]
+    fn parse_chat_message_handles_missing_sent_at() {
+        let raw = json!({
+            "id": "msg-9",
+            "from": { "displayName": "John Doe" },
+            "textBody": "hi",
+        });
+        let parsed = parse_chat_message(&raw, &None);
+
+        // Empty raw timestamp falls through chrono parsing and is returned as-is.
+        assert_eq!(parsed.timestamp, "");
+    }
+
+    #[test]
+    fn parse_chat_message_handles_missing_id() {
+        let raw = json!({
+            "from": { "displayName": "John Doe" },
+            "textBody": "hi",
+            "sentAt": "2026-01-15T14:30:00Z",
+        });
+        let parsed = parse_chat_message(&raw, &None);
+
+        assert_eq!(parsed.id, "");
+    }
+}
+

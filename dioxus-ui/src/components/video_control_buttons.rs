@@ -423,6 +423,7 @@ pub fn OpenChatButton(onclick: EventHandler<MouseEvent>) -> Element {
     rsx! {
         button {
             class: "video-control-button",
+            aria_label: "Open Chat",
             onclick: move |evt| onclick.call(evt),
             svg {
                 xmlns: "http://www.w3.org/2000/svg",
