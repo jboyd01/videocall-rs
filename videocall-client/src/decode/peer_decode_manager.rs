@@ -652,6 +652,56 @@ impl Peer {
         let _ = global_sender().try_broadcast(evt);
     }
 
+    /// Authoritatively force *this* peer's audio and/or video to the *off*
+    /// state, bypassing the heartbeat freshness guard.
+    ///
+    /// This is the shared per-peer body behind both
+    /// [`PeerDecodeManager::force_peer_media_off`] (single target, HCL #1034)
+    /// and [`PeerDecodeManager::force_all_peers_media_off_except`] (mute-all /
+    /// disable-all, HCL #1036). It sets the tracked `audio_enabled` /
+    /// `video_enabled` flags **directly** and reuses the same decoder-flush
+    /// paths the heartbeat off-transition uses, so a frozen last frame is
+    /// cleared at the instant the tile flips and the NetEq buffer stops
+    /// emitting expand/hiss after the stream is gone.
+    ///
+    /// Idempotent: only mutates and reports a change on an actual
+    /// `enabled -> false` transition, so duplicate dual-transport deliveries or
+    /// already-off peers are no-ops. Returns `true` iff any tracked flag
+    /// transitioned, so the caller can drive a single `broadcast_peer_status()`
+    /// per real change.
+    fn force_media_off(&mut self, audio_off: bool, video_off: bool) -> bool {
+        let mut changed = false;
+
+        if audio_off && self.audio_enabled {
+            self.audio_enabled = false;
+            // Mute and flush the audio decoder the same way the heartbeat
+            // audio-off transition does, to prevent the NetEq buffer from
+            // emitting expand/hiss packets after the stream is gone.
+            self.audio.set_muted(true);
+            self.audio.flush();
+            changed = true;
+            debug!(
+                "force_media_off: muted audio for peer {} (host command)",
+                self.session_id
+            );
+        }
+
+        if video_off && self.video_enabled {
+            self.video_enabled = false;
+            // Reuse the heartbeat video-off flush path so the frozen last
+            // frame is cleared at the same instant the tile flips to the
+            // avatar — no lingering freeze-frame (#1034).
+            self.video.flush();
+            changed = true;
+            debug!(
+                "force_media_off: disabled video for peer {} (host command)",
+                self.session_id
+            );
+        }
+
+        changed
+    }
+
     /// Emit windowed per-stream packet-loss and keyframe-request rates on the
     /// diagnostics bus (freeze observability, issue #1013).
     ///
@@ -1782,6 +1832,118 @@ impl PeerDecodeManager {
                 if peer.user_id == user_id {
                     peer.display_name = Some(display_name.clone());
                     self.display_name_cache.insert(key, display_name.clone());
+                }
+            }
+        }
+    }
+
+    /// Authoritatively force a peer's audio and/or video to the *off* state,
+    /// identified by `user_id` (the `target_user_id` carried on a host-command
+    /// broadcast such as `HOST_MUTE_PARTICIPANT` / `HOST_DISABLE_VIDEO`).
+    ///
+    /// HCL issue #1034. A host command is **authoritative** — unlike a
+    /// heartbeat, it is not a possibly-stale announcement racing live media on
+    /// a separate QUIC stream. It is a deliberate moderation action the whole
+    /// room must reflect *immediately*. We therefore set the tracked
+    /// `audio_enabled` / `video_enabled` flags **directly**, bypassing
+    /// [`apply_heartbeat_enabled_flag`] and its `MEDIA_FRESH_WINDOW_MS`
+    /// freshness guard.
+    ///
+    /// Why bypassing the guard is correct here (and only here): the freshness
+    /// guard (HCL bug #1) exists to stop a *stale negative heartbeat* from
+    /// clobbering a *live* stream during the ~5s out-of-order window on
+    /// WebTransport. When the host mutes peer X, X stops its encoder and sends
+    /// an immediate off-heartbeat, but X is still flushing straggler frames, so
+    /// `last_video_frame_ms` / `last_audio_frame_ms` look fresh and the guard
+    /// would keep `enabled = true` until the window expires — the ~5s lag from
+    /// the bug report. The host command is independent ground truth, so it does
+    /// not need (and must not be subject to) the freshness arbitration.
+    ///
+    /// On video-off we reuse the same decoder-flush path the heartbeat
+    /// off-transition uses (`self.video.flush()`), so the frozen last frame is
+    /// cleared at the instant the tile flips — no lingering freeze-frame.
+    /// On audio-off we mute and flush the audio decoder the same way.
+    ///
+    /// This is **not** a permanent latch: it writes the very same tracked flags
+    /// the heartbeat path reads and writes. When the target later legitimately
+    /// re-enables and sends `heartbeat = true` with fresh frames,
+    /// [`apply_heartbeat_enabled_flag`] returns `true` (affirmative heartbeats
+    /// always win) and the peer recovers normally.
+    ///
+    /// Safe no-op when no connected peer matches `user_id` (e.g. the host's own
+    /// view, or a peer not yet known to this client). Only emits a peer-status
+    /// broadcast for peers whose state actually changed, avoiding redundant UI
+    /// churn on duplicate dual-transport deliveries.
+    pub fn force_peer_media_off(&mut self, user_id: &str, audio_off: bool, video_off: bool) {
+        if !audio_off && !video_off {
+            return;
+        }
+        let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
+        for key in keys {
+            if let Some(peer) = self.connected_peers.get_mut(&key) {
+                if peer.user_id != user_id {
+                    continue;
+                }
+                // Per-peer force-off + change detection lives in the shared
+                // `Peer::force_media_off` helper (also used by the mute-all /
+                // disable-all path, #1036).
+                if peer.force_media_off(audio_off, video_off) {
+                    // Drives the `peer_status` diagnostics event the UI peer
+                    // tiles subscribe to, so the muted/video-off state shows
+                    // immediately rather than after the freshness window.
+                    peer.broadcast_peer_status();
+                }
+                // A given user_id maps to one peer per session; keep scanning
+                // in case the same user is present under multiple session_ids
+                // (multi-tab), so every tile for that user updates.
+            }
+        }
+    }
+
+    /// Authoritatively force audio and/or video to the *off* state for **every
+    /// connected peer except** the one whose `user_id` matches `except_user_id`.
+    ///
+    /// HCL issue #1036. The mute-all / disable-all host broadcasts
+    /// (`HOST_MUTE_PARTICIPANT` / `HOST_DISABLE_VIDEO` with an empty
+    /// `target_user_id`) must reflect across the whole room *immediately*, the
+    /// same way the single-target [`force_peer_media_off`] does — not lag behind
+    /// the slow heartbeat path. But a mute-all must **not** force-mute the
+    /// issuing host's own tile: the host muting everyone is not muting itself.
+    /// The server therefore carries the host's `user_id` on the broadcast via
+    /// `creator_id`, which the handler passes here as `except_user_id`; that one
+    /// peer is skipped entirely (its `audio_enabled` / `video_enabled` are left
+    /// untouched) while every other peer is forced off.
+    ///
+    /// Shares the exact per-peer force-off body, freshness-guard bypass, decoder
+    /// flush, idempotency (only a real `enabled -> false` transition mutates or
+    /// broadcasts), and multi-tab handling with [`force_peer_media_off`] via
+    /// [`Peer::force_media_off`]. Like that method it is **not** a permanent
+    /// latch: a later affirmative heartbeat with fresh frames re-enables the
+    /// peer normally.
+    ///
+    /// Safe no-op for `audio_off == video_off == false`. The exclusion is by
+    /// `user_id`, so all of the host's own sessions/tabs are excluded.
+    pub fn force_all_peers_media_off_except(
+        &mut self,
+        except_user_id: &str,
+        audio_off: bool,
+        video_off: bool,
+    ) {
+        if !audio_off && !video_off {
+            return;
+        }
+        let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
+        for key in keys {
+            if let Some(peer) = self.connected_peers.get_mut(&key) {
+                // Skip the issuing host's own tile(s) entirely — a mute-all
+                // must not mute the host that issued it (#1036).
+                if peer.user_id == except_user_id {
+                    continue;
+                }
+                if peer.force_media_off(audio_off, video_off) {
+                    // Single status broadcast per real change, same as the
+                    // single-target path, to avoid redundant UI churn.
+                    peer.broadcast_peer_status();
                 }
             }
         }
@@ -4704,6 +4866,401 @@ mod tests {
             batch_sink.borrow().len(),
             0,
             "batch callback must not fire when no peers were removed"
+        );
+    }
+
+    // -- #1034: authoritative host-command force-off ----------------------
+
+    /// `force_peer_media_off(video_off)` flips `video_enabled` to false
+    /// **immediately**, even when a video frame was *just* decoded (the
+    /// `last_video_frame_ms` is brand-new and inside the freshness window).
+    ///
+    /// This is the crux of #1034: an off-*heartbeat* in this exact state would
+    /// be SUPPRESSED by `apply_heartbeat_enabled_flag` (the frame is fresh, so
+    /// the guard keeps `enabled = true` for up to `MEDIA_FRESH_WINDOW_MS`),
+    /// causing the ~5s freeze. A host *command* is authoritative and must
+    /// bypass that guard.
+    #[wasm_bindgen_test]
+    fn force_peer_media_off_disables_video_despite_fresh_frame() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(1000);
+        peer.has_received_heartbeat = true;
+        // Peer's video is already on (host hasn't acted yet).
+        peer.video_enabled = true;
+        manager.connected_peers.insert(1000, peer);
+
+        // A video frame arrives "just now": stamps last_video_frame_ms to a
+        // fresh value. This is the precise state in which a stale off-heartbeat
+        // would be blocked by the guard.
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::VIDEO.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    data: vec![0u8; 10],
+                    ..Default::default()
+                },
+                1000,
+            ),
+            "test@test.com",
+        );
+        {
+            let peer = manager.connected_peers.get(&1000).unwrap();
+            assert!(peer.video_enabled, "video frame should enable video");
+            assert!(
+                peer.last_video_frame_ms > 0,
+                "video frame should stamp freshness"
+            );
+        }
+
+        // Authoritative host command: force video off.
+        manager.force_peer_media_off("test@test.com", false, true);
+
+        let peer = manager.connected_peers.get(&1000).unwrap();
+        assert!(
+            !peer.video_enabled,
+            "force_peer_media_off must disable video immediately, bypassing the \
+             freshness guard that would otherwise keep a fresh-frame peer enabled"
+        );
+        // Audio untouched (was never enabled, stays off).
+        assert!(!peer.audio_enabled);
+    }
+
+    /// `force_peer_media_off(audio_off)` mutes immediately and marks the
+    /// audio decoder muted, even with a just-decoded audio frame.
+    #[wasm_bindgen_test]
+    fn force_peer_media_off_disables_audio_despite_fresh_frame() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, muted) = make_test_peer(1001);
+        peer.has_received_heartbeat = true;
+        // Peer's audio is already on (unmuted) before the host acts.
+        peer.audio_enabled = true;
+        muted.set(false);
+        manager.connected_peers.insert(1001, peer);
+
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::AUDIO.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    data: vec![0u8; 10],
+                    ..Default::default()
+                },
+                1001,
+            ),
+            "test@test.com",
+        );
+        {
+            let peer = manager.connected_peers.get(&1001).unwrap();
+            assert!(peer.audio_enabled, "audio frame should enable audio");
+            assert!(peer.last_audio_frame_ms > 0);
+        }
+        assert!(!muted.get(), "audio decoder unmuted after audio frame");
+
+        manager.force_peer_media_off("test@test.com", true, false);
+
+        let peer = manager.connected_peers.get(&1001).unwrap();
+        assert!(
+            !peer.audio_enabled,
+            "force_peer_media_off must mute audio immediately, bypassing freshness"
+        );
+        assert!(
+            muted.get(),
+            "audio decoder must be muted after force-off so no expand/hiss packets play"
+        );
+        // Video untouched.
+        assert!(!peer.video_enabled);
+    }
+
+    /// No permanent latch: after a host force-off, a later legitimate
+    /// `heartbeat = true` with fresh frames re-enables the peer normally. The
+    /// force-off writes the same tracked flags the heartbeat path reads, so an
+    /// affirmative heartbeat recovers (affirmative heartbeats always win).
+    #[wasm_bindgen_test]
+    fn force_peer_media_off_does_not_latch_reenable_recovers() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, muted) = make_test_peer(1002);
+        peer.has_received_heartbeat = true;
+        peer.video_enabled = true;
+        peer.audio_enabled = true;
+        muted.set(false);
+        manager.connected_peers.insert(1002, peer);
+
+        // Host force-off both.
+        manager.force_peer_media_off("test@test.com", true, true);
+        {
+            let peer = manager.connected_peers.get(&1002).unwrap();
+            assert!(!peer.video_enabled);
+            assert!(!peer.audio_enabled);
+            assert!(muted.get(), "audio muted by force-off");
+        }
+
+        // Target re-enables and a heartbeat=true arrives.
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::HEARTBEAT.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    heartbeat_metadata: Some(HeartbeatMetadata {
+                        video_enabled: true,
+                        audio_enabled: true,
+                        screen_enabled: false,
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                },
+                1002,
+            ),
+            "test@test.com",
+        );
+
+        let peer = manager.connected_peers.get(&1002).unwrap();
+        assert!(
+            peer.video_enabled,
+            "an affirmative heartbeat after force-off must re-enable video (no latch)"
+        );
+        assert!(
+            peer.audio_enabled,
+            "an affirmative heartbeat after force-off must re-enable audio (no latch)"
+        );
+        assert!(
+            !muted.get(),
+            "audio decoder must be unmuted again on re-enable"
+        );
+    }
+
+    /// Unknown user_id is a safe no-op: it must not panic, and must not touch
+    /// any existing peer's state.
+    #[wasm_bindgen_test]
+    fn force_peer_media_off_unknown_user_is_noop() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(1003);
+        peer.video_enabled = true;
+        peer.audio_enabled = true;
+        manager.connected_peers.insert(1003, peer);
+
+        manager.force_peer_media_off("nobody@nowhere.com", true, true);
+
+        let peer = manager.connected_peers.get(&1003).unwrap();
+        assert!(
+            peer.video_enabled && peer.audio_enabled,
+            "force-off for an unknown user_id must not alter any peer"
+        );
+    }
+
+    /// Regression guard: the ORDINARY heartbeat path is UNCHANGED. A stale
+    /// `heartbeat = false` within the freshness window must STILL be suppressed
+    /// (the peer stays enabled) — proving #1034's force-off did not weaken the
+    /// `apply_heartbeat_enabled_flag` guard for normal heartbeats.
+    #[wasm_bindgen_test]
+    fn ordinary_stale_heartbeat_still_suppressed_within_fresh_window() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(1004);
+        peer.has_received_heartbeat = true;
+        // Peer's video is already on.
+        peer.video_enabled = true;
+        manager.connected_peers.insert(1004, peer);
+
+        // Fresh video frame stamps freshness (video already enabled).
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::VIDEO.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    data: vec![0u8; 10],
+                    ..Default::default()
+                },
+                1004,
+            ),
+            "test@test.com",
+        );
+        assert!(manager.connected_peers.get(&1004).unwrap().video_enabled);
+
+        // Ordinary stale off-heartbeat arrives within the window. The guard
+        // must KEEP video_enabled = true (this is the WT-race protection that
+        // #1034 must not regress).
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::HEARTBEAT.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    heartbeat_metadata: Some(HeartbeatMetadata {
+                        video_enabled: false,
+                        audio_enabled: false,
+                        screen_enabled: false,
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                },
+                1004,
+            ),
+            "test@test.com",
+        );
+
+        assert!(
+            manager.connected_peers.get(&1004).unwrap().video_enabled,
+            "ordinary stale off-heartbeat within the freshness window must NOT flip a \
+             normal peer — the guard is unchanged by #1034"
+        );
+    }
+
+    // -- #1036: mute-all / disable-all host-excluded force-off ------------
+
+    /// Helper: build a connected peer with a distinct `user_id`, both media
+    /// flags ON, already past the first heartbeat, and a fresh just-decoded
+    /// video+audio frame so the freshness guard would *block* a stale
+    /// off-heartbeat (the exact state #1036's fast path must override).
+    fn insert_fresh_enabled_peer(
+        manager: &mut PeerDecodeManager,
+        session_id: u64,
+        user_id: &str,
+    ) -> Rc<Cell<bool>> {
+        let (mut peer, muted) = make_test_peer(session_id);
+        peer.user_id = user_id.into();
+        peer.has_received_heartbeat = true;
+        peer.video_enabled = true;
+        peer.audio_enabled = true;
+        muted.set(false);
+        manager.connected_peers.insert(session_id, peer);
+
+        // Fresh video + audio frames stamp `last_*_frame_ms` so a stale
+        // off-heartbeat would be suppressed by the freshness guard.
+        for mt in [MediaType::VIDEO, MediaType::AUDIO] {
+            let _ = manager.decode(
+                packet_wrapper(
+                    &MediaPacket {
+                        media_type: mt.into(),
+                        user_id: user_id.as_bytes().to_vec(),
+                        data: vec![0u8; 10],
+                        ..Default::default()
+                    },
+                    session_id,
+                ),
+                user_id,
+            );
+        }
+        muted.set(false);
+        let p = manager.connected_peers.get(&session_id).unwrap();
+        assert!(
+            p.video_enabled && p.audio_enabled,
+            "fresh frames should leave both media flags enabled before the host acts"
+        );
+        muted
+    }
+
+    /// `force_all_peers_media_off_except` forces audio + video OFF for every
+    /// peer EXCEPT the excluded host, **despite fresh frames** (same
+    /// guard-bypass property as `force_peer_media_off`). The excluded host
+    /// peer's `audio_enabled` / `video_enabled` must stay TRUE.
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_excludes_host_despite_fresh_frames() {
+        let mut manager = PeerDecodeManager::new();
+        // Host owns two sessions (multi-tab) under the same user_id — BOTH
+        // must be excluded.
+        let _host_a = insert_fresh_enabled_peer(&mut manager, 2000, "host@hcl");
+        let _host_b = insert_fresh_enabled_peer(&mut manager, 2001, "host@hcl");
+        let alice_muted = insert_fresh_enabled_peer(&mut manager, 2002, "alice@hcl");
+        let bob_muted = insert_fresh_enabled_peer(&mut manager, 2003, "bob@hcl");
+
+        // Mute-all + disable-all in one shot: exclude the host.
+        manager.force_all_peers_media_off_except("host@hcl", true, true);
+
+        // Host's two tiles untouched — a mute-all must NOT mute the issuing
+        // host (the crux of #1036).
+        for sid in [2000u64, 2001u64] {
+            let host = manager.connected_peers.get(&sid).unwrap();
+            assert!(
+                host.audio_enabled && host.video_enabled,
+                "excluded host session {sid} must keep audio+video ON after mute-all"
+            );
+        }
+
+        // Every other peer forced fully off, despite their fresh frames.
+        for sid in [2002u64, 2003u64] {
+            let other = manager.connected_peers.get(&sid).unwrap();
+            assert!(
+                !other.audio_enabled,
+                "non-host peer {sid} audio must be forced off, bypassing freshness"
+            );
+            assert!(
+                !other.video_enabled,
+                "non-host peer {sid} video must be forced off, bypassing freshness"
+            );
+        }
+        assert!(
+            alice_muted.get() && bob_muted.get(),
+            "non-host audio decoders must be muted so no expand/hiss plays after force-off"
+        );
+    }
+
+    /// Audio-only variant (mute-all): only `audio_enabled` is forced off for
+    /// non-host peers; `video_enabled` is left untouched; the host is skipped.
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_audio_only_leaves_video() {
+        let mut manager = PeerDecodeManager::new();
+        let _host = insert_fresh_enabled_peer(&mut manager, 2100, "host@hcl");
+        let _alice = insert_fresh_enabled_peer(&mut manager, 2101, "alice@hcl");
+
+        manager.force_all_peers_media_off_except("host@hcl", true, false);
+
+        let host = manager.connected_peers.get(&2100).unwrap();
+        assert!(
+            host.audio_enabled && host.video_enabled,
+            "host excluded from mute-all"
+        );
+        let alice = manager.connected_peers.get(&2101).unwrap();
+        assert!(!alice.audio_enabled, "alice audio forced off");
+        assert!(alice.video_enabled, "mute-all must NOT touch video_enabled");
+    }
+
+    /// Idempotent / no-op for already-off peers: a peer whose audio+video are
+    /// already off is unchanged, and a re-issued mute-all does not re-flip an
+    /// already-muted peer. (No-op guard mirrors `force_peer_media_off`.)
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_idempotent_for_already_off() {
+        let mut manager = PeerDecodeManager::new();
+
+        // Already-off peer: make_test_peer defaults both flags to false.
+        let (mut already_off, _m) = make_test_peer(2200);
+        already_off.user_id = "alice@hcl".into();
+        already_off.has_received_heartbeat = true;
+        manager.connected_peers.insert(2200, already_off);
+
+        // First call forces it off — but it is already off, so this is a no-op
+        // transition (stays false, no panic).
+        manager.force_all_peers_media_off_except("host@hcl", true, true);
+        {
+            let p = manager.connected_peers.get(&2200).unwrap();
+            assert!(!p.audio_enabled && !p.video_enabled);
+        }
+
+        // Now an enabled peer; force it off, then re-issue — the second call is
+        // a no-op (already off) and must not error or change state.
+        let _bob = insert_fresh_enabled_peer(&mut manager, 2201, "bob@hcl");
+        manager.force_all_peers_media_off_except("host@hcl", true, true);
+        manager.force_all_peers_media_off_except("host@hcl", true, true);
+        let bob = manager.connected_peers.get(&2201).unwrap();
+        assert!(
+            !bob.audio_enabled && !bob.video_enabled,
+            "re-issuing mute-all on an already-off peer is an idempotent no-op"
+        );
+    }
+
+    /// `audio_off == video_off == false` is a safe no-op: nothing changes even
+    /// for non-host peers.
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_no_flags_is_noop() {
+        let mut manager = PeerDecodeManager::new();
+        let _alice = insert_fresh_enabled_peer(&mut manager, 2300, "alice@hcl");
+
+        manager.force_all_peers_media_off_except("host@hcl", false, false);
+
+        let alice = manager.connected_peers.get(&2300).unwrap();
+        assert!(
+            alice.audio_enabled && alice.video_enabled,
+            "force-off with no flags set must not change any peer"
         );
     }
 }
