@@ -34,7 +34,8 @@ window.__APP_CONFIG = ({
   oauthIssuer: "${OAUTH_ISSUER:-}",
   oauthPrompt: "${OAUTH_PROMPT:-}",
   oauthFlow: "${OAUTH_FLOW:-}",
-  mockPeersEnabled: "${MOCK_PEERS_ENABLED:-false}"
+  mockPeersEnabled: "${MOCK_PEERS_ENABLED:-false}",
+  jmapBaseUrl: "${JMAP_BASE_URL:-}"
 });
 EOF
 

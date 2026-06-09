@@ -1,0 +1,119 @@
+# Caddy reverse proxy — LOCAL DEV same-origin edge for the videocall stack + external smatter chat.
+#
+# Purpose: serve the videocall Dioxus UI AND every backend path the browser needs
+# under ONE origin (https://meet.localhost) so:
+#   - the smatter `sse_session` auth cookie (SameSite=Lax; Secure; Path=/sse) is
+#     FIRST-PARTY, and
+#   - the videocall meeting-api session cookie + OAuth redirects are first-party too
+#     (the meeting-api stack is configured for the meet.localhost origin — see
+#     docker-compose.yaml: LOGIN_URL, COOKIE_SECURE, ACTIX_UI_BACKEND_URL=wss://meet.localhost).
+#
+# WHY THIS EXISTS:
+#   The chat client (dioxus-ui/src/jmap_service.rs) talks to smatter, which sets the
+#   SSE auth cookie as `HttpOnly; Secure; SameSite=Lax; Path=/sse`. A SameSite=Lax /
+#   Secure cookie is only sent on FIRST-PARTY (same-origin), HTTPS requests. Putting
+#   the UI, the videocall backend, and smatter all behind one https://meet.localhost
+#   origin makes the cookie first-party and lets the EventSource reconnects stay
+#   authenticated. The same first-party requirement applies to the videocall
+#   meeting-api cookie and the OAuth /login redirect, so those route through here too.
+#
+# CONTAINERIZED EDGE — IN-NETWORK UPSTREAMS:
+#   This Caddyfile runs INSIDE the profile-gated `caddy` service (docker-compose.yaml).
+#   The OTHER videocall services are reached by Docker SERVICE NAME + CONTAINER port
+#   ON THE COMPOSE NETWORK — NOT the host-published ports:
+#     - dioxus-ui     :3002  (UI; TRUNK_SERVE_PORT=DIOXUS_SERVE_PORT, default 3002)
+#     - meeting-api   :8081  (actix meeting-api; LISTEN_ADDR=0.0.0.0:8081 — the host
+#                             8082 publish is irrelevant inside the network)
+#     - websocket-api :8080  (lobby signaling ws; ACTIX_PORT=8080 — the host 8086
+#                             publish is irrelevant inside the network)
+#   smatter is NOT part of this compose (it's a separate HOST process on :8443), so it
+#   is reached via the host gateway as host.docker.internal:8443. The `caddy` service
+#   declares `extra_hosts: ["host.docker.internal:host-gateway"]` for Linux parity.
+#
+# >>> DEVELOPER ACTION REQUIRED <<<
+#   1. Browse https://meet.localhost  (NOT http://localhost:3002) — only the
+#      meet.localhost origin makes the smatter SSE cookie + meeting-api cookie first-party.
+#   2. The EXTERNAL smatter backend must be running on https://127.0.0.1:8443 with
+#      SSE enabled (enable_sse=true). This compose stack does NOT start smatter.
+#   3. On first visit, accept/trust the Caddy local CA (tls internal) so `Secure`
+#      cookies are honored.
+#
+# Upstream hosts are overridable via env so this works whether Caddy runs in the
+# compose network (service names) or directly on the host.
+#   SMATTER_UPSTREAM      — default host.docker.internal:8443 (external smatter chat)
+#   UI_UPSTREAM           — default dioxus-ui:3002      (videocall trunk UI)
+#   MEETING_API_UPSTREAM  — default meeting-api:8081    (videocall meeting-api)
+#   WEBSOCKET_API_UPSTREAM — default websocket-api:8080 (videocall lobby signaling)
+{
+	# Quiet, predictable local-CA https. No public ACME in dev.
+	admin off
+}
+
+meet.localhost {
+	# Local CA → trusted https on *.localhost, so first-party `Secure` cookies work.
+	tls internal
+
+	# ── Chat SSE stream → smatter ──────────────────────────────────────────────
+	# Long-lived EventSource: disable response buffering (flush_interval -1) and
+	# never time out the read side (read_timeout 0). Mirrors the smatter reference
+	# Caddyfile exactly.
+	# tls_insecure_skip_verify is DEV-ONLY (smatter uses a self-signed cert on
+	# :8443). NEVER copy this into any prod/staging config.
+	@sse path /sse /sse/*
+	handle @sse {
+		reverse_proxy https://{$SMATTER_UPSTREAM:host.docker.internal:8443} {
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				tls_insecure_skip_verify
+			}
+		}
+	}
+
+	# ── Chat JMAP RPC → smatter ────────────────────────────────────────────────
+	# Only /jmap* goes to smatter. NOTE the order: this is matched AFTER @sse and
+	# BEFORE @lobby/@api so it can never swallow /lobby or videocall's own paths.
+	# tls_insecure_skip_verify is DEV-ONLY — see note above.
+	@jmap path /jmap*
+	handle @jmap {
+		reverse_proxy https://{$SMATTER_UPSTREAM:host.docker.internal:8443} {
+			transport http {
+				tls_insecure_skip_verify
+			}
+		}
+	}
+
+	# ── Meeting signaling websocket (lobby) → websocket-api ─────────────────────
+	# GET /lobby?token=<JWT> and the deprecated /lobby/{user}/{room} (see
+	# actix-api/src/lobby.rs). Caddy auto-upgrades the WS connection; it is
+	# long-lived, so disable buffering and the read timeout. The browser reaches
+	# this via ACTIX_UI_BACKEND_URL=wss://meet.localhost (docker-compose / .env).
+	@lobby path /lobby /lobby/*
+	handle @lobby {
+		reverse_proxy {$WEBSOCKET_API_UPSTREAM:websocket-api:8080} {
+			flush_interval -1
+			transport http {
+				read_timeout 0
+			}
+		}
+	}
+
+	# ── Videocall backend (meeting-api) → actix ─────────────────────────────────
+	# These are the ONLY real meeting-api paths (matched against meeting-api's
+	# router — meeting-api/src/routes/mod.rs). Everything else (incl. the SPA
+	# /auth/callback PKCE page, /meeting/:id, assets, config.js) must fall through
+	# to the UI handle below. In particular /auth/* is a UI SPA route and is NOT
+	# listed here, so it falls through to the UI.
+	@api path /api/* /login /login/* /logout /logout/* /profile /session /version
+	handle @api {
+		reverse_proxy {$MEETING_API_UPSTREAM:meeting-api:8081}
+	}
+
+	# ── Everything else → videocall trunk UI ───────────────────────────────────
+	# UI bundle, WASM, trunk live-reload websocket, and all SPA routes (/,
+	# /meeting/*, /auth/callback, …). Caddy reverse_proxy transparently upgrades
+	# the trunk live-reload websocket.
+	handle {
+		reverse_proxy {$UI_UPSTREAM:dioxus-ui:3002}
+	}
+}

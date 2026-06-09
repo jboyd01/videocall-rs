@@ -7,6 +7,7 @@ mod console_log_collector;
 mod constants;
 mod context;
 mod id_token;
+mod jmap_service;
 mod local_storage;
 pub mod meeting_api;
 mod pages;
@@ -16,7 +17,6 @@ mod routing;
 mod shared;
 mod theme;
 mod types;
-mod jmap_service;
 mod util;
 
 use crate::components::search_modal::SearchVisibleCtx;

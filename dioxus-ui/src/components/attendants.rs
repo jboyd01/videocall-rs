@@ -24,7 +24,6 @@ use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
-    capability_check::{assess_capability, CapabilityVerdict},
     chat_sidebar::ChatSidebar,
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
@@ -36,8 +35,9 @@ use crate::components::{
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
-        CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
-        MicButton, MockPeersButton, OpenChatButton, PeerListButton, ScreenShareButton,
+        CameraButton, ChatButtonWithBadge, DensityModeButton, DeviceSettingsButton,
+        DiagnosticsButton, HangUpButton, MicButton, MockPeersButton, PeerListButton,
+        ScreenShareButton,
     },
 };
 use crate::console_log_collector::{flush_console_logs, set_console_log_context};
@@ -467,6 +467,8 @@ pub fn AttendantsComponent(
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
     let mut chat_open = use_signal(|| false);
+    // True when a chat message has arrived while the sidebar is closed.
+    let mut chat_has_unread = use_signal(|| false);
     let mut mock_peers_open = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
@@ -4051,17 +4053,11 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
-                                    {
-                                        let mda_chat = mda.clone();
-                                        let _ = mda_chat;
-                                        rsx! {
-                                            OpenChatButton {
-                                                onclick: move |_| {
-                                                    chat_open.set(!chat_open());
-                                                },
-                                            }
-                                        }
-                                    }
+                                    // Reactive read of `chat_has_unread` is
+                                    // scoped INSIDE this child, so flipping the
+                                    // unread flag re-renders only the button, not
+                                    // the whole in-call view.
+                                    ChatButtonWithBadge { chat_has_unread, chat_open }
                                     // (в) Secondary buttons — hidden by default, expand on hover
                                     div { class: "controls-secondary",
                                         if !is_ios() {
@@ -4718,6 +4714,14 @@ pub fn AttendantsComponent(
                     is_show: chat_open(),
                     onclose: move |_| chat_open.set(false),
                     conv_id: id.clone(),
+                    on_new_message: move |_| {
+                        // Event closure — not a reactive render-body read.
+                        // `peek()` keeps it explicitly non-subscribing so the
+                        // badge flip stays scoped to ChatButtonWithBadge.
+                        if !*chat_has_unread.peek() {
+                            chat_has_unread.set(true);
+                        }
+                    },
                 }
         }
     }

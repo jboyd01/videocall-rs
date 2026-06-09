@@ -38,5 +38,11 @@ if (window.__APP_CONFIG) {
 
     // Mock remote participants without a full stack.
     // mockPeersEnabled: "false",
+
+    // Base URL prefix for the JMAP chat endpoints (/jmap, /sse/session, /sse).
+    // Leave empty (the default) for same-origin via the Caddy edge — required
+    // for the first-party SameSite=Lax SSE cookie. Set to an absolute origin
+    // only when chat is served from a different origin.
+    // jmapBaseUrl: "",
   });
 }
