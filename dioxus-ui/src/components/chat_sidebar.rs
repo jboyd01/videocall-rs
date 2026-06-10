@@ -19,7 +19,7 @@ use crate::jmap_service::{
     current_user_id, get_message_changes, get_messages_with_state, get_or_create_conversation,
     send_message, subscribe_chat_sse, SseHandle,
 };
-use chrono::DateTime;
+use chrono::{DateTime, Local, Offset, TimeZone, Utc};
 use dioxus::prelude::*;
 
 /// Distance (in px) from the bottom within which we consider the user "at the
@@ -159,10 +159,47 @@ fn message_text(m: &serde_json::Value) -> String {
     "no content".to_string()
 }
 
+/// Display format shared by every chat timestamp, e.g. `Wednesday, Jan 15 - 1:30 PM`.
+const TIMESTAMP_FORMAT: &str = "%A, %b %-d - %-I:%M %p";
+
+/// Render an instant in a *specific* UTC offset using [`TIMESTAMP_FORMAT`].
+///
+/// This is the pure, timezone-explicit core of [`format_timestamp`]: it takes
+/// the local offset as an argument instead of reading the ambient zone, so its
+/// output is fully determined by its inputs and can be unit-tested without
+/// depending on the test runner's timezone.
+fn format_instant_at_offset(instant: DateTime<Utc>, local_offset: chrono::FixedOffset) -> String {
+    instant
+        .with_timezone(&local_offset)
+        .format(TIMESTAMP_FORMAT)
+        .to_string()
+}
+
+/// Format a server `sentAt` (RFC3339, UTC) for display in the **browser's local
+/// timezone** so the wall-clock time matches what cc7/smatter show.
+///
+/// Runtime mechanism: the input parses to a `DateTime<FixedOffset>` pinned to
+/// the wire offset (`Z` → +00:00), so formatting it directly would render in
+/// UTC. We re-anchor to UTC and convert with `chrono::Local`. On the wasm32
+/// browser target, `chrono::Local` is backed by `js_sys::Date` (chrono's
+/// `wasmbind`/`clock` features — enabled via this crate's chrono dependency),
+/// so the offset reflects the *browser's* zone at runtime, not the build host's.
+///
+/// Note on DST: the offset comes from `Local`/`js_sys::Date` evaluated for the
+/// message's own instant, so each timestamp uses the offset in effect at that
+/// instant — DST-correct for the displayed instant.
+///
+/// Fallbacks preserved: empty input → empty string; unparseable input → raw.
 fn format_timestamp(raw: &str) -> String {
-    DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.format("%A, %b %-d - %-I:%M %p").to_string())
-        .unwrap_or_else(|_| raw.to_string())
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(dt) => {
+            let instant = dt.with_timezone(&Utc);
+            // Offset of the browser's local zone for *this* instant.
+            let local_offset = Local.offset_from_utc_datetime(&instant.naive_utc()).fix();
+            format_instant_at_offset(instant, local_offset)
+        }
+        Err(_) => raw.to_string(),
+    }
 }
 
 // =============================================================================
@@ -927,12 +964,55 @@ mod tests {
     // ──────────────────────── format_timestamp ──────────────────────────
 
     #[test]
-    fn format_timestamp_formats_valid_rfc3339() {
+    fn format_instant_at_offset_renders_in_utc_when_offset_is_zero() {
+        let instant = DateTime::parse_from_rfc3339("2025-01-15T13:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        let out = format_instant_at_offset(instant, utc);
+        // 13:30 UTC at +00:00 → 1:30 PM, Wednesday Jan 15.
+        assert_eq!(out, "Wednesday, Jan 15 - 1:30 PM", "got: {}", out);
+    }
+
+    #[test]
+    fn format_instant_at_offset_converts_to_local_zone() {
+        // US Pacific standard time is UTC-8. 13:30 UTC must render as 5:30 AM
+        // local — NOT 1:30 PM. This is the exact bug the fix addresses: if the
+        // code reverted to rendering in UTC, this assertion would fail, because
+        // the offset would be ignored and the output would read "1:30 PM".
+        let instant = DateTime::parse_from_rfc3339("2025-01-15T13:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let pacific = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
+        let out = format_instant_at_offset(instant, pacific);
+        assert_eq!(out, "Wednesday, Jan 15 - 5:30 AM", "got: {}", out);
+    }
+
+    #[test]
+    fn format_instant_at_offset_rolls_date_back_across_midnight() {
+        // 01:30 UTC at UTC-8 is the previous evening (5:30 PM, Jan 14): proves
+        // the conversion shifts the calendar day, not just the clock time.
+        let instant = DateTime::parse_from_rfc3339("2025-01-15T01:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let pacific = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
+        let out = format_instant_at_offset(instant, pacific);
+        assert_eq!(out, "Tuesday, Jan 14 - 5:30 PM", "got: {}", out);
+    }
+
+    #[test]
+    fn format_timestamp_produces_nonempty_output_for_valid_rfc3339() {
+        // The public entry point reads the *ambient* local zone, so the exact
+        // wall-clock string is runner-dependent and not asserted here (see the
+        // `format_instant_at_offset_*` tests for the deterministic conversion).
+        // We only assert it parses and formats rather than falling back to raw.
         let out = format_timestamp("2025-01-15T13:30:00Z");
-        // Should produce something like "Wednesday, Jan 15 - 1:30 PM" — assert
-        // on stable substrings rather than the exact weekday/timezone string.
-        assert!(out.contains("Jan 15"), "got: {}", out);
-        assert!(out.contains("1:30 PM"), "got: {}", out);
+        assert!(
+            out.contains("Jan 15") || out.contains("Jan 14"),
+            "got: {}",
+            out
+        );
+        assert_ne!(out, "2025-01-15T13:30:00Z", "should not fall back to raw");
     }
 
     #[test]
