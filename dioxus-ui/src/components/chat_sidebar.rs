@@ -421,6 +421,11 @@ pub fn ChatSidebar(
                     // correctly once the token is seeded.
                     if since_state.is_empty() {
                         log::info!("⏳ SSE event before state token seeded; skipping delta");
+                        // Mirror the error-path cleanup below: a coalesced pending
+                        // flag set during this unseeded window must not survive the
+                        // break, or the next SSE event would trigger a spurious
+                        // extra delta-fetch.
+                        delta_pending.set(false);
                         break;
                     }
                     log::info!("📥 Delta-fetching messages since state {}…", since_state);

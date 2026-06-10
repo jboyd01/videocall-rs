@@ -315,6 +315,18 @@ pub async fn get_message_changes(
     extract_message_changes(response, &conv_id)
 }
 
+/// Build the JMAP `bodyValues` payload for a plain-text message: a JSON object
+/// string `{"ops":[{"insert":"<text>\n"}]}` with a trailing newline inside the
+/// inserted text.
+///
+/// Uses serde_json so ALL characters (newlines, tabs, quotes, backslashes,
+/// control chars such as NUL) are escaped correctly. The trailing `"\n"` is
+/// part of the inserted text, matching the prior hand-rolled wire shape
+/// `{"ops":[{"insert":"<text>\n"}]}` for safe (escape-free) inputs.
+fn default_body_values(text_body: &str) -> String {
+    json!({ "ops": [{ "insert": format!("{text_body}\n") }] }).to_string()
+}
+
 pub async fn send_message(
     conv_id: &str,
     text_body: &str,
@@ -327,10 +339,7 @@ pub async fn send_message(
 
     let body_val = match body_values {
         Some(bv) => bv.to_string(),
-        None => {
-            let escaped = text_body.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(r#"{{"ops":[{{"insert":"{}\n"}}]}}"#, escaped)
-        }
+        None => default_body_values(text_body),
     };
 
     let sender_id = current_user_id_from_token(&token).unwrap_or_default();
@@ -840,5 +849,64 @@ mod tests {
             "0".to_string(),
         )]);
         assert!(extract_message_changes(resp, "c1").is_err());
+    }
+
+    // ───────────────────────── default_body_values ──────────────────────
+    //
+    // These tests pin the JSON-escaping contract of `default_body_values`.
+    // The round-trip tests (newline / tab+backslash / NUL) are written to
+    // FAIL against the old hand-rolled `format!`/`replace` implementation,
+    // which only escaped `\` and `"` and emitted raw control characters —
+    // producing JSON that either fails to parse or loses the original bytes.
+
+    /// Parse the body-values string and return the `["ops"][0]["insert"]`
+    /// field. Asserting via parse (not string matching) proves the output is
+    /// valid JSON AND recovers the exact inserted text.
+    fn parsed_insert(body: &str) -> String {
+        let v: serde_json::Value =
+            serde_json::from_str(body).expect("default_body_values must produce valid JSON");
+        v["ops"][0]["insert"]
+            .as_str()
+            .expect("insert must be a string")
+            .to_string()
+    }
+
+    #[test]
+    fn default_body_values_plain_ascii_exact_wire_shape() {
+        // Byte-for-byte equivalence for safe inputs: pins the exact wire shape.
+        assert_eq!(
+            default_body_values("hello"),
+            r#"{"ops":[{"insert":"hello\n"}]}"#
+        );
+    }
+
+    #[test]
+    fn default_body_values_embedded_double_quote_round_trips() {
+        let body = default_body_values(r#"say "hi""#);
+        // Valid JSON + round-trips to the original text plus the trailing "\n".
+        assert_eq!(parsed_insert(&body), "say \"hi\"\n");
+    }
+
+    #[test]
+    fn default_body_values_embedded_newline_is_escaped_not_raw() {
+        // The OLD code emitted a RAW newline here, producing invalid JSON.
+        // `parsed_insert` would panic at `serde_json::from_str` against it.
+        let body = default_body_values("line1\nline2");
+        assert_eq!(parsed_insert(&body), "line1\nline2\n");
+    }
+
+    #[test]
+    fn default_body_values_tab_and_backslash_round_trip() {
+        // OLD code escaped `\` but emitted a RAW tab → invalid JSON.
+        let body = default_body_values("a\tb\\c");
+        assert_eq!(parsed_insert(&body), "a\tb\\c\n");
+    }
+
+    #[test]
+    fn default_body_values_control_char_nul_round_trips() {
+        // OLD code emitted a RAW NUL byte → invalid JSON (control char in a
+        // JSON string must be escaped as  ).
+        let body = default_body_values("a\u{0}b");
+        assert_eq!(parsed_insert(&body), "a\u{0}b\n");
     }
 }
