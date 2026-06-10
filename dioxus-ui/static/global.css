@@ -1420,6 +1420,25 @@ html[data-theme="light"] #invite-overlay p {
   --speaker-value-width: 44px;
   --speaker-preview-column: 260px;
   --speaker-preview-shift-x: 25px;
+
+  /* Chat sidebar — Google-Meet-style surface. Theme-agnostic on purpose: the
+     chat panel keeps a fixed dark Meet palette regardless of the app's
+     light/dark theme, so these tokens live in :root rather than the paired
+     html[data-theme] blocks. Values mirror Google Meet's chat greys/blue. */
+  --chat-surface: #202124;
+  --chat-surface-notice: #2d2e30;
+  --chat-surface-raised: #3c4043;
+  --chat-surface-input-focus: #4a4d50;
+  --chat-text-primary: #e8eaed;
+  --chat-text-secondary: #9aa0a6;
+  --chat-text-muted: #5f6368;
+  --chat-accent: #1a73e8;
+  --chat-accent-hover: #1557b0;
+  --chat-on-accent: #fff;
+  --chat-border: #3c4043;
+  --chat-shadow: rgba(0, 0, 0, 0.4);
+  --chat-error-text: #f28b82;
+  --chat-error-bg: #3c2a2a;
 }
 
 /* Accessibility: high-contrast fallback */

@@ -619,7 +619,7 @@ pub fn MeetingPage(id: String) -> Element {
                             height: "64",
                             view_box: "0 0 24 24",
                             fill: "none",
-                            stroke: "#ff6b6b",
+                            stroke: theme_color::ERROR_ICON,
                             stroke_width: "1.5",
                             circle { cx: "12", cy: "12", r: "10" }
                             line {
@@ -664,7 +664,7 @@ pub fn MeetingPage(id: String) -> Element {
                             height: "64",
                             view_box: "0 0 24 24",
                             fill: "none",
-                            stroke: "#ff9800",
+                            stroke: theme_color::WARNING_ICON,
                             stroke_width: "1.5",
                             circle { cx: "12", cy: "12", r: "10" }
                             line {
@@ -718,7 +718,7 @@ pub fn MeetingPage(id: String) -> Element {
                                 h2 { style: "color: {theme_color::TEXT_PRIMARY}; text-align: center; margin-bottom: 0.5rem;",
                                     "Enter your display name"
                                 }
-                                p { style: "color: rgba(255,255,255,0.6); text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
+                                p { style: "color: {theme_color::TEXT_ON_GLASS_MUTED}; text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
                                     "Choose a name to join the meeting"
                                 }
                                 form {
