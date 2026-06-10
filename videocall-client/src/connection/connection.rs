@@ -451,6 +451,19 @@ impl Connection {
         conn
     }
 
+    /// Build a test connection with an explicit transport type so transport-gated
+    /// logic (e.g. the #1179 local-WT early-seed gate) can be exercised without a
+    /// browser. `new_for_test` defaults to WEBSOCKET.
+    pub(crate) fn new_for_test_with_transport(webtransport: bool) -> Self {
+        let mut conn = Self::new_for_test();
+        conn.transport_type = if webtransport {
+            TransportType::TRANSPORT_WEBTRANSPORT
+        } else {
+            TransportType::TRANSPORT_WEBSOCKET
+        };
+        conn
+    }
+
     pub(crate) fn state_resend_is_pending(&self) -> bool {
         self.state_resend.borrow().is_some()
     }
@@ -458,6 +471,79 @@ impl Connection {
     pub(crate) fn stop_heartbeat_for_test(&mut self) {
         self.stop_heartbeat();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_heartbeat_packet(
+    userid: &str,
+    video_enabled: &AtomicBool,
+    audio_enabled: &AtomicBool,
+    screen_enabled: &AtomicBool,
+    is_speaking: &AtomicBool,
+    aes: &Aes128State,
+    session_id: &RefCell<Option<u64>>,
+    transport_type: TransportType,
+) -> Option<PacketWrapper> {
+    let heartbeat_metadata = HeartbeatMetadata {
+        video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
+        transport_type: ::protobuf::EnumOrUnknown::new(transport_type),
+        special_fields: ::protobuf::SpecialFields::new(),
+    };
+
+    let packet = MediaPacket {
+        media_type: MediaType::HEARTBEAT.into(),
+        user_id: userid.as_bytes().to_vec(),
+        timestamp: js_sys::Date::now(),
+        heartbeat_metadata: Some(heartbeat_metadata).into(),
+        ..Default::default()
+    };
+
+    let data = aes_encrypt_heartbeat(aes, &packet)
+        .map_err(|e| {
+            log::error!("{e}");
+            let _ = videocall_diagnostics::global_sender().try_broadcast(
+                videocall_diagnostics::DiagEvent {
+                    subsystem: "heartbeat",
+                    stream_id: None,
+                    ts_ms: videocall_diagnostics::now_ms(),
+                    metrics: vec![videocall_diagnostics::metric!("encryption_failure", 1u64)],
+                },
+            );
+        })
+        .ok()?;
+    let mut packet_wrapper = PacketWrapper {
+        data,
+        user_id: userid.as_bytes().to_vec(),
+        packet_type: PacketType::MEDIA.into(),
+        ..Default::default()
+    };
+
+    if let Some(sid) = session_id.borrow().as_ref() {
+        packet_wrapper.session_id = *sid;
+    }
+
+    Some(packet_wrapper)
+}
+
+fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, String> {
+    let bytes = packet
+        .write_to_bytes()
+        .map_err(|e| format!("Failed to serialize heartbeat packet: {e}"))?;
+    aes.encrypt(&bytes)
+        .map_err(|e| format!("Failed to encrypt heartbeat packet: {e:?}"))
+}
+
+fn tap_callback<IN: 'static, OUT: 'static>(
+    callback: Callback<IN, OUT>,
+    tap: Callback<()>,
+) -> Callback<IN, OUT> {
+    Callback::from(move |arg| {
+        tap.emit(());
+        callback.emit(arg)
+    })
 }
 
 #[cfg(test)]
@@ -563,77 +649,4 @@ mod tests {
             "periodic keepalive datagram path must not run without start_heartbeat"
         );
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_heartbeat_packet(
-    userid: &str,
-    video_enabled: &AtomicBool,
-    audio_enabled: &AtomicBool,
-    screen_enabled: &AtomicBool,
-    is_speaking: &AtomicBool,
-    aes: &Aes128State,
-    session_id: &RefCell<Option<u64>>,
-    transport_type: TransportType,
-) -> Option<PacketWrapper> {
-    let heartbeat_metadata = HeartbeatMetadata {
-        video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
-        transport_type: ::protobuf::EnumOrUnknown::new(transport_type),
-        special_fields: ::protobuf::SpecialFields::new(),
-    };
-
-    let packet = MediaPacket {
-        media_type: MediaType::HEARTBEAT.into(),
-        user_id: userid.as_bytes().to_vec(),
-        timestamp: js_sys::Date::now(),
-        heartbeat_metadata: Some(heartbeat_metadata).into(),
-        ..Default::default()
-    };
-
-    let data = aes_encrypt_heartbeat(aes, &packet)
-        .map_err(|e| {
-            log::error!("{e}");
-            let _ = videocall_diagnostics::global_sender().try_broadcast(
-                videocall_diagnostics::DiagEvent {
-                    subsystem: "heartbeat",
-                    stream_id: None,
-                    ts_ms: videocall_diagnostics::now_ms(),
-                    metrics: vec![videocall_diagnostics::metric!("encryption_failure", 1u64)],
-                },
-            );
-        })
-        .ok()?;
-    let mut packet_wrapper = PacketWrapper {
-        data,
-        user_id: userid.as_bytes().to_vec(),
-        packet_type: PacketType::MEDIA.into(),
-        ..Default::default()
-    };
-
-    if let Some(sid) = session_id.borrow().as_ref() {
-        packet_wrapper.session_id = *sid;
-    }
-
-    Some(packet_wrapper)
-}
-
-fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, String> {
-    let bytes = packet
-        .write_to_bytes()
-        .map_err(|e| format!("Failed to serialize heartbeat packet: {e}"))?;
-    aes.encrypt(&bytes)
-        .map_err(|e| format!("Failed to encrypt heartbeat packet: {e:?}"))
-}
-
-fn tap_callback<IN: 'static, OUT: 'static>(
-    callback: Callback<IN, OUT>,
-    tap: Callback<()>,
-) -> Callback<IN, OUT> {
-    Callback::from(move |arg| {
-        tap.emit(());
-        callback.emit(arg)
-    })
 }
