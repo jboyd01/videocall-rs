@@ -1,4 +1,48 @@
 services:
+  # LOCAL DEV same-origin edge. Serves the videocall UI and proxies ONLY the
+  # external smatter chat paths (/jmap*, /sse*) under one origin so the smatter
+  # SSE auth cookie (SameSite=Lax; Secure; Path=/sse) is first-party.
+  #
+  # >>> Browse https://meet.localhost (NOT http://localhost:${DIOXUS_SERVE_PORT}) for chat SSE
+  # to work. The external smatter backend must be running on https://127.0.0.1:8443
+  # with enable_sse=true — this stack does NOT start smatter. See docker/Caddyfile.
+  caddy:
+    image: caddy:2
+    # Profile-gated so a normal `docker compose up` / `make up` does NOT start it:
+    # in the combined smatter+videocall dev topology a separately-running host
+    # Caddy already owns :443, and two processes cannot bind the same port. Start
+    # this containerized edge explicitly with `--profile edge` only when you want
+    # it instead of the host Caddy.
+    profiles: ["edge"]
+    ports:
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      # External smatter chat backend (host :8443), reached from this container
+      # via the host gateway. Override if smatter listens elsewhere.
+      - SMATTER_UPSTREAM=${SMATTER_UPSTREAM:-host.docker.internal:8443}
+      # videocall app services — reached by Docker SERVICE NAME + CONTAINER port
+      # on the shared compose network (NOT the host-published ports). dioxus-ui
+      # listens on TRUNK_SERVE_PORT (=DIOXUS_SERVE_PORT), meeting-api on its
+      # LISTEN_ADDR :8081, websocket-api on ACTIX_PORT :8080.
+      - UI_UPSTREAM=${UI_UPSTREAM:-dioxus-ui:${DIOXUS_SERVE_PORT:-3001}}
+      - MEETING_API_UPSTREAM=${MEETING_API_UPSTREAM:-meeting-api:8081}
+      - WEBSOCKET_API_UPSTREAM=${WEBSOCKET_API_UPSTREAM:-websocket-api:${ACTIX_PORT:-8080}}
+    extra_hosts:
+      # Lets the container reach the HOST smatter backend (:8443) via the gateway.
+      # App services are reached by service name, not through this.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - dioxus-ui
+      - meeting-api
+      - websocket-api
+
   dioxus-ui:
     volumes:
       - type: bind
@@ -21,8 +65,11 @@ services:
       - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
       - TRUNK_SERVE_PORT=${DIOXUS_SERVE_PORT:-3001}
       - ENABLE_OAUTH=${ENABLE_OAUTH:-false}
+      # Same-origin through the meet.localhost edge so browser API calls AND the
+      # server-side /login redirect are first-party. login_url() in the UI is
+      # derived from this (meeting_api_base_url + "/login").
       - API_BASE_URL=${API_BASE_URL:-http://localhost:8081}
-      - LOGIN_URL=http://localhost:8081/login
+      - LOGIN_URL=${LOGIN_URL:-https://meet.localhost/login}
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
       - RUST_BACKTRACE=1
       - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
@@ -30,17 +77,30 @@ services:
       - FIREFOX_ENABLED=${FIREFOX_ENABLED:-false}
       - USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM:-}
       - CARGO_TARGET_DIR=/app/dioxus-ui/target
-      - CARGO_INCREMENTAL=1
+      - CARGO_INCREMENTAL=0
+      - CARGO_PROFILE_DEV_DEBUG=false
+      - CARGO_PROFILE_RELEASE_DEBUG=false
       - CARGO_NET_OFFLINE=false
       - OAUTH_PROVIDER=${OAUTH_PROVIDER:-google}
       - UI_URL=${UI_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+      # Browser-facing identity endpoints (the browser trusts the host Caddy CA).
       - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-}
       - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
       - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}/auth/callback}
       - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
-      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-}
-      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      # IMPORTANT: never expose a backend-only http://host.docker.internal token
+      # URL to the browser. Stays empty in BOTH flows: the server-side flow does the
+      # exchange in meeting-api; the PKCE flow discovers the token endpoint from the
+      # issuer in-browser. Pinned empty so it can never inherit a backend value.
+      - OAUTH_TOKEN_URL=
+      # Browser-facing issuer, consumed by the PKCE callback page (reached when
+      # OAUTH_FLOW=pkce, as the local .env sets). Safe + browser-reachable.
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-https://id.localhost}
       - OAUTH_PROMPT=${OAUTH_PROMPT:-}
+      # Default (unset) ⇒ is_pkce_flow()==false ⇒ server-side confidential flow
+      # (UI redirects to meeting-api /login; cookie auth). Set OAUTH_FLOW=pkce in
+      # .env for browser PKCE (public client) — required for chat's id_token Bearer.
+      - OAUTH_FLOW=${OAUTH_FLOW:-}
       - MOCK_PEERS_ENABLED=${MOCK_PEERS_ENABLED:-false}
     ports:
       - "${DIOXUS_SERVE_PORT:-3001}:${DIOXUS_SERVE_PORT:-3001}"
@@ -91,17 +151,31 @@ services:
       # Production callers can still override via the env-var path.
       - TOKEN_TTL_SECS=${TOKEN_TTL_SECS:-86400}
       - SESSION_TTL_SECS=${SESSION_TTL_SECS:-315360000}
-      - COOKIE_SECURE=false
+      # LOCAL DEV: cookies ride https://meet.localhost (same-origin edge) → Secure.
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
       - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
       - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-}
       - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
       - OAUTH_SECRET=${OAUTH_CLIENT_SECRET:-}
       - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:8081/login/callback}
+      # OAUTH_ISSUER intentionally left UNSET for the local id.localhost stack:
+      # setting it makes meeting-api run a FATAL OIDC discovery fetch against the
+      # issuer at startup (main.rs: resolve_discovery().expect(...)), but the
+      # issuer https://id.localhost is unreachable from inside this container and
+      # the http://host.docker.internal:8081 discovery doc advertises only
+      # https://id.localhost endpoints. We supply explicit container-reachable
+      # URLs below instead. Trade-off: the id_token `iss` claim is not pinned
+      # (signature/aud/exp still verified via JWKS). LOCAL DEV ONLY.
       - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      # Browser-facing (meeting-api builds the authorize redirect the BROWSER
+      # follows): https://id.localhost is reachable+trusted by the browser.
       - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-}
-      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-}
-      - OAUTH_JWKS_URL=${OAUTH_JWKS_URL:-}
-      - OAUTH_USERINFO_URL=${OAUTH_USERINFO_URL:-}
+      # Backend-facing (container → identity over plain HTTP via host gateway).
+      # These MUST stay container-reachable; do NOT point them at id.localhost.
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-http://host.docker.internal:8081/oauth/token}
+      - OAUTH_JWKS_URL=${OAUTH_JWKS_URL:-http://host.docker.internal:8081/.well-known/jwks.json}
+      - OAUTH_USERINFO_URL=${OAUTH_USERINFO_URL:-http://host.docker.internal:8081/oauth/userinfo}
+      # Browser-facing RP-initiated logout endpoint.
       - OAUTH_END_SESSION_URL=${OAUTH_END_SESSION_URL:-}
       - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
       - AFTER_LOGIN_URL=${AFTER_LOGIN_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
@@ -116,10 +190,19 @@ services:
       - DEV_USER=${DEV_USER:-dev@local.test:Dev User}
       - RUST_LOG=debug
       - CARGO_TARGET_DIR=/app/meeting-api/target
-      - CARGO_INCREMENTAL=1
+      - CARGO_INCREMENTAL=0
+      - CARGO_PROFILE_DEV_DEBUG=false
+      - CARGO_PROFILE_RELEASE_DEBUG=false
       - CARGO_NET_OFFLINE=false
+    extra_hosts:
+      # Lets this container reach the HOST identity service (plain HTTP :8081)
+      # for backend OAuth token/JWKS/userinfo calls via host.docker.internal.
+      - "host.docker.internal:host-gateway"
     ports:
-      - "8081:8081"
+      # Host identity service already owns :8081 — publish meeting-api on host
+      # 8082 (container still listens on 8081 via LISTEN_ADDR). The browser never
+      # hits this directly in the local stack; it goes through https://meet.localhost.
+      - "8082:8081"
     volumes:
       - type: bind
         source: ../
@@ -139,11 +222,11 @@ services:
     working_dir: /app/actix-api
     command: >
       nix develop /app#backend-dev --command bash -c
-      "cargo watch -x 'run -r --bin websocket_server'"
+      "cargo watch -x 'run --bin websocket_server'"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - ACTIX_PORT=${ACTIX_PORT:-8080}
-      - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:3001}
+      - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
       - DATABASE_ENABLED=false
       - RUST_LOG=debug,async_nats=info
       - NATS_URL=nats:4222
@@ -151,7 +234,9 @@ services:
       - SERVER_ID=${SERVER_ID:-server-1}
       - SERVICE_TYPE=websocket
       - CARGO_TARGET_DIR=/app/actix-api/target
-      - CARGO_INCREMENTAL=1
+      - CARGO_INCREMENTAL=0
+      - CARGO_PROFILE_DEV_DEBUG=false
+      - CARGO_PROFILE_RELEASE_DEBUG=false
       - CARGO_NET_OFFLINE=false
       - LOGIN_URL=""
       - ACTIX_UI_BACKEND_URL=""
@@ -159,7 +244,10 @@ services:
       - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
       - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
     ports:
-      - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
+      # Host 8086 → container 8080. Host :8080 is left for cc7's `dx serve`
+      # (smatter's chat.localhost edge expects cc7 there); they collide otherwise.
+      # The meet.localhost Caddy /lobby route proxies to 127.0.0.1:8086.
+      - "8086:${ACTIX_PORT:-8080}"
     volumes:
       - type: bind
         source: ../
@@ -388,3 +476,5 @@ volumes:
   rustlemania-bot-cache:
   prometheus_data:
   grafana_data:
+  caddy_data:
+  caddy_config:

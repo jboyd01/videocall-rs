@@ -1,0 +1,10 @@
+host: prometheus.videocall.fnxlabs.com
+serviceName: prometheus-server
+servicePort: 80
+# Reuse the existing namespace wildcard cert (*.videocall.fnxlabs.com), which
+# already covers this host — no dedicated cert-manager issuance required. The
+# sibling pushgateway-ingress mints its own cert via `issuer`; this one shares
+# the wildcard instead. If the wildcard is ever retired, switch to a dedicated
+# cert by setting `issuer: letsencrypt-prod` and a unique `tlsSecretName`, and
+# add the matching cert-manager.io/issuer annotation in templates/ingress.yaml.
+tlsSecretName: videocall-wildcard-tls
