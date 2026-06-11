@@ -7988,6 +7988,7 @@ html[data-theme="light"] .settings-divider {
   z-index: 200;
   box-shadow: -2px 0 10px var(--chat-shadow);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overflow: hidden;
 }
 
 #chat-sidebar.visible {
@@ -8008,8 +8009,17 @@ html[data-theme="light"] .settings-divider {
 }
 
 /* Message list */
+.chat-messages-container {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
 .chat-messages {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 16px;
   display: flex;
@@ -8105,6 +8115,7 @@ html[data-theme="light"] .settings-divider {
 
 /* Input area */
 .chat-input-area {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 8px;

@@ -649,14 +649,16 @@ pub fn ChatSidebar(
                     },
                     if is_loading() {
                         div { class: "chat-loading", "Loading messages…" }
-                    } else if let Some(err) = load_error() {
-                        div { class: "chat-error",
-                            "Failed to load messages: "
-                            span { "{err}" }
-                        }
-                    } else if messages().is_empty() {
-                        div { class: "chat-empty", "No messages yet. Be the first to say something!" }
                     } else {
+                        if let Some(err) = load_error() {
+                            div { class: "chat-error",
+                                "Failed to load messages: "
+                                span { "{err}" }
+                            }
+                        }
+                        if messages().is_empty() && load_error().is_none() {
+                            div { class: "chat-empty", "No messages yet. Be the first to say something!" }
+                        }
                         for msg in messages().iter() {
                             {
                                 let msg = msg.clone();
