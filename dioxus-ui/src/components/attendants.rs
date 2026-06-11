@@ -25,6 +25,7 @@ use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
+    chat_sidebar::ChatSidebar,
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
@@ -36,8 +37,9 @@ use crate::components::{
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
-        CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
-        MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
+        CameraButton, ChatButtonWithBadge, DensityModeButton, DeviceSettingsButton,
+        DiagnosticsButton, HangUpButton, MicButton, MockPeersButton, PeerListButton,
+        ScreenShareButton,
     },
 };
 use crate::console_log_collector::{flush_console_logs, set_console_log_context};
@@ -466,6 +468,9 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut chat_open = use_signal(|| false);
+    // True when a chat message has arrived while the sidebar is closed.
+    let mut chat_has_unread = use_signal(|| false);
     let mut mock_peers_open = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
@@ -3466,6 +3471,7 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
+            style:"display:flex;gap:0.5rem",
             div { id: "main-container", class: "meeting-page",
                 onclick: move |_| {
                     dock_menu_open.set(false);
@@ -4048,6 +4054,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+
                                     // Primary: Camera button - always visible
                                     {
                                         let mda_cam = mda.clone();
@@ -4082,6 +4089,11 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+                                    // Reactive read of `chat_has_unread` is
+                                    // scoped INSIDE this child, so flipping the
+                                    // unread flag re-renders only the button, not
+                                    // the whole in-call view.
+                                    ChatButtonWithBadge { chat_has_unread, chat_open }
                                     // (в) Secondary buttons — hidden by default, expand on hover
                                     div { class: "controls-secondary",
                                         if !is_ios() {
@@ -4618,6 +4630,9 @@ pub fn AttendantsComponent(
                     }
                 }
 
+
+
+
                 // Waiting room controls (host or admitted participants when allowed)
                 if is_owner || admitted_can_admit_toggle() {
                     HostControls {
@@ -4754,6 +4769,20 @@ pub fn AttendantsComponent(
                     }
                 }
             }
+            // Chat sidebar
+                ChatSidebar {
+                    is_show: chat_open(),
+                    onclose: move |_| chat_open.set(false),
+                    conv_id: id.clone(),
+                    on_new_message: move |_| {
+                        // Event closure — not a reactive render-body read.
+                        // `peek()` keeps it explicitly non-subscribing so the
+                        // badge flip stays scoped to ChatButtonWithBadge.
+                        if !*chat_has_unread.peek() {
+                            chat_has_unread.set(true);
+                        }
+                    },
+                }
         }
     }
 }

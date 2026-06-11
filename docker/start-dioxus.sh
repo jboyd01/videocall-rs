@@ -38,6 +38,8 @@ if (window.__APP_CONFIG) {
   oauthTokenUrl: "${OAUTH_TOKEN_URL:-}",
   oauthIssuer: "${OAUTH_ISSUER:-}",
   oauthPrompt: "${OAUTH_PROMPT:-}",
+  oauthFlow: "${OAUTH_FLOW:-}",
+  jmapBaseUrl: "${JMAP_BASE_URL:-}",
   searchApiBaseUrl: ${SEARCH_API_BASE_URL_CONFIG},
   mockPeersEnabled: "${MOCK_PEERS_ENABLED:-false}"
   });
