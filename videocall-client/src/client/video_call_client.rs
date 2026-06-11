@@ -440,6 +440,13 @@ struct Inner {
     /// The camera encoder's diagnostics loop checks this flag and calls
     /// `force_video_step_down()` on the `EncoderBitrateController`.
     congestion_step_down_requested: Arc<AtomicBool>,
+    /// Mirror of `congestion_step_down_requested` for the SCREEN encoder (issue
+    /// #1199). A SEPARATE flag (not the same atom) because each encoder's AQ
+    /// loop consumes its flag with `swap(false)`: a single shared flag would
+    /// race so only one loop ever observed a given CONGESTION signal. A
+    /// self-targeted CONGESTION sets BOTH so both publishers step down. Like the
+    /// split `force_camera_keyframe` / `force_screen_keyframe` flags above.
+    screen_congestion_step_down_requested: Arc<AtomicBool>,
     /// Signal set by `ConnectionManager` when a re-election completes. The
     /// camera encoder reads and clears this to suppress crash ceiling arming.
     reelection_completed_signal: Rc<AtomicBool>,
@@ -872,6 +879,7 @@ impl VideoCallClient {
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+        let screen_congestion_step_down_requested = Arc::new(AtomicBool::new(false));
         let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
         // Phase 8a / TELEM-1: register a Long Tasks API observer once per
@@ -944,6 +952,8 @@ impl VideoCallClient {
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
+                screen_congestion_step_down_requested: screen_congestion_step_down_requested
+                    .clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
                 // Relay layer-union hint atoms (issue #1108, Stage 3). None until
                 // the host wires in the camera/screen encoder accessors; the
@@ -1569,13 +1579,18 @@ impl VideoCallClient {
     ///
     /// The relay never echoes the local publisher's own packets and the local
     /// session is never inserted into the peer decode manager, so this is the
-    /// count of OTHERS, not including self. A momentarily-busy `inner` borrow
-    /// returns `0` (same fail-safe as `sorted_peer_keys`), which the caller treats
-    /// as "no remote peers this tick" and self-corrects on the next read.
-    pub fn peer_count(&self) -> usize {
+    /// count of OTHERS, not including self.
+    ///
+    /// Returns `None` on a momentarily-busy `inner` borrow (issue #1172). A
+    /// borrow-fail is NOT zero peers — callers that make a quality decision on
+    /// the count (e.g. the camera AQ single-layer pin) must treat `None` as "no
+    /// reading this tick" and HOLD their prior state, not collapse to 0 peers
+    /// and release a pin. Callers that only need a best-effort count can use
+    /// `.unwrap_or(0)` to preserve the historical fail-to-zero behavior.
+    pub fn peer_count(&self) -> Option<usize> {
         match self.inner.try_borrow() {
-            Ok(inner) => inner.peer_decode_manager.sorted_string_keys().len(),
-            Err(_) => 0,
+            Ok(inner) => Some(inner.peer_decode_manager.sorted_string_keys().len()),
+            Err(_) => None,
         }
     }
 
@@ -1845,6 +1860,21 @@ impl VideoCallClient {
         self.inner.borrow().congestion_step_down_requested.clone()
     }
 
+    /// Returns a shared reference to the SCREEN congestion step-down flag
+    /// (issue #1199).
+    ///
+    /// Pass this to `ScreenEncoder` so that incoming CONGESTION signals from the
+    /// server also trigger an immediate quality cut on the screen publisher.
+    /// This is a SEPARATE atom from [`congestion_step_down_flag`](Self::congestion_step_down_flag)
+    /// so the camera and screen AQ loops can each `swap(false)` their own flag
+    /// without racing; the CONGESTION dispatch sets BOTH.
+    pub fn screen_congestion_step_down_flag(&self) -> Arc<AtomicBool> {
+        self.inner
+            .borrow()
+            .screen_congestion_step_down_requested
+            .clone()
+    }
+
     /// Returns a shared reference to the re-election completed signal.
     ///
     /// Pass this to `CameraEncoder` so that re-election events reach the
@@ -1899,9 +1929,7 @@ impl VideoCallClient {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &self,
-        fps_ratio: Rc<AtomicU32>,
         p75_peer_fps: Rc<AtomicU32>,
-        bitrate_ratio: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -1917,9 +1945,7 @@ impl VideoCallClient {
             if let Some(hr) = &inner.health_reporter {
                 if let Ok(mut reporter) = hr.try_borrow_mut() {
                     reporter.set_encoder_metric_sources(
-                        fps_ratio,
                         p75_peer_fps,
-                        bitrate_ratio,
                         target_bitrate_kbps,
                         screen_tier,
                         screen_active,
@@ -3121,7 +3147,16 @@ impl Inner {
                         "Received CONGESTION signal targeting us (session: {}), requesting quality step-down",
                         response.session_id,
                     );
+                    // Set BOTH the camera and screen step-down flags (issue
+                    // #1199). The CONGESTION signal targets a SESSION, not a
+                    // media-kind — the relay is dropping our outbound packets
+                    // regardless of which stream they belong to — so every live
+                    // publisher must back off. Separate flags (not one shared
+                    // atom) so each encoder's AQ loop consumes its own with
+                    // `swap(false)` and they never race.
                     self.congestion_step_down_requested
+                        .store(true, Ordering::Release);
+                    self.screen_congestion_step_down_requested
                         .store(true, Ordering::Release);
                 } else {
                     debug!(
