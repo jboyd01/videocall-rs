@@ -528,17 +528,17 @@ pub fn is_sse_auth_failure(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Maximum number of consecutive token-refresh + SSE re-establish attempts
-/// before the chat gives up and surfaces a "disconnected" state. This is the
-/// loop cap that stops `token_expired` from turning into an unbounded refresh
-/// storm: a refresh that keeps failing must TERMINATE, not move the 3s reconnect
-/// loop onto the token endpoint. The budget is reset to zero ONLY after a
-/// reopened stream survives a probation window WITHOUT re-establishing (see the
-/// probation logic in `chat_sidebar`), NOT on a bare successful reopen — a server
-/// that re-emits `token_expired` on every reopen must still climb to this cap and
-/// give up, instead of resetting the budget on each doomed reopen and looping
-/// forever. A genuinely transient expiry hours later gets the full budget again
-/// once the healthy stream survives probation.
+/// Maximum number of consecutive token-refresh + SSE re-establish attempts in a
+/// single reconnect storm before the chat gives up and surfaces a "disconnected"
+/// state. This is the loop cap that stops `token_expired` from turning one storm
+/// into an unbounded refresh loop: a refresh that keeps failing must TERMINATE,
+/// not move the 3s reconnect loop onto the token endpoint. The budget is reset
+/// to zero ONLY after a reopened stream survives a probation window WITHOUT
+/// re-establishing (see the probation logic in `chat_sidebar`), NOT on a bare
+/// successful reopen — a server that re-emits `token_expired` on every reopen
+/// must still climb to this cap and give up, instead of resetting the budget on
+/// each doomed reopen and looping forever. A genuinely transient expiry hours
+/// later gets the full budget again once the healthy stream survives probation.
 pub const SSE_MAX_REESTABLISH_ATTEMPTS: u32 = 4;
 
 /// What the chat SSE re-establish loop should do for a given attempt number.

@@ -133,12 +133,12 @@ fn probation_reset_allowed(armed_at: u32, current: u32) -> bool {
 }
 
 /// Sample the additive retry jitter (ms) for ONE re-establish attempt. Spread is
-/// `0..SSE_REESTABLISH_BASE_MS / 2` (~0–375ms), drawn from `js_sys::Math::random()`
+/// `0..SSE_REESTABLISH_BASE_MS` (~0–750ms), drawn from `js_sys::Math::random()`
 /// on the browser target. Kept OUT of `next_reestablish_action` so that pure fn
 /// stays deterministic and host-testable; only this thin sampler touches the RNG.
 #[cfg(target_arch = "wasm32")]
 fn sse_retry_jitter_ms() -> u32 {
-    let span = (SSE_REESTABLISH_BASE_MS / 2) as f64;
+    let span = SSE_REESTABLISH_BASE_MS as f64;
     // `Math::random()` is [0, 1); scaling by `span` keeps the result in
     // `[0, span)`, so `as u32` truncates to `0..=span-1` — never negative.
     (js_sys::Math::random() * span) as u32
@@ -477,7 +477,152 @@ pub fn ChatSidebar(
     // The probation timer captures the generation at arm time and resets the
     // budget only if it is still current when the timer fires (no reopen
     // happened during probation → the stream is healthy).
-    let sse_connection_generation = use_signal(|| 0u32);
+    let mut sse_connection_generation = use_signal(|| 0u32);
+
+    // Spawn a bounded re-establish wave. This helper owns the retry/backoff
+    // loop so a failed reopen (`subscribe_chat_sse` returning `Err`) can stay in
+    // the same charged wave and keep retrying until the budget is exhausted.
+    struct ReestablishContext<F, C>
+    where
+        F: Fn() -> C + Copy + 'static,
+        C: Fn(String) + 'static,
+    {
+        cid: String,
+        sse_handle: Signal<Option<SseHandle>>,
+        sse_reestablishing: Signal<bool>,
+        sse_reestablish_attempts: Signal<u32>,
+        sse_connection_generation: Signal<u32>,
+        load_error: Signal<Option<String>>,
+        connection_lost: Signal<bool>,
+        make_on_change: F,
+    }
+
+    fn spawn_reestablish_wave<F, C>(ctx: ReestablishContext<F, C>)
+    where
+        F: Fn() -> C + Copy + 'static,
+        C: Fn(String) + 'static,
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            reestablish_chat_sse(ctx).await;
+        });
+    }
+
+    async fn reestablish_chat_sse<F, C>(ctx: ReestablishContext<F, C>)
+    where
+        F: Fn() -> C + Copy + 'static,
+        C: Fn(String) + 'static,
+    {
+        let ReestablishContext {
+            cid,
+            sse_handle,
+            sse_reestablishing,
+            sse_reestablish_attempts,
+            sse_connection_generation,
+            load_error,
+            connection_lost,
+            make_on_change,
+        } = ctx;
+
+        let mut sse_handle = sse_handle;
+        let mut sse_reestablishing = sse_reestablishing;
+        let mut sse_reestablish_attempts = sse_reestablish_attempts;
+        let mut sse_connection_generation = sse_connection_generation;
+        let mut load_error = load_error;
+        let mut connection_lost = connection_lost;
+
+        if *sse_reestablishing.peek() {
+            return;
+        }
+        sse_reestablishing.set(true);
+        sse_handle.set(None);
+
+        loop {
+            let attempt = *sse_reestablish_attempts.peek();
+            let jitter_ms = sse_retry_jitter_ms();
+            match next_reestablish_action(attempt, SSE_MAX_REESTABLISH_ATTEMPTS, jitter_ms) {
+                ReestablishAction::GiveUp => {
+                    log::error!(
+                        "🔌 Chat SSE re-establish gave up after {} attempts; chat disconnected",
+                        SSE_MAX_REESTABLISH_ATTEMPTS
+                    );
+                    connection_lost.set(true);
+                    sse_reestablishing.set(false);
+                    break;
+                }
+                ReestablishAction::Retry { delay_ms } => {
+                    gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+
+                    if crate::meeting_api::refresh_token_single_flight()
+                        .await
+                        .is_err()
+                    {
+                        log::warn!(
+                            "🔐 SSE token refresh failed (attempt {}); will retry within budget",
+                            attempt + 1
+                        );
+                        sse_reestablish_attempts.set(attempt + 1);
+                        continue;
+                    }
+
+                    // Charge this attempt before reopening. A reopen that
+                    // succeeds and then re-fails before probation survives must
+                    // still advance the budget toward GiveUp.
+                    sse_reestablish_attempts.set(attempt + 1);
+
+                    let on_auth_failure = {
+                        let cid_for_auth = cid.clone();
+                        move || {
+                            spawn_reestablish_wave(ReestablishContext {
+                                cid: cid_for_auth.clone(),
+                                sse_handle,
+                                sse_reestablishing,
+                                sse_reestablish_attempts,
+                                sse_connection_generation,
+                                load_error,
+                                connection_lost,
+                                make_on_change,
+                            });
+                        }
+                    };
+
+                    match subscribe_chat_sse(cid.clone(), make_on_change(), on_auth_failure).await {
+                        Ok(h) => {
+                            sse_handle.set(Some(h));
+                            let armed_gen = sse_connection_generation.peek().wrapping_add(1);
+                            sse_connection_generation.set(armed_gen);
+                            sse_reestablishing.set(false);
+                            if connection_lost() {
+                                connection_lost.set(false);
+                            }
+                            if load_error.peek().is_some() {
+                                load_error.set(None);
+                            }
+                            let mut sse_reestablish_attempts = sse_reestablish_attempts;
+                            wasm_bindgen_futures::spawn_local(async move {
+                                gloo_timers::future::TimeoutFuture::new(SSE_HEALTHY_RESET_MS).await;
+                                let current = *sse_connection_generation.peek();
+                                if probation_reset_allowed(armed_gen, current) {
+                                    log::info!(
+                                        "✅ Chat SSE survived probation ({}ms); resetting retry budget",
+                                        SSE_HEALTHY_RESET_MS
+                                    );
+                                    sse_reestablish_attempts.set(0);
+                                }
+                            });
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!("⚠️ Failed to open SSE: {e}");
+                            // Re-drive the same charged wave. There is no live
+                            // EventSource here, so the failed reopen itself must
+                            // keep the bounded retry loop going until GiveUp.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     use_effect(move || {
         let Some(cid) = resolved_conv_id() else {
@@ -627,257 +772,68 @@ pub fn ChatSidebar(
             }
         };
 
-        // ── Re-establishable SSE driver ─────────────────────────────────────
-        // `establish` opens (or re-opens) the EventSource, wiring a fresh
-        // `on_change` and a fresh `on_auth_failure`. It is an `Rc<dyn Fn()>` so
-        // the auth-failure handler can clone it and re-invoke it after a token
-        // refresh, forming the bounded re-establish loop WITHOUT recursion in
-        // the type system (the closure does not need to name itself).
-        //
-        // Copy these `Copy` signals into the driver's environment once. The
-        // attempt/generation signals are re-bound `mut` in the inner scopes that
-        // actually `.set()` them (the microtask's `Ok`/`Err` arms and the
-        // probation task), so they are immutable here.
         let mut sse_handle = sse_handle;
-        let mut sse_reestablishing = sse_reestablishing;
-        let sse_reestablish_attempts = sse_reestablish_attempts;
-        let sse_connection_generation = sse_connection_generation;
         let mut load_error = load_error;
-        // Reopen the EventSource for a conversation id. Boxed so the auth-failure
-        // handler can hold a clone and re-invoke it after a token refresh.
-        type EstablishFn = std::rc::Rc<dyn Fn(String)>;
-        let establish: EstablishFn = {
-            // `establish_slot` lets the closure refer to itself for the
-            // re-establish-after-refresh recursion. Filled in immediately below.
-            let establish_slot: std::rc::Rc<std::cell::RefCell<Option<EstablishFn>>> =
-                std::rc::Rc::new(std::cell::RefCell::new(None));
-            let establish_slot_for_body = establish_slot.clone();
-            let me: EstablishFn = std::rc::Rc::new(move |cid: String| {
-                let on_change = make_on_change();
-                let establish_slot_for_auth = establish_slot_for_body.clone();
-                let cid_for_auth = cid.clone();
-                // `on_auth_failure`: invoked from the SSE on_message closure when
-                // an in-band `token_expired` frame arrives. It must:
-                //   1. Stop the futile native reconnect (drop the handle → close
-                //      the EventSource so the browser stops reconnecting with the
-                //      dead cookie).
-                //   2. Refresh the OAuth token (single-flight, coalesced with the
-                //      meeting path).
-                //   3. Re-open the EventSource with the fresh cookie.
-                // All under a single-flight latch + bounded backoff so a refresh
-                // that keeps failing TERMINATES instead of hot-looping.
-                let on_auth_failure = move || {
-                    // Cheap early-out (an optimisation, NOT the authoritative
-                    // guard): if a re-establish loop is already latched, ignore
-                    // this duplicate `token_expired`. The AUTHORITATIVE
-                    // single-flight check is re-done on the spawned microtask
-                    // below — a burst arriving in one event-loop turn all sees the
-                    // latch still `false` here, so the microtask re-check is what
-                    // actually serialises them. `Signal` is `Copy`, so this `move`
-                    // closure captures copies and stays `Fn` (which
-                    // `subscribe_chat_sse` requires for a possibly-repeated
-                    // EventSource handler).
-                    if *sse_reestablishing.peek() {
-                        log::info!("⏳ SSE re-establish already in flight; ignoring duplicate token_expired");
-                        return;
-                    }
+        let mut connection_lost = connection_lost;
 
-                    let establish_slot_for_auth = establish_slot_for_auth.clone();
-                    let cid_for_auth = cid_for_auth.clone();
-                    // Everything below runs on a SPAWNED microtask, NOT inline in
-                    // this `on_message`/event callback. This is load-bearing:
-                    // `on_auth_failure` is invoked from inside the `_on_message`
-                    // `Closure` that the `SseHandle` OWNS, so dropping that handle
-                    // synchronously (`sse_handle.set(None)`) here would free the
-                    // very Rust closure currently executing on the stack — a
-                    // wasm-bindgen use-after-free. Deferring lets the callback
-                    // return and the stack unwind BEFORE the handle is dropped.
-                    wasm_bindgen_futures::spawn_local(async move {
-                        // `Copy` signals re-bound `mut` for the `.set()`s below.
-                        let mut sse_reestablishing = sse_reestablishing;
-                        let mut sse_handle = sse_handle;
-                        let mut sse_reestablish_attempts = sse_reestablish_attempts;
-                        let mut connection_lost = connection_lost;
-
-                        // Re-check the latch on the microtask: a burst of
-                        // `token_expired` frames in the same event-loop turn each
-                        // spawn a task, but only the FIRST to run here may proceed.
-                        if *sse_reestablishing.peek() {
-                            return;
-                        }
-                        sse_reestablishing.set(true);
-
-                        // (1) Stop the native reconnect: dropping the stored handle
-                        // closes the EventSource (see `SseHandle::drop`) so the
-                        // browser stops reconnecting with the dead cookie. Safe to
-                        // drop HERE — we are off the callback stack.
-                        sse_handle.set(None);
-
-                        loop {
-                            let attempt = *sse_reestablish_attempts.peek();
-                            // Per-client jitter so a token expiry that hits all N
-                            // participants at once does NOT make them refresh +
-                            // re-`POST /sse/session` in lockstep (a herd against the
-                            // IdP and the SSE session route). Sampled at the wasm
-                            // call site (the pure fn stays deterministic); spread is
-                            // `0..base/2` additive (~0–375ms).
-                            let jitter_ms = sse_retry_jitter_ms();
-                            match next_reestablish_action(
-                                attempt,
-                                SSE_MAX_REESTABLISH_ATTEMPTS,
-                                jitter_ms,
-                            ) {
-                                ReestablishAction::GiveUp => {
-                                    // Budget exhausted: surface a terminal
-                                    // "disconnected" state and STOP. Do NOT loop —
-                                    // this is the guard that prevents replacing the
-                                    // 3s reconnect loop with a refresh storm.
-                                    log::error!(
-                                        "🔌 Chat SSE re-establish gave up after {} attempts; chat disconnected",
-                                        SSE_MAX_REESTABLISH_ATTEMPTS
-                                    );
-                                    connection_lost.set(true);
-                                    sse_reestablishing.set(false);
-                                    break;
-                                }
-                                ReestablishAction::Retry { delay_ms } => {
-                                    // Wait before retrying: an immediate reopen
-                                    // would race the not-yet-propagated refreshed
-                                    // cookie and re-trip `token_expired`.
-                                    gloo_timers::future::TimeoutFuture::new(delay_ms).await;
-
-                                    // (2) Refresh the OAuth token through the
-                                    // SHARED single-flight path so a chat refresh
-                                    // and a concurrent meeting refresh coalesce
-                                    // into ONE network POST (see
-                                    // `meeting_api::refresh_token_single_flight`).
-                                    if crate::meeting_api::refresh_token_single_flight()
-                                        .await
-                                        .is_err()
-                                    {
-                                        log::warn!(
-                                            "🔐 SSE token refresh failed (attempt {}); will retry within budget",
-                                            attempt + 1
-                                        );
-                                        // (A) Refresh-fail charge: count the failed
-                                        // attempt and loop; the cap above guarantees
-                                        // termination. (We did NOT reopen, so site B
-                                        // never ran for this cycle — this is the only
-                                        // charge.)
-                                        sse_reestablish_attempts.set(attempt + 1);
-                                        continue;
-                                    }
-
-                                    // (B) Reopen-commit charge: count THIS attempt
-                                    // BEFORE reopening. This is what makes the
-                                    // budget terminate a reopen-then-refail storm:
-                                    // a server that re-emits `token_expired` on
-                                    // every reopen never lets the probation reset
-                                    // run, so the only thing that can advance the
-                                    // budget is charging at commit. Without this,
-                                    // a succeed-then-refail loop would keep reading
-                                    // the same `attempt` and never reach GiveUp.
-                                    sse_reestablish_attempts.set(attempt + 1);
-
-                                    // (3) Re-POST `/sse/session` + reopen the
-                                    // EventSource with the fresh cookie.
-                                    let establish =
-                                        establish_slot_for_auth.borrow().as_ref().cloned();
-                                    if let Some(establish) = establish {
-                                        log::info!(
-                                            "🔁 Re-establishing chat SSE (attempt {})",
-                                            attempt + 1
-                                        );
-                                        establish(cid_for_auth.clone());
-                                    }
-                                    // `establish` reopens asynchronously. On a bare
-                                    // `Ok` it does NOT reset the budget — it ARMS a
-                                    // probation timer that resets only if the stream
-                                    // survives `SSE_HEALTHY_RESET_MS` without another
-                                    // reopen (see the probation section). We stop the
-                                    // loop here regardless: if the reopen itself
-                                    // re-expires it fires a NEW `on_auth_failure`,
-                                    // which the latch lets through (cleared by the
-                                    // reopen's Ok/Err arm) and which reads the
-                                    // already-incremented attempt counter — so the
-                                    // budget is enforced ACROSS reopens (this is the
-                                    // termination guarantee the host test pins), and
-                                    // we never run two loops.
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                };
-
-                // The SSE token exchange requires an await, so the subscription
-                // must run on the local task pool. The handle is stored back into
-                // the signal once the EventSource is established.
-                wasm_bindgen_futures::spawn_local(async move {
-                    match subscribe_chat_sse(cid, on_change, on_auth_failure).await {
-                        Ok(h) => {
-                            sse_handle.set(Some(h));
-                            // A bare `Ok` means only that `POST /sse/session`
-                            // succeeded and the EventSource was constructed — NOT
-                            // that the reopened stream stays authenticated. So we do
-                            // NOT reset the retry budget here (resetting on a bare
-                            // reopen would let a server that re-emits `token_expired`
-                            // on every reopen loop forever, never reaching GiveUp).
-                            //
-                            // Instead: bump the connection generation and ARM a
-                            // probation timer. The reset to 0 fires ONLY if the
-                            // stream survives `SSE_HEALTHY_RESET_MS` without another
-                            // reopen (generation unchanged → healthy). A
-                            // `token_expired` during probation bumps the generation
-                            // again, so the reset is gated out and the budget keeps
-                            // climbing toward GiveUp.
-                            let mut sse_connection_generation = sse_connection_generation;
-                            let armed_gen = sse_connection_generation.peek().wrapping_add(1);
-                            sse_connection_generation.set(armed_gen);
-                            sse_reestablishing.set(false);
-                            if load_error.peek().is_some() {
-                                load_error.set(None);
-                            }
-                            // Delayed healthy reset, gated on the generation being
-                            // unchanged when it fires. Capture `armed_gen` by value;
-                            // read the generation fresh at fire time. No stale
-                            // closure capture of the LIVE counter — only the integer
-                            // snapshot is captured.
-                            let mut sse_reestablish_attempts = sse_reestablish_attempts;
-                            wasm_bindgen_futures::spawn_local(async move {
-                                gloo_timers::future::TimeoutFuture::new(SSE_HEALTHY_RESET_MS).await;
-                                let current = *sse_connection_generation.peek();
-                                if probation_reset_allowed(armed_gen, current) {
-                                    log::info!(
-                                        "✅ Chat SSE survived probation ({}ms); resetting retry budget",
-                                        SSE_HEALTHY_RESET_MS
-                                    );
-                                    sse_reestablish_attempts.set(0);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            log::warn!("⚠️ Failed to open SSE: {e}");
-                            // (C) Reopen-Err: release the latch so the next
-                            // `on_auth_failure` (or the loop) can retry. The attempt
-                            // was ALREADY charged at the reopen-commit site (B) above
-                            // before `establish` was called, so we must NOT charge it
-                            // again here — double-counting would halve the effective
-                            // budget. We only clear the latch when we are in a
-                            // re-establish wave; the initial-mount open (latch false)
-                            // leaves the budget untouched.
-                            if *sse_reestablishing.peek() {
-                                sse_reestablishing.set(false);
-                            }
-                        }
-                    }
-                });
+        let cid_for_reestablish = cid.clone();
+        let start_reestablish_wave = move || {
+            spawn_reestablish_wave(ReestablishContext {
+                cid: cid_for_reestablish.clone(),
+                sse_handle,
+                sse_reestablishing,
+                sse_reestablish_attempts,
+                sse_connection_generation,
+                load_error,
+                connection_lost,
+                make_on_change,
             });
-            *establish_slot.borrow_mut() = Some(me.clone());
-            me
         };
 
-        establish(cid);
+        // Initial subscription: one shot, no retry budget. If the first `POST
+        // /sse/session` fails, the next auth-failure frame will drive the bounded
+        // re-establish helper above.
+        let on_auth_failure = move || {
+            if *sse_reestablishing.peek() {
+                log::info!(
+                    "⏳ SSE re-establish already in flight; ignoring duplicate token_expired"
+                );
+                return;
+            }
+            start_reestablish_wave();
+        };
+
+        let on_change = make_on_change();
+        wasm_bindgen_futures::spawn_local(async move {
+            match subscribe_chat_sse(cid, on_change, on_auth_failure).await {
+                Ok(h) => {
+                    sse_handle.set(Some(h));
+                    let armed_gen = sse_connection_generation.peek().wrapping_add(1);
+                    sse_connection_generation.set(armed_gen);
+                    if connection_lost() {
+                        connection_lost.set(false);
+                    }
+                    if load_error.peek().is_some() {
+                        load_error.set(None);
+                    }
+                    let mut sse_reestablish_attempts = sse_reestablish_attempts;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(SSE_HEALTHY_RESET_MS).await;
+                        let current = *sse_connection_generation.peek();
+                        if probation_reset_allowed(armed_gen, current) {
+                            log::info!(
+                                "✅ Chat SSE survived probation ({}ms); resetting retry budget",
+                                SSE_HEALTHY_RESET_MS
+                            );
+                            sse_reestablish_attempts.set(0);
+                        }
+                    });
+                }
+                Err(e) => {
+                    log::warn!("⚠️ Failed to open SSE: {e}");
+                }
+            }
+        });
     });
 
     // ── Auto-scroll to bottom ───────────────────────────────────────
@@ -1141,8 +1097,8 @@ mod tests {
     //
     // The runtime re-establish loop is spread across async sites (the retry
     // backoff loop, the reopen-commit, the `subscribe_chat_sse` Ok/Err arms, and
-    // the delayed probation reset). The model below replays that EXACT control
-    // flow against the real source-of-truth decision fns
+    // the delayed probation reset). The model below mirrors the accounting and
+    // termination behavior against the real source-of-truth decision fns
     // (`next_reestablish_action`, `probation_reset_allowed`,
     // `SSE_MAX_REESTABLISH_ATTEMPTS`) without needing wasm timers — so the
     // TERMINATION guarantee is host-testable and breaks if the accounting
@@ -1157,8 +1113,8 @@ mod tests {
     ///     "reopens": because it re-fails before probation survives, the
     ///     generation is bumped again, so `probation_reset_allowed(armed, current)`
     ///     is FALSE — the budget is NOT reset (this is the crux of the bug fix);
-    ///   * a `ReopenError` charges one attempt at commit (site B) and the Err arm
-    ///     does NOT charge again (no double-count).
+    ///   * a `ReopenError` charges one attempt at commit (site B) and keeps the
+    ///     same bounded wave moving toward `GiveUp` without double-counting.
     ///
     /// Returns `(gave_up, cycles_run)`. `gave_up == true` means the loop reached
     /// `GiveUp` within `max` cycles instead of spinning forever.
