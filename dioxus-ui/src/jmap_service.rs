@@ -494,6 +494,113 @@ async fn jmap_call(
 // SSE – real-time chat event stream
 // =============================================================================
 
+/// Returns `true` if an already-parsed SSE `message` payload is an in-band
+/// auth-failure frame — i.e. JSON with `type == "auth"` and a `status` that
+/// signals the session token is no longer valid (e.g. `"token_expired"`).
+///
+/// Takes a borrowed [`serde_json::Value`] (not a `&str`) so the on_message
+/// handler can parse the frame ONCE and feed the same `Value` to both this
+/// auth-failure check and the StateChange/`changed` re-fetch check. Parsing the
+/// frame twice per chat event was a measurable per-message cost in busy rooms.
+///
+/// Smatter validates the session token on the LIVE stream and, on expiry, emits
+/// `{"type":"auth","status":"token_expired"}` then closes the stream CLEANLY
+/// (HTTP 200, server-initiated FIN — NOT a 401). The browser's `EventSource`
+/// treats a clean close as normal and auto-reconnects after ~3s carrying the
+/// SAME, still-expired `sse_session` cookie, which nothing re-mints → an
+/// infinite ~3s reconnect loop. Recognising this frame is what lets the client
+/// break that loop (drop the source, refresh the token, re-establish).
+///
+/// `status` is matched permissively (any non-`"ok"`/`"valid"` status on a
+/// `type=="auth"` frame is treated as a failure) so a future server adding e.g.
+/// `"token_invalid"` or `"unauthorized"` is still handled — better to attempt a
+/// bounded refresh on an unknown auth status than to ignore it and hot-loop.
+pub fn is_sse_auth_failure(value: &serde_json::Value) -> bool {
+    if value.get("type").and_then(|v| v.as_str()) != Some("auth") {
+        return false;
+    }
+    match value.get("status").and_then(|v| v.as_str()) {
+        // Explicit healthy statuses are NOT failures.
+        Some("ok") | Some("valid") | Some("authenticated") => false,
+        // Any other status on a `type=="auth"` frame (incl. the field being
+        // absent) is treated as an auth failure.
+        _ => true,
+    }
+}
+
+/// Maximum number of consecutive token-refresh + SSE re-establish attempts
+/// before the chat gives up and surfaces a "disconnected" state. This is the
+/// loop cap that stops `token_expired` from turning into an unbounded refresh
+/// storm: a refresh that keeps failing must TERMINATE, not move the 3s reconnect
+/// loop onto the token endpoint. The budget is reset to zero ONLY after a
+/// reopened stream survives a probation window WITHOUT re-establishing (see the
+/// probation logic in `chat_sidebar`), NOT on a bare successful reopen — a server
+/// that re-emits `token_expired` on every reopen must still climb to this cap and
+/// give up, instead of resetting the budget on each doomed reopen and looping
+/// forever. A genuinely transient expiry hours later gets the full budget again
+/// once the healthy stream survives probation.
+pub const SSE_MAX_REESTABLISH_ATTEMPTS: u32 = 4;
+
+/// What the chat SSE re-establish loop should do for a given attempt number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReestablishAction {
+    /// Wait `delay_ms` then make this attempt.
+    Retry { delay_ms: u32 },
+    /// Budget exhausted — stop and surface a disconnected state.
+    GiveUp,
+}
+
+/// Base backoff for the first re-establish attempt (ms). Exposed so the wasm
+/// caller can derive a proportional jitter spread from the same constant.
+pub const SSE_REESTABLISH_BASE_MS: u32 = 750;
+
+/// Pure decision function for the bounded-backoff re-establish loop. `attempt`
+/// is 0-based (0 == the first re-establish after detecting `token_expired`).
+///
+/// Returns [`ReestablishAction::GiveUp`] once `attempt >= max_attempts`,
+/// otherwise [`ReestablishAction::Retry`] with an exponential-with-cap backoff
+/// delay PLUS the caller-supplied `jitter_ms`. Extracted as a pure fn (no wasm,
+/// no signals, no clock/RNG) so the TERMINATION guarantee — the loop stops after
+/// `max_attempts` and does not hot-spin — is unit-testable on the host target.
+///
+/// Jitter is passed IN (not sampled here) to keep the function deterministic:
+/// the wasm caller computes `jitter_ms` from `js_sys::Math::random()`, host
+/// tests pass a fixed value (e.g. 0). De-correlating retries matters because a
+/// single token expiry is correlated across ALL N meeting participants (they
+/// auth on the same session token and expire together), so without jitter every
+/// client would refresh + re-`POST /sse/session` at the SAME instants — a
+/// thundering herd against the IdP token endpoint and the SSE session route.
+/// Jitter is added AFTER the cap so the spread survives the clamp; the resulting
+/// delay can exceed `CAP_MS` by up to the jitter span, which is intentional.
+///
+/// Backoff schedule (base 750ms, doubling, capped at 8s) for the default cap,
+/// with `jitter_ms == 0`:
+///   attempt 0 → 750ms, 1 → 1500ms, 2 → 3000ms, 3 → 6000ms, 4+ → GiveUp.
+/// The first delay is deliberately NON-zero even at zero jitter: an immediate
+/// retry that races the not-yet-propagated refreshed cookie would just re-trip
+/// `token_expired`.
+pub fn next_reestablish_action(
+    attempt: u32,
+    max_attempts: u32,
+    jitter_ms: u32,
+) -> ReestablishAction {
+    if attempt >= max_attempts {
+        return ReestablishAction::GiveUp;
+    }
+    const CAP_MS: u32 = 8_000;
+    // `1u32 << attempt` could overflow for large attempt counts; saturate the
+    // shift so an absurd cap can never panic — the multiply is then clamped to
+    // CAP_MS anyway.
+    let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    let delay_ms = SSE_REESTABLISH_BASE_MS
+        .saturating_mul(factor)
+        .min(CAP_MS)
+        // De-correlate the N-client herd; saturate so a large jitter cannot
+        // wrap. Still strictly positive (base is non-zero), so no busy-spin.
+        .saturating_add(jitter_ms);
+    ReestablishAction::Retry { delay_ms }
+}
+
 /// Handle returned by [`subscribe_chat_sse`].  When dropped the underlying
 /// `EventSource` is closed automatically.
 pub struct SseHandle {
@@ -516,11 +623,18 @@ impl Drop for SseHandle {
 /// `on_change` callback is invoked with the new conversation-id so the
 /// caller can re-fetch messages.
 ///
+/// `on_auth_failure` is invoked (at most once worth acting on — see the caller's
+/// re-establish guard) when an in-band auth-failure frame
+/// (`{"type":"auth","status":"token_expired"}`) arrives. The caller is expected
+/// to DROP this handle (closing the EventSource so the browser stops
+/// reconnecting with the dead cookie), refresh the token, and re-subscribe.
+///
 /// Returns `Ok(SseHandle)` – the caller **must** keep the handle alive
 /// (e.g. in a `use_signal`) for the connection to stay open.
 pub async fn subscribe_chat_sse(
     conv_id: String,
     on_change: impl Fn(String) + 'static,
+    on_auth_failure: impl Fn() + 'static,
 ) -> Result<SseHandle, String> {
     let token = get_stored_id_token()
         .or_else(get_stored_access_token)
@@ -595,14 +709,39 @@ pub async fn subscribe_chat_sse(
                 }
                 log::info!("📨 SSE event [{}]: {}", evt_type, &text);
 
+                // Parse the frame ONCE. Both the auth-failure check and the
+                // StateChange/`changed` re-fetch check below consume this single
+                // `Value` — previously each parsed the same text into its own
+                // `Value`, so every real chat event was deserialized twice. A
+                // non-JSON frame (ping/heartbeat already short-circuited above,
+                // but a stray garbage frame can still arrive) yields `None`; the
+                // event-name checks still work without a parse.
+                let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+
+                // Auth-failure frame takes priority over re-fetch handling: the
+                // session token has expired, so a re-fetch would 401 and the
+                // native EventSource would keep reconnecting with the dead
+                // cookie. Notify the caller (which drops this handle and runs the
+                // bounded refresh + re-establish loop) and STOP — do not also
+                // treat it as a chat event.
+                if parsed.as_ref().map(is_sse_auth_failure).unwrap_or(false) {
+                    log::warn!(
+                        "🔐 SSE auth-failure frame received; signalling re-establish: {}",
+                        &text
+                    );
+                    on_auth_failure();
+                    return;
+                }
+
                 // Permissive trigger: any non-ping frame on a known JMAP
                 // push event-name OR any JSON payload that looks like a
                 // StateChange / has a `changed` field counts as "something
-                // happened, please re-fetch".
+                // happened, please re-fetch". Reuses the single `parsed` Value.
                 let is_chat_event = evt_type == "ChatMessage"
                     || evt_type == "state"
                     || evt_type == "StateChange"
-                    || serde_json::from_str::<serde_json::Value>(&text)
+                    || parsed
+                        .as_ref()
                         .map(|p| {
                             p.get("@type").and_then(|v| v.as_str()) == Some("StateChange")
                                 || p.get("changed").is_some()
@@ -908,5 +1047,164 @@ mod tests {
         // JSON string must be escaped as  ).
         let body = default_body_values("a\u{0}b");
         assert_eq!(parsed_insert(&body), "a\u{0}b\n");
+    }
+
+    // ──────────────────── is_sse_auth_failure ────────────────────
+    //
+    // `is_sse_auth_failure` now takes an already-parsed `&serde_json::Value`
+    // (the on_message handler parses each frame ONCE and feeds the same Value to
+    // both the auth check and the re-fetch check). These tests parse here to
+    // mirror that. Non-JSON frames never reach `is_sse_auth_failure` at runtime
+    // (the parse yields `None` and the caller short-circuits), so there is no
+    // `&str`-garbage case to model anymore.
+
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn is_sse_auth_failure_matches_token_expired() {
+        assert!(is_sse_auth_failure(&parse(
+            r#"{"type":"auth","status":"token_expired"}"#
+        )));
+    }
+
+    #[test]
+    fn is_sse_auth_failure_matches_unknown_auth_status() {
+        // A future/unknown auth status (or a missing status) on a type==auth
+        // frame is still treated as a failure — we'd rather attempt a bounded
+        // refresh than ignore it and let the native reconnect loop spin.
+        assert!(is_sse_auth_failure(&parse(
+            r#"{"type":"auth","status":"weird"}"#
+        )));
+        assert!(is_sse_auth_failure(&parse(r#"{"type":"auth"}"#)));
+    }
+
+    #[test]
+    fn is_sse_auth_failure_ignores_healthy_auth_and_non_auth_frames() {
+        // Healthy auth statuses are NOT failures.
+        assert!(!is_sse_auth_failure(&parse(
+            r#"{"type":"auth","status":"ok"}"#
+        )));
+        assert!(!is_sse_auth_failure(&parse(
+            r#"{"type":"auth","status":"valid"}"#
+        )));
+        // Ordinary chat / state frames are not auth frames.
+        assert!(!is_sse_auth_failure(&parse(r#"{"@type":"StateChange"}"#)));
+        assert!(!is_sse_auth_failure(&parse(r#"{"changed":{"x":1}}"#)));
+    }
+
+    // ──────────── next_reestablish_action / termination ────────────
+
+    #[test]
+    fn next_reestablish_action_backs_off_then_gives_up() {
+        // First attempts retry with exponential backoff (base 750ms, doubling,
+        // capped at 8s); once `attempt >= max_attempts` it GIVES UP. Zero jitter
+        // here so the schedule is exact.
+        assert_eq!(
+            next_reestablish_action(0, 4, 0),
+            ReestablishAction::Retry { delay_ms: 750 }
+        );
+        assert_eq!(
+            next_reestablish_action(1, 4, 0),
+            ReestablishAction::Retry { delay_ms: 1500 }
+        );
+        assert_eq!(
+            next_reestablish_action(2, 4, 0),
+            ReestablishAction::Retry { delay_ms: 3000 }
+        );
+        assert_eq!(
+            next_reestablish_action(3, 4, 0),
+            ReestablishAction::Retry { delay_ms: 6000 }
+        );
+        // Budget exhausted: must terminate (jitter is irrelevant once GiveUp).
+        assert_eq!(next_reestablish_action(4, 4, 0), ReestablishAction::GiveUp);
+        assert_eq!(next_reestablish_action(5, 4, 0), ReestablishAction::GiveUp);
+    }
+
+    #[test]
+    fn next_reestablish_action_delay_is_capped() {
+        // Large attempt numbers saturate the shift and clamp to the 8s cap —
+        // never panic, never grow unbounded (zero jitter).
+        assert_eq!(
+            next_reestablish_action(20, 100, 0),
+            ReestablishAction::Retry { delay_ms: 8_000 }
+        );
+        assert_eq!(
+            next_reestablish_action(31, 100, 0),
+            ReestablishAction::Retry { delay_ms: 8_000 }
+        );
+    }
+
+    #[test]
+    fn next_reestablish_action_adds_jitter_after_cap() {
+        // Jitter is additive ON TOP of the (possibly capped) base delay, so two
+        // clients with different jitter inputs get different delays — the whole
+        // point of de-correlating the N-client herd.
+        assert_eq!(
+            next_reestablish_action(0, 4, 100),
+            ReestablishAction::Retry { delay_ms: 850 } // 750 + 100
+        );
+        // Jitter survives the cap: a capped attempt still spreads.
+        assert_eq!(
+            next_reestablish_action(20, 100, 250),
+            ReestablishAction::Retry { delay_ms: 8_250 } // 8000 + 250
+        );
+        // Different jitter → different delay for the same attempt.
+        assert_ne!(
+            next_reestablish_action(0, 4, 50),
+            next_reestablish_action(0, 4, 300),
+        );
+    }
+
+    #[test]
+    fn next_reestablish_action_jitter_saturates_not_panics() {
+        // A pathological jitter near u32::MAX must saturate, never overflow.
+        assert_eq!(
+            next_reestablish_action(0, 4, u32::MAX),
+            ReestablishAction::Retry { delay_ms: u32::MAX }
+        );
+    }
+
+    /// TERMINATION proof: a re-establish loop that ALWAYS fails (refresh keeps
+    /// erroring / the frame keeps being `token_expired`) must STOP after exactly
+    /// `max_attempts` tries — it must never hot-loop. This simulates the real
+    /// loop's control flow against the pure decision fn. If the cap were removed
+    /// (e.g. `next_reestablish_action` always returned `Retry`), this loop would
+    /// never break and the test would HANG (caught as a CI timeout) instead of
+    /// completing — i.e. the test fails if the guard is broken.
+    #[test]
+    fn reestablish_loop_terminates_on_persistent_failure() {
+        let max = SSE_MAX_REESTABLISH_ATTEMPTS;
+        let mut attempt = 0u32;
+        let mut tries = 0u32;
+        let gave_up = loop {
+            // Deterministic zero jitter so the termination count is exact.
+            match next_reestablish_action(attempt, max, 0) {
+                ReestablishAction::Retry { delay_ms } => {
+                    // Mirror the runtime guard: a Retry always carries a
+                    // strictly-positive delay, so we never busy-spin even on the
+                    // first attempt (an immediate retry would race the
+                    // not-yet-propagated refreshed cookie).
+                    assert!(delay_ms > 0, "retry delay must be non-zero (no busy-spin)");
+                    tries += 1;
+                    // Simulate the attempt failing (refresh or re-subscribe
+                    // errored) → advance and try again.
+                    attempt += 1;
+                    // Hard safety net so a regression surfaces as an ASSERT, not
+                    // an infinite loop: we should never exceed the cap.
+                    assert!(
+                        tries <= max,
+                        "loop exceeded max_attempts={max} — cap is not bounding retries"
+                    );
+                }
+                ReestablishAction::GiveUp => break true,
+            }
+        };
+        assert!(gave_up, "loop must give up, not retry forever");
+        assert_eq!(
+            tries, max,
+            "must make exactly max_attempts tries before giving up"
+        );
     }
 }
