@@ -17,8 +17,13 @@ use crate::auth::{check_session, get_user_profile};
 use crate::constants::oauth_enabled;
 use crate::jmap_service::{
     current_user_id, get_message_changes, get_messages_with_state, get_or_create_conversation,
-    send_message, subscribe_chat_sse, SseHandle,
+    next_reestablish_action, send_message, subscribe_chat_sse, ReestablishAction, SseHandle,
+    SSE_MAX_REESTABLISH_ATTEMPTS,
 };
+// Only the wasm jitter sampler reads the base-delay constant; gating the import
+// avoids an unused-import warning on the host (test) target.
+#[cfg(target_arch = "wasm32")]
+use crate::jmap_service::SSE_REESTABLISH_BASE_MS;
 use chrono::{DateTime, Local, Offset, TimeZone, Utc};
 use dioxus::prelude::*;
 
@@ -83,6 +88,83 @@ fn cap_messages(list: &mut Vec<ChatMessage>) {
         let overflow = list.len() - MAX_RETAINED_MESSAGES;
         list.drain(0..overflow);
     }
+}
+
+// ── SSE re-establish probation ───────────────────────────────────────────────
+//
+// The re-establish budget (`SSE_MAX_REESTABLISH_ATTEMPTS`) only terminates a
+// `token_expired` storm if a reopen does NOT reset the attempt counter the
+// instant `subscribe_chat_sse` returns `Ok`. A bare `Ok` means only that the
+// `POST /sse/session` succeeded and the EventSource object was constructed — it
+// does NOT mean the reopened stream stays authenticated. A server (or an
+// injected frame) that re-emits `token_expired` on EVERY reopen would, under a
+// reset-on-bare-`Ok` policy, loop forever: open → token_expired → reset to 0 →
+// Retry → refresh → reopen → repeat, never reaching `GiveUp` and never showing a
+// terminal state.
+//
+// So we only reset the budget after the stream PROVES HEALTHY by surviving a
+// probation window without re-establishing. We track a monotonically-increasing
+// connection generation, incremented on each reopen; on a successful reopen we
+// spawn a delayed reset that fires only if the generation is UNCHANGED when it
+// runs (i.e. no re-establish happened during probation). A `token_expired` that
+// arrives DURING probation bumps the generation and counts against the budget,
+// so a server rejecting every connect climbs to the cap and hits `GiveUp`.
+
+/// Probation interval (ms): how long a reopened SSE stream must survive WITHOUT
+/// re-establishing before its success is treated as "healthy" and the retry
+/// budget is reset to zero. Must comfortably exceed the time between a reopen
+/// and a re-emitted `token_expired` (Smatter validates the token on connect, so
+/// a doomed reopen re-fails within a round-trip), so a connect-loop never gets
+/// its budget reset mid-storm.
+const SSE_HEALTHY_RESET_MS: u32 = 30_000;
+
+/// Pure decision for the delayed "healthy reset": after the probation timer for
+/// the connection generation `armed_at` fires, the retry budget may be reset to
+/// zero ONLY IF the current generation still equals `armed_at` — meaning no
+/// reopen happened during probation, so the stream survived and is healthy.
+///
+/// Extracted as a pure fn (no signals/timers) so the gate that PREVENTS a
+/// reset-on-bare-reopen from sneaking back in is host-testable. If a reopen
+/// (which bumps the generation) happened during probation, `current != armed_at`
+/// and we must NOT reset — the in-flight storm's attempt count has to keep
+/// climbing toward `GiveUp`.
+fn probation_reset_allowed(armed_at: u32, current: u32) -> bool {
+    armed_at == current
+}
+
+/// Sample the additive retry jitter (ms) for ONE re-establish attempt. Spread is
+/// `0..SSE_REESTABLISH_BASE_MS` (~0–750ms), drawn from `js_sys::Math::random()`
+/// on the browser target. Kept OUT of `next_reestablish_action` so that pure fn
+/// stays deterministic and host-testable; only this thin sampler touches the RNG.
+#[cfg(target_arch = "wasm32")]
+fn sse_retry_jitter_ms() -> u32 {
+    let span = SSE_REESTABLISH_BASE_MS as f64;
+    // `Math::random()` is [0, 1); scaling by `span` keeps the result in
+    // `[0, span)`, so `as u32` truncates to `0..=span-1` — never negative.
+    (js_sys::Math::random() * span) as u32
+}
+
+/// Host stub: tests drive the decision logic with deterministic jitter, so this
+/// non-wasm build returns 0. (The wasm sampler above is the production path.)
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+fn sse_retry_jitter_ms() -> u32 {
+    0
+}
+
+/// Outcome of one modeled re-establish cycle in the pure loop model below.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CycleOutcome {
+    /// `subscribe_chat_sse` returned `Ok`, but the reopened stream re-emitted
+    /// `token_expired` BEFORE surviving probation (so the healthy reset never
+    /// ran). Models a server that rejects every reopen.
+    ReopenedThenRefailed,
+    /// `subscribe_chat_sse` returned `Err` (the `POST /sse/session` itself
+    /// failed).
+    ReopenError,
+    /// The refresh POST failed before we even reopened.
+    RefreshError,
 }
 
 /// Merge a delta batch of server messages into `list`, applying (in order):
@@ -253,6 +335,11 @@ pub fn ChatSidebar(
     let mut chat_state_token = use_signal(String::new);
     let mut next_local_id = use_signal(|| 0u32);
     let mut load_error = use_signal(|| None::<String>);
+    // Terminal "real-time connection lost" state, set only when SSE re-establish
+    // gives up (see the GiveUp arm). Kept SEPARATE from `load_error` so the
+    // disconnect banner is NOT rendered with the "Failed to load messages:"
+    // prefix — this is a mid-session disconnect, not an initial-load failure.
+    let connection_lost = use_signal(|| false);
     let mut is_loading = use_signal(|| true);
     // Whether to show the "jump to bottom" button (user scrolled up).
     let mut show_jump_button = use_signal(|| false);
@@ -343,7 +430,7 @@ pub fn ChatSidebar(
 
     // ── SSE: subscribe to real-time chat events ─────────────────────
     // Keep the handle alive so the EventSource stays connected.
-    let mut sse_handle: Signal<Option<SseHandle>> = use_signal(|| None);
+    let sse_handle: Signal<Option<SseHandle>> = use_signal(|| None);
 
     // Serializes delta fetches so at most ONE `/changes` round-trip is in flight
     // at a time. A single SSE EventSource can fire `on_change` many times for one
@@ -361,6 +448,182 @@ pub fn ChatSidebar(
     let delta_in_flight = use_signal(|| false);
     let delta_pending = use_signal(|| false);
 
+    // ── SSE auth-expiry re-establish guards ─────────────────────────────────
+    // When Smatter sends an in-band `{"type":"auth","status":"token_expired"}`
+    // frame and cleanly closes the stream, the browser's EventSource would
+    // auto-reconnect every ~3s carrying the SAME dead `sse_session` cookie — an
+    // infinite loop (observed 2393× in one call). We instead drop the source,
+    // refresh the OAuth token, and re-subscribe — but that must itself be
+    // BOUNDED so we don't just move the loop onto the token endpoint.
+    //
+    // `sse_reestablishing` is a single-flight latch: overlapping `token_expired`
+    // frames (the same handler is bound to several event names, and a burst can
+    // arrive together) must not spawn concurrent re-subscribe loops.
+    let sse_reestablishing = use_signal(|| false);
+    // 0-based count of re-establish attempts charged against the budget. It is
+    // mutated at exactly three sites, each mapped to a failure mode:
+    //   (A) refresh-fail  (Retry arm) — the token-refresh POST errored.
+    //   (B) reopen-commit  (Retry arm) — we committed to a reopen after a
+    //       successful refresh; charged BEFORE the reopen so a reopen that
+    //       succeeds-then-refails (token_expired re-emitted before probation
+    //       survives) still advances the budget toward GiveUp.
+    //   (C) reopen-Err (subscribe arm) — `subscribe_chat_sse` itself failed.
+    // It is reset to 0 ONLY by the probation timer, and ONLY if the connection
+    // generation is unchanged when it fires (the stream survived probation). It
+    // is NOT reset on a bare `Ok` from `subscribe_chat_sse` — see the probation
+    // section above for why that would defeat the cap.
+    let sse_reestablish_attempts = use_signal(|| 0u32);
+    // Monotonically-increasing connection generation, bumped on each reopen.
+    // The probation timer captures the generation at arm time and resets the
+    // budget only if it is still current when the timer fires (no reopen
+    // happened during probation → the stream is healthy).
+    let mut sse_connection_generation = use_signal(|| 0u32);
+
+    // Spawn a bounded re-establish wave. This helper owns the retry/backoff
+    // loop so a failed reopen (`subscribe_chat_sse` returning `Err`) can stay in
+    // the same charged wave and keep retrying until the budget is exhausted.
+    struct ReestablishContext<F, C>
+    where
+        F: Fn() -> C + Copy + 'static,
+        C: Fn(String) + 'static,
+    {
+        cid: String,
+        sse_handle: Signal<Option<SseHandle>>,
+        sse_reestablishing: Signal<bool>,
+        sse_reestablish_attempts: Signal<u32>,
+        sse_connection_generation: Signal<u32>,
+        load_error: Signal<Option<String>>,
+        connection_lost: Signal<bool>,
+        make_on_change: F,
+    }
+
+    fn spawn_reestablish_wave<F, C>(ctx: ReestablishContext<F, C>)
+    where
+        F: Fn() -> C + Copy + 'static,
+        C: Fn(String) + 'static,
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            reestablish_chat_sse(ctx).await;
+        });
+    }
+
+    async fn reestablish_chat_sse<F, C>(ctx: ReestablishContext<F, C>)
+    where
+        F: Fn() -> C + Copy + 'static,
+        C: Fn(String) + 'static,
+    {
+        let ReestablishContext {
+            cid,
+            sse_handle,
+            sse_reestablishing,
+            sse_reestablish_attempts,
+            sse_connection_generation,
+            load_error,
+            connection_lost,
+            make_on_change,
+        } = ctx;
+
+        let mut sse_handle = sse_handle;
+        let mut sse_reestablishing = sse_reestablishing;
+        let mut sse_reestablish_attempts = sse_reestablish_attempts;
+        let mut sse_connection_generation = sse_connection_generation;
+        let mut load_error = load_error;
+        let mut connection_lost = connection_lost;
+
+        if *sse_reestablishing.peek() {
+            return;
+        }
+        sse_reestablishing.set(true);
+        sse_handle.set(None);
+
+        loop {
+            let attempt = *sse_reestablish_attempts.peek();
+            let jitter_ms = sse_retry_jitter_ms();
+            match next_reestablish_action(attempt, SSE_MAX_REESTABLISH_ATTEMPTS, jitter_ms) {
+                ReestablishAction::GiveUp => {
+                    log::error!(
+                        "🔌 Chat SSE re-establish gave up after {} attempts; chat disconnected",
+                        SSE_MAX_REESTABLISH_ATTEMPTS
+                    );
+                    connection_lost.set(true);
+                    sse_reestablishing.set(false);
+                    break;
+                }
+                ReestablishAction::Retry { delay_ms } => {
+                    gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+
+                    if crate::meeting_api::refresh_token_single_flight()
+                        .await
+                        .is_err()
+                    {
+                        log::warn!(
+                            "🔐 SSE token refresh failed (attempt {}); will retry within budget",
+                            attempt + 1
+                        );
+                        sse_reestablish_attempts.set(attempt + 1);
+                        continue;
+                    }
+
+                    // Charge this attempt before reopening. A reopen that
+                    // succeeds and then re-fails before probation survives must
+                    // still advance the budget toward GiveUp.
+                    sse_reestablish_attempts.set(attempt + 1);
+
+                    let on_auth_failure = {
+                        let cid_for_auth = cid.clone();
+                        move || {
+                            spawn_reestablish_wave(ReestablishContext {
+                                cid: cid_for_auth.clone(),
+                                sse_handle,
+                                sse_reestablishing,
+                                sse_reestablish_attempts,
+                                sse_connection_generation,
+                                load_error,
+                                connection_lost,
+                                make_on_change,
+                            });
+                        }
+                    };
+
+                    match subscribe_chat_sse(cid.clone(), make_on_change(), on_auth_failure).await {
+                        Ok(h) => {
+                            sse_handle.set(Some(h));
+                            let armed_gen = sse_connection_generation.peek().wrapping_add(1);
+                            sse_connection_generation.set(armed_gen);
+                            sse_reestablishing.set(false);
+                            if connection_lost() {
+                                connection_lost.set(false);
+                            }
+                            if load_error.peek().is_some() {
+                                load_error.set(None);
+                            }
+                            let mut sse_reestablish_attempts = sse_reestablish_attempts;
+                            wasm_bindgen_futures::spawn_local(async move {
+                                gloo_timers::future::TimeoutFuture::new(SSE_HEALTHY_RESET_MS).await;
+                                let current = *sse_connection_generation.peek();
+                                if probation_reset_allowed(armed_gen, current) {
+                                    log::info!(
+                                        "✅ Chat SSE survived probation ({}ms); resetting retry budget",
+                                        SSE_HEALTHY_RESET_MS
+                                    );
+                                    sse_reestablish_attempts.set(0);
+                                }
+                            });
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!("⚠️ Failed to open SSE: {e}");
+                            // Re-drive the same charged wave. There is no live
+                            // EventSource here, so the failed reopen itself must
+                            // keep the bounded retry loop going until GiveUp.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use_effect(move || {
         let Some(cid) = resolved_conv_id() else {
             return; // still waiting for conversation resolution
@@ -377,138 +640,198 @@ pub fn ChatSidebar(
         // the whole Vec. This makes the per-event cost O(new messages) instead of
         // O(full history), which matters in N-person rooms where every turn would
         // otherwise trigger ~N full re-fetches.
-        let on_change = move |cid: String| {
-            log::info!("🪝 SSE on_change fired for conv_id={}", cid);
-            // ── Concurrency guard ──────────────────────────────────────────
-            // If a delta fetch is already in flight, do NOT start a second one
-            // that would read the same not-yet-advanced `sinceState` and re-fetch
-            // (and re-append) the same created message. Instead record that
-            // another change arrived; the in-flight run re-checks this flag when
-            // it finishes and runs exactly one more fetch. This collapses an SSE
-            // reconnect burst (or multi-named-event delivery) of one logical
-            // change into a single delta, while never dropping a genuinely-new
-            // change that landed mid-fetch.
-            let mut delta_in_flight = delta_in_flight;
-            let mut delta_pending = delta_pending;
-            if *delta_in_flight.peek() {
-                log::info!("⏳ Delta already in flight; coalescing this SSE event");
-                delta_pending.set(true);
-                return;
-            }
-            delta_in_flight.set(true);
-            wasm_bindgen_futures::spawn_local(async move {
-                // Loop so a change that arrives while we are fetching is serviced
-                // by exactly one follow-up fetch (not a new concurrent task).
-                loop {
-                    // Read the user id fresh at event time (untracked — we are in
-                    // a spawned async path, not a reactive scope) so a late-
-                    // resolving `my_user_id` still yields correct `is_self`.
-                    let uid = my_user_id.peek().clone();
-                    // Read the current delta token fresh; advanced after success.
-                    let since_state = chat_state_token.peek().clone();
-                    // Guard against an UNSEEDED token. The SSE effect (depends only
-                    // on `resolved_conv_id`) and the initial-load effect (which
-                    // seeds the token from `/get`'s `state`) both fire when the
-                    // conversation id resolves and run concurrently. If an SSE
-                    // StateChange lands before the initial load seeds the token,
-                    // `since_state` is still the `use_signal(String::new)` default
-                    // "". An empty `sinceState` is never a valid token (it is a
-                    // numeric string from `/get`); the server may treat it as
-                    // "since 0" and return the full tenant history, which would be
-                    // appended on top of the separately-completing initial snapshot
-                    // → duplicates. So no-op here: the initial newest-20 snapshot
-                    // covers this gap, and the next SSE event runs the delta
-                    // correctly once the token is seeded.
-                    if since_state.is_empty() {
-                        log::info!("⏳ SSE event before state token seeded; skipping delta");
-                        // Mirror the error-path cleanup below: a coalesced pending
-                        // flag set during this unseeded window must not survive the
-                        // break, or the next SSE event would trigger a spurious
-                        // extra delta-fetch.
-                        delta_pending.set(false);
-                        break;
-                    }
-                    log::info!("📥 Delta-fetching messages since state {}…", since_state);
-                    match get_message_changes(cid.clone(), since_state).await {
-                        Ok(changes) => {
-                            // Advance the token FIRST so even a no-op delta (state
-                            // moved but nothing for this conversation) doesn't refetch
-                            // the same window forever.
-                            chat_state_token.set(changes.new_state);
-
-                            if changes.created_messages.is_empty() {
-                                log::info!(
-                                    "✅ Delta returned no new messages for this conversation"
-                                );
-                            } else {
-                                log::info!(
-                                    "✅ Delta returned {} new message(s); appending",
-                                    changes.created_messages.len()
-                                );
-
-                                // Parse the new (already conversation-filtered, oldest→
-                                // newest) batch. Do NOT reverse: the server emits created
-                                // oldest-first and the Vec is oldest→newest.
-                                let new_msgs: Vec<ChatMessage> = changes
-                                    .created_messages
-                                    .iter()
-                                    .map(|m| parse_chat_message(m, &uid))
-                                    .collect();
-
-                                // Dedup by server id, reconcile optimistic bubbles,
-                                // append the rest, and cap — see [`merge_delta_messages`].
-                                // Returns whether a genuinely-new message from someone
-                                // else was appended (drives the unread badge below).
-                                let appended_from_other =
-                                    merge_delta_messages(&mut messages.write(), new_msgs);
-
-                                gloo_timers::future::TimeoutFuture::new(0).await;
-
-                                // Notify the parent ONLY when a genuinely-new message
-                                // from someone else arrived while the sidebar is closed,
-                                // so the badge signals "someone messaged you" and never
-                                // flips for a self-echo.
-                                if appended_from_other && !is_show_sig() {
-                                    on_new_message.call(());
-                                }
-
-                                scroll_chat_to_bottom();
-                                show_jump_button.set(false);
-                                log::info!("🎨 messages signal updated (appended delta)");
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("❌ SSE delta-fetch failed: {e:?}");
-                            // On failure the token did NOT advance. Do not loop on the
-                            // same window (would hot-spin on a persistent error); the
-                            // next SSE event re-triggers a fresh attempt. Drop any
-                            // coalesced pending flag so we exit cleanly.
+        // Fresh `on_change` closure factory. The auth-expiry re-establish path
+        // reopens the EventSource, which needs a NEW `on_change` each time
+        // (`subscribe_chat_sse` consumes it by value). All captured state is
+        // `Copy` (Dioxus signals / EventHandler), so rebuilding is cheap.
+        let make_on_change = move || {
+            move |cid: String| {
+                log::info!("🪝 SSE on_change fired for conv_id={}", cid);
+                // ── Concurrency guard ──────────────────────────────────────────
+                // If a delta fetch is already in flight, do NOT start a second one
+                // that would read the same not-yet-advanced `sinceState` and re-fetch
+                // (and re-append) the same created message. Instead record that
+                // another change arrived; the in-flight run re-checks this flag when
+                // it finishes and runs exactly one more fetch. This collapses an SSE
+                // reconnect burst (or multi-named-event delivery) of one logical
+                // change into a single delta, while never dropping a genuinely-new
+                // change that landed mid-fetch.
+                let mut delta_in_flight = delta_in_flight;
+                let mut delta_pending = delta_pending;
+                if *delta_in_flight.peek() {
+                    log::info!("⏳ Delta already in flight; coalescing this SSE event");
+                    delta_pending.set(true);
+                    return;
+                }
+                delta_in_flight.set(true);
+                wasm_bindgen_futures::spawn_local(async move {
+                    // Loop so a change that arrives while we are fetching is serviced
+                    // by exactly one follow-up fetch (not a new concurrent task).
+                    loop {
+                        // Read the user id fresh at event time (untracked — we are in
+                        // a spawned async path, not a reactive scope) so a late-
+                        // resolving `my_user_id` still yields correct `is_self`.
+                        let uid = my_user_id.peek().clone();
+                        // Read the current delta token fresh; advanced after success.
+                        let since_state = chat_state_token.peek().clone();
+                        // Guard against an UNSEEDED token. The SSE effect (depends only
+                        // on `resolved_conv_id`) and the initial-load effect (which
+                        // seeds the token from `/get`'s `state`) both fire when the
+                        // conversation id resolves and run concurrently. If an SSE
+                        // StateChange lands before the initial load seeds the token,
+                        // `since_state` is still the `use_signal(String::new)` default
+                        // "". An empty `sinceState` is never a valid token (it is a
+                        // numeric string from `/get`); the server may treat it as
+                        // "since 0" and return the full tenant history, which would be
+                        // appended on top of the separately-completing initial snapshot
+                        // → duplicates. So no-op here: the initial newest-20 snapshot
+                        // covers this gap, and the next SSE event runs the delta
+                        // correctly once the token is seeded.
+                        if since_state.is_empty() {
+                            log::info!("⏳ SSE event before state token seeded; skipping delta");
+                            // Mirror the error-path cleanup below: a coalesced pending
+                            // flag set during this unseeded window must not survive the
+                            // break, or the next SSE event would trigger a spurious
+                            // extra delta-fetch.
                             delta_pending.set(false);
                             break;
                         }
-                    }
+                        log::info!("📥 Delta-fetching messages since state {}…", since_state);
+                        match get_message_changes(cid.clone(), since_state).await {
+                            Ok(changes) => {
+                                // Advance the token FIRST so even a no-op delta (state
+                                // moved but nothing for this conversation) doesn't refetch
+                                // the same window forever.
+                                chat_state_token.set(changes.new_state);
 
-                    // If another SSE event arrived while we were fetching, service
-                    // it now with exactly ONE more iteration (the token has since
-                    // advanced, so this fetch sees only what is genuinely new).
-                    // Otherwise we are done — clear the in-flight flag so the next
-                    // event can start a fresh run.
-                    if *delta_pending.peek() {
-                        delta_pending.set(false);
-                        continue;
+                                if changes.created_messages.is_empty() {
+                                    log::info!(
+                                        "✅ Delta returned no new messages for this conversation"
+                                    );
+                                } else {
+                                    log::info!(
+                                        "✅ Delta returned {} new message(s); appending",
+                                        changes.created_messages.len()
+                                    );
+
+                                    // Parse the new (already conversation-filtered, oldest→
+                                    // newest) batch. Do NOT reverse: the server emits created
+                                    // oldest-first and the Vec is oldest→newest.
+                                    let new_msgs: Vec<ChatMessage> = changes
+                                        .created_messages
+                                        .iter()
+                                        .map(|m| parse_chat_message(m, &uid))
+                                        .collect();
+
+                                    // Dedup by server id, reconcile optimistic bubbles,
+                                    // append the rest, and cap — see [`merge_delta_messages`].
+                                    // Returns whether a genuinely-new message from someone
+                                    // else was appended (drives the unread badge below).
+                                    let appended_from_other =
+                                        merge_delta_messages(&mut messages.write(), new_msgs);
+
+                                    gloo_timers::future::TimeoutFuture::new(0).await;
+
+                                    // Notify the parent ONLY when a genuinely-new message
+                                    // from someone else arrived while the sidebar is closed,
+                                    // so the badge signals "someone messaged you" and never
+                                    // flips for a self-echo.
+                                    if appended_from_other && !is_show_sig() {
+                                        on_new_message.call(());
+                                    }
+
+                                    scroll_chat_to_bottom();
+                                    show_jump_button.set(false);
+                                    log::info!("🎨 messages signal updated (appended delta)");
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("❌ SSE delta-fetch failed: {e:?}");
+                                // On failure the token did NOT advance. Do not loop on the
+                                // same window (would hot-spin on a persistent error); the
+                                // next SSE event re-triggers a fresh attempt. Drop any
+                                // coalesced pending flag so we exit cleanly.
+                                delta_pending.set(false);
+                                break;
+                            }
+                        }
+
+                        // If another SSE event arrived while we were fetching, service
+                        // it now with exactly ONE more iteration (the token has since
+                        // advanced, so this fetch sees only what is genuinely new).
+                        // Otherwise we are done — clear the in-flight flag so the next
+                        // event can start a fresh run.
+                        if *delta_pending.peek() {
+                            delta_pending.set(false);
+                            continue;
+                        }
+                        break;
                     }
-                    break;
-                }
-                delta_in_flight.set(false);
+                    delta_in_flight.set(false);
+                });
+            }
+        };
+
+        let mut sse_handle = sse_handle;
+        let mut load_error = load_error;
+        let mut connection_lost = connection_lost;
+
+        let cid_for_reestablish = cid.clone();
+        let start_reestablish_wave = move || {
+            spawn_reestablish_wave(ReestablishContext {
+                cid: cid_for_reestablish.clone(),
+                sse_handle,
+                sse_reestablishing,
+                sse_reestablish_attempts,
+                sse_connection_generation,
+                load_error,
+                connection_lost,
+                make_on_change,
             });
         };
-        // The SSE token exchange requires an await, so the subscription must
-        // run on the local task pool. The handle is stored back into the
-        // signal once the EventSource is established.
+
+        // Initial subscription: one shot, no retry budget. If the first `POST
+        // /sse/session` fails, the next auth-failure frame will drive the bounded
+        // re-establish helper above.
+        let on_auth_failure = move || {
+            if *sse_reestablishing.peek() {
+                log::info!(
+                    "⏳ SSE re-establish already in flight; ignoring duplicate token_expired"
+                );
+                return;
+            }
+            start_reestablish_wave();
+        };
+
+        let on_change = make_on_change();
         wasm_bindgen_futures::spawn_local(async move {
-            match subscribe_chat_sse(cid.clone(), on_change).await {
-                Ok(h) => sse_handle.set(Some(h)),
-                Err(e) => log::warn!("⚠️ Failed to open SSE: {e}"),
+            match subscribe_chat_sse(cid, on_change, on_auth_failure).await {
+                Ok(h) => {
+                    sse_handle.set(Some(h));
+                    let armed_gen = sse_connection_generation.peek().wrapping_add(1);
+                    sse_connection_generation.set(armed_gen);
+                    if connection_lost() {
+                        connection_lost.set(false);
+                    }
+                    if load_error.peek().is_some() {
+                        load_error.set(None);
+                    }
+                    let mut sse_reestablish_attempts = sse_reestablish_attempts;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(SSE_HEALTHY_RESET_MS).await;
+                        let current = *sse_connection_generation.peek();
+                        if probation_reset_allowed(armed_gen, current) {
+                            log::info!(
+                                "✅ Chat SSE survived probation ({}ms); resetting retry budget",
+                                SSE_HEALTHY_RESET_MS
+                            );
+                            sse_reestablish_attempts.set(0);
+                        }
+                    });
+                }
+                Err(e) => {
+                    log::warn!("⚠️ Failed to open SSE: {e}");
+                }
             }
         });
     });
@@ -656,7 +979,12 @@ pub fn ChatSidebar(
                                 span { "{err}" }
                             }
                         }
-                        if messages().is_empty() && load_error().is_none() {
+                        if connection_lost() {
+                            div { class: "chat-error",
+                                "Chat disconnected (session expired). Reload the page to reconnect."
+                            }
+                        }
+                        if messages().is_empty() && load_error().is_none() && !connection_lost() {
                             div { class: "chat-empty", "No messages yet. Be the first to say something!" }
                         }
                         for msg in messages().iter() {
@@ -764,6 +1092,138 @@ pub fn ChatSidebar(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ──────────── SSE re-establish termination / probation ────────────
+    //
+    // The runtime re-establish loop is spread across async sites (the retry
+    // backoff loop, the reopen-commit, the `subscribe_chat_sse` Ok/Err arms, and
+    // the delayed probation reset). The model below mirrors the accounting and
+    // termination behavior against the real source-of-truth decision fns
+    // (`next_reestablish_action`, `probation_reset_allowed`,
+    // `SSE_MAX_REESTABLISH_ATTEMPTS`) without needing wasm timers — so the
+    // TERMINATION guarantee is host-testable and breaks if the accounting
+    // regresses.
+
+    /// Replay the re-establish loop for a stream of cycle outcomes, mirroring the
+    /// runtime accounting:
+    ///   * each cycle first consults `next_reestablish_action(attempt, max, 0)`;
+    ///     `GiveUp` terminates the loop (returns `true`);
+    ///   * a `RefreshError` charges one attempt (site A) and retries;
+    ///   * a `ReopenedThenRefailed` charges one attempt at COMMIT (site B), then
+    ///     "reopens": because it re-fails before probation survives, the
+    ///     generation is bumped again, so `probation_reset_allowed(armed, current)`
+    ///     is FALSE — the budget is NOT reset (this is the crux of the bug fix);
+    ///   * a `ReopenError` charges one attempt at commit (site B) and keeps the
+    ///     same bounded wave moving toward `GiveUp` without double-counting.
+    ///
+    /// Returns `(gave_up, cycles_run)`. `gave_up == true` means the loop reached
+    /// `GiveUp` within `max` cycles instead of spinning forever.
+    fn run_reestablish_model(outcomes: &[CycleOutcome]) -> (bool, u32) {
+        let max = SSE_MAX_REESTABLISH_ATTEMPTS;
+        let mut attempt = 0u32;
+        let mut generation = 0u32;
+        let mut cycles = 0u32;
+        // Hard safety net: even a regressed (non-terminating) loop must not hang
+        // the test — bound iterations well above any sane budget and assert the
+        // model gave up within `max`.
+        let iteration_cap = max.saturating_mul(8).max(64);
+        for outcome in outcomes.iter().cycle() {
+            if cycles >= iteration_cap {
+                // Did not terminate within the safety bound → report not-gave-up
+                // so the caller's assertion fails loudly (instead of looping).
+                return (false, cycles);
+            }
+            match next_reestablish_action(attempt, max, 0) {
+                ReestablishAction::GiveUp => return (true, cycles),
+                ReestablishAction::Retry { delay_ms } => {
+                    assert!(delay_ms > 0, "retry delay must be non-zero (no busy-spin)");
+                    cycles += 1;
+                    match outcome {
+                        CycleOutcome::RefreshError => {
+                            // Site A: refresh failed → charge + retry.
+                            attempt += 1;
+                        }
+                        CycleOutcome::ReopenedThenRefailed => {
+                            // Site B: charge at commit BEFORE reopening.
+                            attempt += 1;
+                            // Reopen "succeeds": arm probation at gen+1.
+                            let armed = generation.wrapping_add(1);
+                            generation = armed;
+                            // It re-fails before probation survives: a new
+                            // reopen bumps the generation again, so the probation
+                            // reset for `armed` is gated OUT.
+                            generation = generation.wrapping_add(1);
+                            // The healthy-reset would only run if allowed:
+                            if probation_reset_allowed(armed, generation) {
+                                attempt = 0; // would defeat the cap — must NOT happen
+                            }
+                        }
+                        CycleOutcome::ReopenError => {
+                            // Site B charged at commit; the Err arm does NOT
+                            // charge again (no double-count).
+                            attempt += 1;
+                        }
+                    }
+                }
+            }
+        }
+        (false, cycles)
+    }
+
+    /// THE termination regression test for FINDING 1. A server (or injected
+    /// frame) that re-emits `token_expired` on EVERY reopen — i.e. every cycle is
+    /// `ReopenedThenRefailed` — must climb the budget to `GiveUp` after a BOUNDED
+    /// number of cycles, NOT loop forever.
+    ///
+    /// This FAILS if reset-on-bare-reopen is reintroduced: if the model treated a
+    /// bare reopen `Ok` as healthy and reset `attempt` to 0 (the old `Ok` arm
+    /// did `sse_reestablish_attempts.set(0)`), `attempt` would never climb,
+    /// `next_reestablish_action` would always return `Retry`, and the loop would
+    /// hit the `iteration_cap` and return `gave_up == false` — failing the assert
+    /// below. (The `probation_reset_allowed` gate is what prevents that reset, so
+    /// removing the gate / always-allowing it reintroduces the bug and trips this
+    /// test.)
+    #[test]
+    fn reopen_then_refail_storm_reaches_giveup_bounded() {
+        let (gave_up, cycles) = run_reestablish_model(&[CycleOutcome::ReopenedThenRefailed]);
+        assert!(
+            gave_up,
+            "a reopen-then-refail storm must reach GiveUp, not loop forever (reset-on-bare-reopen regression)"
+        );
+        assert_eq!(
+            cycles, SSE_MAX_REESTABLISH_ATTEMPTS,
+            "must make exactly the budgeted number of reopen cycles before giving up"
+        );
+    }
+
+    /// Mixed failure modes (refresh errors interleaved with reopen-then-refails)
+    /// must also terminate within the budget — every cycle charges exactly one
+    /// attempt regardless of which site, so the cap bounds the total.
+    #[test]
+    fn mixed_failure_modes_reach_giveup_bounded() {
+        let (gave_up, cycles) = run_reestablish_model(&[
+            CycleOutcome::ReopenedThenRefailed,
+            CycleOutcome::RefreshError,
+            CycleOutcome::ReopenError,
+        ]);
+        assert!(gave_up, "mixed failures must still terminate at GiveUp");
+        assert_eq!(
+            cycles, SSE_MAX_REESTABLISH_ATTEMPTS,
+            "each cycle charges exactly one attempt, so the cap bounds total cycles"
+        );
+    }
+
+    /// `probation_reset_allowed` is the gate that distinguishes "stream survived
+    /// probation" (generation unchanged) from "a reopen happened during
+    /// probation" (generation moved). Only the former may reset the budget.
+    #[test]
+    fn probation_reset_only_when_generation_unchanged() {
+        // Armed at gen 7, still gen 7 when the timer fires → survived → reset OK.
+        assert!(probation_reset_allowed(7, 7));
+        // A reopen during probation bumped the generation → must NOT reset.
+        assert!(!probation_reset_allowed(7, 8));
+        assert!(!probation_reset_allowed(7, 9));
+    }
 
     // ─────────────────────────── cap_messages ───────────────────────────
 
