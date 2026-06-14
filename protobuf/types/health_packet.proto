@@ -35,6 +35,27 @@ message VideoStats {
   double frames_buffered = 2;
   uint64 frames_decoded = 3;
   uint64 bitrate_kbps = 4;
+
+  // Buffered video playout latency (#1252): how far behind live this peer's
+  // decoded video is, in milliseconds. Spans BOTH receive pipeline stages —
+  // the jitter-buffer backlog (stage 1, the dominant arrival-time span) plus
+  // the WebCodecs decoder queue (stage 2, bounded by #1024's high-water mark).
+  // The receiver only reports a nonzero value while fps_received > 0, so a
+  // DecodeBudget-paused or hidden tile (stale buffered frame, no decode) can't
+  // masquerade as latency. 0 = at live; sustained >1800ms = the #1252 lag.
+  double playout_latency_ms = 5;
+  // Stage-1 attribution of playout_latency_ms: just the jitter-buffer backlog
+  // span (newest − next-to-release arrival time). Emitted separately so a
+  // dashboard can tell whether the #1024 release-side gate REMOVED the backlog
+  // or merely RELOCATED it (total stays high while this drops => relocated).
+  double playout_stage1_span_ms = 6;
+  // Stage-3 paint lag (#1252): decoded-but-unpainted frames living in the
+  // worker→main postMessage queue + main-thread paint task queue — a region
+  // decode_queue_size() (stage 2) cannot observe — valued at one source frame
+  // interval per outstanding frame. Computed in the worker as
+  // (frames_emitted − frames_painted) so the FIFO delay of the stats message
+  // itself does not hide the backlog. Reported only while fps_received > 0.
+  double playout_paint_lag_ms = 7;
 }
 
 message PeerStats {
@@ -189,7 +210,7 @@ message HealthPacket {
   optional double render_fps = 66;
 
   // Compatibility field added after TELEM-7/8/9 consumed 56-66.
-  optional double encoder_p75_peer_fps = 67;       // p75 peer FPS driving encoder decisions
+  optional double encoder_p75_peer_fps = 67;       // sender-side encoder queue depth (backpressure) driving encoder decisions; field NAME frozen — value is queue depth, NOT p75 peer FPS (#1231/#1263)
 
   // Adaptive decode-budget controller state (#987). Surfaces the receiver-side
   // tile-cap decision so population-scale dashboards can see the adaptive loop's
