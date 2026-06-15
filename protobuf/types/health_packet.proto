@@ -28,6 +28,19 @@ message NetEqStats {
   // needed to absorb observed network jitter. This IS the network jitter metric;
   // < 30ms = excellent, < 75ms = acceptable, >= 75ms = degraded.
   double target_delay_ms = 5;
+
+  // Audio playout latency (#1299): how far behind live this peer's audio
+  // playout sits, in milliseconds. This is NetEQ's WebRTC-style FILTERED
+  // current buffer level (the EWMA-smoothed playout buffer, updated every
+  // decode tick in get_decision) — the exact value the Accelerate gate
+  // compares against high_limit. It is the audio sibling of
+  // VideoStats.playout_latency_ms (#1252). Distinct from current_buffer_size_ms
+  // (field 1, the RAW instantaneous snapshot) and from target_delay_ms
+  // (field 5, the TARGET, not the actual): when #1299's lag accumulates this
+  // filtered level ratchets up and gates Accelerate off, so this is the field
+  // that makes the audio lag observable. 0 = at live; a sustained multi-second
+  // value is the #1299 lag. Observability only — no governor/resync attached.
+  double playout_latency_ms = 6;
 }
 
 message VideoStats {
@@ -272,6 +285,40 @@ message HealthPacket {
   // (encoded + sent). The AQ controller sheds the top layer(s) under congestion,
   // so this can be < effective_video_layers. The gap is the shed depth.
   optional uint32 active_video_layers = 76;
+
+  // Encoder auto-RESTART counters (#527), cumulative since page load,
+  // partitioned by reason. Distinct from the *_errors_* counters above: those
+  // count fault OCCURRENCES; these count restart CYCLES (the encode loop
+  // re-entering its 'restart loop). The relay's metrics_server expands these
+  // into a single labeled counter
+  // videocall_encoder_restart_total{kind=camera|screen, reason=closed_codec|memory|configure|other}.
+  // Only attached when non-zero (healthy sessions never restart), mirroring the
+  // encoder-error fields. Cold start and user-initiated stop do NOT bump these.
+  optional uint64 camera_encoder_restarts_closed_codec = 77;
+  optional uint64 camera_encoder_restarts_memory = 78;
+  optional uint64 camera_encoder_restarts_configure = 79;
+  optional uint64 camera_encoder_restarts_other = 80;
+  optional uint64 screen_encoder_restarts_closed_codec = 81;
+  optional uint64 screen_encoder_restarts_memory = 82;
+  optional uint64 screen_encoder_restarts_configure = 83;
+  optional uint64 screen_encoder_restarts_other = 84;
+
+  // RTT-probe resilience signals (#522). Surface the client-side RTT-probe
+  // backpressure/staleness the merged #522 core already tracks so operators can
+  // see probe-pipeline health across the fleet server-side. Both are cumulative
+  // since the ConnectionManager was created and re-sent every health packet
+  // (same convention as the connection-loss counters in fields 54-55); the
+  // relay's metrics_server `.set()`s each onto a per-reporter GaugeVec so Grafana
+  // charts rate()/increase() exactly as for the sibling *_total gauges.
+  //
+  // rtt_probe_dropped_total = cumulative count of RTT probes dropped because the
+  // in-flight probe queue was at MAX_INFLIGHT_PROBES (queue-cap backpressure).
+  optional uint64 rtt_probe_dropped_total = 85; // (#522)
+  // rtt_probe_stale_suppressions_total = cumulative count of 1 Hz diagnostics
+  // ticks on which the active link's RTT-probe pipeline was stale and so
+  // active_server_rtt was suppressed (observability-only; does NOT change the
+  // suppression/re-election behavior, only counts it).
+  optional uint64 rtt_probe_stale_suppressions_total = 86; // (#522)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the
