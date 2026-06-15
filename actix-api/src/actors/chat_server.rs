@@ -53,7 +53,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
-    RELAY_CONGESTION_FILTERED_TOTAL, RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
+    RELAY_CONGESTION_FILTERED_TOTAL, RELAY_INBOUND_MAILBOX_DROPS_TOTAL,
+    RELAY_INNER_SESSION_SELF_FILTERED_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
     RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
     RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
@@ -4321,6 +4322,17 @@ fn handle_msg(
             subject_self || inner_session_self
         };
         if drop_self_echo && !is_congestion && !is_layer_hint {
+            // Count ONLY the #618 post-reconnect leak shape: the embedded inner
+            // session_id matched our OWN session, but the NATS subject did NOT
+            // (it pointed at a STALE/different session). A routine self-echo is
+            // EXCLUDED here because the relay stamps the inner session_id on
+            // publish (`session_id = session` at the publish path above), so an
+            // ordinary echo arrives with BOTH subject_self AND inner_session_self
+            // true — the `!subject_self` arm filters it out so the leak signal is
+            // not drowned by routine self-echo volume (#629).
+            RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+                .with_label_values(&[&room])
+                .inc();
             return Ok(());
         }
 
@@ -6781,6 +6793,220 @@ mod tests {
             1.0,
             "#1220: dropping a non-target CONGESTION must increment \
              relay_congestion_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #618 (the leak) / #629 (this metric): a DIAGNOSTICS packet that arrives on
+    /// a STALE post-reconnect subject (subject session != our current session)
+    /// but carries our OWN session_id embedded must be dropped by the
+    /// inner-`session_id` self-skip (`inner_session_self`), and that drop must
+    /// increment `relay_inner_session_self_filtered_total{room}` exactly once.
+    /// This reproduces the 2026-05-08 production leak where a stale subscription
+    /// survived a reconnect and delivered self-DIAGNOSTICS back to the reporter.
+    ///
+    /// MUTATION PROOF: removing the `inner_session_self` operand from
+    /// `drop_self_echo` (so a non-self subject no longer triggers the self-skip)
+    /// forwards the DIAGNOSTICS packet -> `count` becomes 1, failing assert (a);
+    /// removing the `.inc()` inside the `if inner_session_self` guard makes the
+    /// metric delta 0.0, failing assert (b).
+    #[actix_rt::test]
+    async fn test_handle_msg_self_diagnostics_inner_session_dropped_and_metric_incremented() {
+        let room = "self-diag-inner-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver's CURRENT session is 8888. The packet arrives on a STALE
+        // subject keyed to an old session (1234) — what a subscription that
+        // survived a reconnect would deliver — but its embedded session_id is
+        // still 8888 (our own), exactly the #618 leak shape.
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            8888,
+            false,
+            "reporter-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.1234"),
+            make_packet_bytes_with_session(PacketType::DIAGNOSTICS, 8888),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "#618: self-DIAGNOSTICS on a STALE post-reconnect subject whose \
+             embedded session_id still equals our current session (8888) must \
+             be dropped by the inner-session self-skip, NOT forwarded"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            1.0,
+            "#629: the inner-session self-skip drop must increment \
+             relay_inner_session_self_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #629: a PLAIN self-echo — a packet on the receiver's OWN subject with no
+    /// embedded session_id (inner session_id 0) — is dropped via `subject_self`,
+    /// NOT via the inner-`session_id` arm. The
+    /// `relay_inner_session_self_filtered_total` counter MUST NOT fire for it,
+    /// because #629 specifically wants to surface the post-reconnect inner-id
+    /// leak rate, not ordinary (expected, uninteresting) subject self-echoes.
+    ///
+    /// MUTATION PROOF: moving the `.inc()` OUTSIDE the `if inner_session_self`
+    /// guard (so it increments on every self-echo drop, including plain
+    /// `subject_self` echoes) makes this delta 1.0, failing assert (b).
+    #[actix_rt::test]
+    async fn test_handle_msg_inner_session_self_metric_not_incremented_for_plain_subject_echo() {
+        let room = "plain-echo-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver's session is 5555 and the packet arrives on its OWN subject
+        // (`room.{room}.5555`). The inner session_id stays 0, so
+        // `inner_session_self` is false and `subject_self` is true: the drop
+        // happens via the plain subject self-echo path, which must NOT touch the
+        // inner-session metric.
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            5555,
+            false,
+            "self-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.5555"),
+            make_packet_bytes(PacketType::MEDIA),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "a MEDIA packet on the receiver's own subject must be dropped as a \
+             plain subject_self echo"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            0.0,
+            "#629: a plain subject_self echo (inner session_id 0) must NOT \
+             increment relay_inner_session_self_filtered_total"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #629 over-count regression guard: an ORDINARY relay-stamped self-echo —
+    /// subject == our OWN subject AND inner session_id == our session — must NOT
+    /// increment `relay_inner_session_self_filtered_total`. The relay stamps
+    /// `session_id = session` on publish (the publish path stamps id when the
+    /// client sent 0), so a routine self-echo arrives with BOTH `subject_self`
+    /// and `inner_session_self` true. The increment guard's `!subject_self` arm
+    /// excludes it; only the #618 leak shape (inner-id match WITHOUT subject
+    /// match) is counted. Without this exclusion the leak signal would be
+    /// drowned by routine self-echo volume.
+    ///
+    /// MUTATION PROOF: reverting the guard from `if inner_session_self &&
+    /// !subject_self` back to `if inner_session_self` makes this stamped own-
+    /// subject echo increment the metric -> delta becomes 1.0 -> assert (b)
+    /// FAILS. That is exactly the over-count bug this guard closes.
+    #[actix_rt::test]
+    async fn test_handle_msg_inner_session_self_metric_not_incremented_for_stamped_own_subject_echo(
+    ) {
+        let room = "stamped-echo-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver session 4242. This is the RELAY-STAMPED routine echo shape:
+        // the packet arrives on the receiver's OWN subject (`room.{room}.4242`)
+        // AND carries inner session_id 4242 (non-zero, as the publish stamp
+        // sets it). subject_self TRUE and inner_session_self TRUE — the routine
+        // echo the OLD `if inner_session_self` guard wrongly counted.
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            4242,
+            false,
+            "self-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.4242"),
+            make_packet_bytes_with_session(PacketType::MEDIA, 4242),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "a relay-stamped own-subject self-echo must be dropped \
+             (subject_self || inner_session_self), NOT forwarded"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            0.0,
+            "#629: an ordinary relay-stamped own-subject echo (subject_self AND \
+             inner_session_self both true) must NOT increment \
+             relay_inner_session_self_filtered_total — the `!subject_self` arm \
+             excludes it"
         );
 
         // Leave no residual series for the #996 GC guard / other tests.
