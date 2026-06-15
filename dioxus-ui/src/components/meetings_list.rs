@@ -30,6 +30,7 @@ use crate::constants::meeting_api_client;
 use crate::local_storage::{load_bool, load_json, save_bool, save_json};
 use crate::routing::Route;
 use dioxus::prelude::*;
+use std::rc::Rc;
 use videocall_meeting_types::responses::{ListFeedResponse, MeetingFeedSummary};
 use wasm_bindgen::JsCast;
 
@@ -97,9 +98,16 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
     // (meetings, filter, sort) change — NOT on every unrelated re-render. `now`
     // is read once per recompute via the browser clock; the actual filtering is
     // the pure `filter_and_sort_meetings` (host-testable with `now` injected).
+    //
+    // issue 498 (memo-level Rc form): wrap each row in `Rc` here so passing a
+    // row into `MeetingItem` is a cheap pointer clone instead of a deep clone
+    // of the whole `MeetingFeedSummary` on every parent re-render.
     let visible_meetings = use_memo(move || {
         let now_ms = js_sys::Date::now() as i64;
         filter_and_sort_meetings(&meetings(), &filter(), &sort(), now_ms)
+            .into_iter()
+            .map(Rc::new)
+            .collect::<Vec<_>>()
     });
 
     #[allow(unused_mut)]
@@ -313,7 +321,10 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
 
 #[component]
 fn MeetingItem(
-    meeting: MeetingFeedSummary,
+    // issue 498: shared via `Rc` so the parent hands us a cheap pointer clone
+    // instead of deep-cloning the whole `MeetingFeedSummary` per row on every
+    // re-render. We only read fields here; we never mutate the row in place.
+    meeting: Rc<MeetingFeedSummary>,
     on_select_meeting: Option<EventHandler<String>>,
     on_delete: EventHandler<String>,
 ) -> Element {
@@ -389,15 +400,28 @@ fn MeetingItem(
     // browser-back inside the same SPA route isn't worth the global handler.
     use_drop(hide_meeting_info_tooltip);
 
-    let tooltip_html = build_meeting_tooltip_html(&meeting, is_active, is_ended, duration_ms);
-    let tooltip_html_for_show = tooltip_html.clone();
+    // issue 497: defer the tooltip HTML build to hover. A dedicated `Rc` clone
+    // (cheap pointer clone) is captured by the `FnMut` hover handler so it can
+    // rebuild the HTML on each `mouseenter`; the scalars `is_active`/`is_ended`/
+    // `duration_ms` are `Copy`. This avoids building HTML for every row on every
+    // render — it now runs only when a row is actually hovered.
+    let meeting_for_tooltip = meeting.clone();
 
     rsx! {
         li {
             class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" },
+            // issue 497: tooltip HTML is built lazily here on hover (not eagerly
+            // per render); content is byte-for-byte identical to the prior eager
+            // build (same helper, same args).
             onmouseenter: move |e: MouseEvent| {
                 let coords = e.client_coordinates();
-                show_meeting_info_tooltip(coords.x, coords.y, &tooltip_html_for_show);
+                let html = build_meeting_tooltip_html(
+                    &meeting_for_tooltip,
+                    is_active,
+                    is_ended,
+                    duration_ms,
+                );
+                show_meeting_info_tooltip(coords.x, coords.y, &html);
             },
             onmousemove: move |e: MouseEvent| {
                 let coords = e.client_coordinates();
