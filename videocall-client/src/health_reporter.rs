@@ -26,9 +26,13 @@ use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::encode::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
-    camera_encoder_frames_submitted_ok, screen_encoder_errors_closed_codec,
+    camera_encoder_frames_submitted_ok, camera_encoder_restarts_closed_codec,
+    camera_encoder_restarts_configure, camera_encoder_restarts_memory,
+    camera_encoder_restarts_other, screen_encoder_errors_closed_codec,
     screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
     screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
+    screen_encoder_restarts_closed_codec, screen_encoder_restarts_configure,
+    screen_encoder_restarts_memory, screen_encoder_restarts_other,
 };
 use log::{debug, trace, warn};
 use protobuf::Message;
@@ -1493,6 +1497,44 @@ impl HealthReporter {
             pb.screen_encoder_frames_submitted_ok = Some(scr_frames);
         }
 
+        // Encoder auto-restart counters (#527), partitioned by reason. Same
+        // zero-cost-static + non-zero-only convention as the error counters
+        // above. The relay's metrics_server folds these into the single labeled
+        // counter videocall_encoder_restart_total{kind, reason}.
+        let cam_restart_closed = camera_encoder_restarts_closed_codec();
+        let cam_restart_mem = camera_encoder_restarts_memory();
+        let cam_restart_cfg = camera_encoder_restarts_configure();
+        let cam_restart_other = camera_encoder_restarts_other();
+        let scr_restart_closed = screen_encoder_restarts_closed_codec();
+        let scr_restart_mem = screen_encoder_restarts_memory();
+        let scr_restart_cfg = screen_encoder_restarts_configure();
+        let scr_restart_other = screen_encoder_restarts_other();
+
+        if cam_restart_closed > 0 {
+            pb.camera_encoder_restarts_closed_codec = Some(cam_restart_closed);
+        }
+        if cam_restart_mem > 0 {
+            pb.camera_encoder_restarts_memory = Some(cam_restart_mem);
+        }
+        if cam_restart_cfg > 0 {
+            pb.camera_encoder_restarts_configure = Some(cam_restart_cfg);
+        }
+        if cam_restart_other > 0 {
+            pb.camera_encoder_restarts_other = Some(cam_restart_other);
+        }
+        if scr_restart_closed > 0 {
+            pb.screen_encoder_restarts_closed_codec = Some(scr_restart_closed);
+        }
+        if scr_restart_mem > 0 {
+            pb.screen_encoder_restarts_memory = Some(scr_restart_mem);
+        }
+        if scr_restart_cfg > 0 {
+            pb.screen_encoder_restarts_configure = Some(scr_restart_cfg);
+        }
+        if scr_restart_other > 0 {
+            pb.screen_encoder_restarts_other = Some(scr_restart_other);
+        }
+
         // Connection-loss reason counters
         if handshake_failures_total > 0 {
             pb.connection_handshake_failures_total = Some(handshake_failures_total);
@@ -1677,6 +1719,14 @@ impl HealthReporter {
                     // Delay manager target: the algorithm's estimate of buffering needed
                     // to absorb observed network jitter. This is the real VoIP jitter metric.
                     ns.target_delay_ms = v;
+                }
+                // Audio playout latency (#1299): NetEQ's filtered current buffer level — how far
+                // behind live this peer's audio playout sits. The audio sibling of
+                // VideoStats.playout_latency_ms (#1252). Surfaced straight from the NetEQ stats
+                // JSON top-level (NetEqStats::playout_latency_ms); when the field is absent (older
+                // NetEQ worker) it stays at the proto 0.0 default = "at live". Observability only.
+                if let Some(v) = neteq.get("playout_latency_ms").and_then(|v| v.as_f64()) {
+                    ns.playout_latency_ms = v;
                 }
 
                 // Calculate audio packet loss percentage from WINDOWED rates (not lifetime)
@@ -2372,6 +2422,105 @@ mod tests {
 
         assert_eq!(stats.fps_received, 0.0);
         assert_eq!(stats.playout_paint_lag_ms, 0.0);
+    }
+
+    /// Build a health packet whose peer carries NetEQ audio stats. `playout_latency_ms` is
+    /// `Some(v)` to include the field in the stats JSON (the shape the NetEQ worker emits at the
+    /// top level of NetEqStats), or `None` to OMIT it entirely (the older-worker / pre-#1299 case).
+    fn health_packet_with_neteq_playout_latency(playout_latency_ms: Option<f64>) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        let mut neteq = json!({
+            "current_buffer_size_ms": 200.0,
+            "target_delay_ms": 80.0,
+            "packets_awaiting_decode": 3.0,
+            "packets_per_sec": 50.0,
+        });
+        if let Some(v) = playout_latency_ms {
+            neteq["playout_latency_ms"] = json!(v);
+        }
+        peer.update_audio_stats(neteq);
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// Audio playout latency (#1299): when NetEQ reports a filtered playout buffer level in the
+    /// stats JSON, it must fold into NetEqStats.playout_latency_ms on the wire. Mirrors the video
+    /// sibling test. Fails if the read in create_health_packet is dropped or reads the wrong key.
+    #[test]
+    fn audio_playout_latency_folds_from_neteq_stats() {
+        let pb = health_packet_with_neteq_playout_latency(Some(1450.0));
+        let neteq = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .neteq_stats
+            .as_ref()
+            .expect("neteq stats must be present");
+
+        assert_eq!(neteq.playout_latency_ms, 1450.0);
+        // Sanity: the metric is distinct from the raw buffer snapshot it travels alongside.
+        assert_eq!(neteq.current_buffer_size_ms, 200.0);
+    }
+
+    /// When the NetEQ stats JSON OMITS playout_latency_ms (older worker / pre-#1299), the proto
+    /// field must stay at its 0.0 default ("at live"), never a stale or fabricated value. Guards
+    /// against the #1338-style false-value trap.
+    #[test]
+    fn audio_playout_latency_defaults_to_zero_when_absent() {
+        let pb = health_packet_with_neteq_playout_latency(None);
+        let neteq = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .neteq_stats
+            .as_ref()
+            .expect("neteq stats must be present");
+
+        assert_eq!(neteq.playout_latency_ms, 0.0);
     }
 
     /// #1032: a cached agent-memory reading rides the HealthPacket on the wire.
