@@ -256,14 +256,38 @@ prometheus:
                 summary: "NATS publish latency p99 > 50ms"
                 description: "NATS publish p99 latency is {{ $value | printf \"%.1f\" }}ms"
 
-            - alert: RelayQueueNearFull
-              expr: relay_outbound_queue_depth > 100
+            # RelayQueueNearFull is split per transport because the single
+            # relay_outbound_queue_depth gauge carries an 8x-different max per
+            # transport, so one scalar threshold cannot express "near full" for
+            # both: WS max = WS_OUTBOUND_CHANNEL_CAPACITY (128); WT max = the SUM
+            # of the unistream (WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 512) and
+            # datagram (WT_DATAGRAM_CHANNEL_CAPACITY, 512) channels = 1024. The
+            # gauge has only room+transport labels (no per-primitive label yet),
+            # so the WT rule anchors on 410 (~80% of the 512 unistream queue),
+            # not 80% of the 1024 sum: under congestion the reliable unistream
+            # backs up first (it blocks on QUIC flow control) while the datagram
+            # path drops rather than queues, so a ~410-deep unistream backlog —
+            # the source of the freeze symptom — would otherwise hide under the
+            # summed gauge whenever datagrams are near-empty. Exporting a
+            # per-primitive depth label so the WT rule can target the unistream
+            # queue directly is a source-side follow-up (issue #710).
+            - alert: RelayQueueNearFullWS
+              expr: relay_outbound_queue_depth{transport="websocket"} > 102
               for: 30s
               labels:
                 severity: warning
               annotations:
-                summary: "Relay outbound queue near capacity ({{ $labels.transport }})"
-                description: "Room {{ $labels.room }} ({{ $labels.transport }}) queue depth: {{ $value }} (WS cap=128, WT cap=256)"
+                summary: "Relay WS outbound queue near capacity"
+                description: "Room {{ $labels.room }} (websocket) queue depth: {{ $value }} of 128 (WS cap=128)"
+
+            - alert: RelayQueueNearFullWT
+              expr: relay_outbound_queue_depth{transport="webtransport"} > 410
+              for: 30s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Relay WT outbound queue near capacity"
+                description: "Room {{ $labels.room }} (webtransport) queue depth: {{ $value }} (WT cap=1024: unistream 512 + datagram 512; alert anchors on the 512 unistream queue)"
 
         - name: videocall_quality_alerts
           rules:
