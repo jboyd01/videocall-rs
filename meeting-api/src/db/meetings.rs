@@ -239,6 +239,11 @@ pub async fn count_search_by_owner(
 ///
 /// The `last_joined_at` value is `p.admitted_at`. The query filters on
 /// `admitted_at IS NOT NULL`, so this column is always populated.
+///
+/// Counts are folded into the same SELECT (LEFT JOIN LATERAL) so the route
+/// handler does not need to issue per-row queries to assemble
+/// participant_count / waiting_count. Status semantics match the legacy
+/// `db_participants::count_admitted` / `count_waiting` helpers byte-for-byte.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct JoinedMeetingRow {
@@ -251,6 +256,8 @@ pub struct JoinedMeetingRow {
     pub password_hash: Option<String>,
     pub state: Option<String>,
     pub last_joined_at: DateTime<Utc>,
+    pub participant_count: i64,
+    pub waiting_count: i64,
 }
 
 /// List meetings the user has been admitted into at least once, including
@@ -277,10 +284,24 @@ pub async fn list_joined_by_user(
                m.creator_id,
                m.password_hash,
                m.state,
-               p.admitted_at AS last_joined_at
+               p.admitted_at AS last_joined_at,
+               COALESCE(pc.admitted_count, 0) AS participant_count,
+               COALESCE(wc.waiting_count, 0) AS waiting_count
         FROM meetings m
         INNER JOIN meeting_participants p
             ON p.meeting_id = m.id AND p.user_id = $1
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS admitted_count
+            FROM meeting_participants
+            WHERE meeting_id = m.id
+              AND status = 'admitted'
+        ) pc ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS waiting_count
+            FROM meeting_participants
+            WHERE meeting_id = m.id
+              AND status = 'waiting'
+        ) wc ON TRUE
         WHERE m.deleted_at IS NULL
           AND p.admitted_at IS NOT NULL
         ORDER BY p.admitted_at DESC, m.id DESC
