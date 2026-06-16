@@ -4330,9 +4330,11 @@ fn handle_msg(
             // ordinary echo arrives with BOTH subject_self AND inner_session_self
             // true — the `!subject_self` arm filters it out so the leak signal is
             // not drowned by routine self-echo volume (#629).
-            RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
-                .with_label_values(&[&room])
-                .inc();
+            if inner_session_self && !subject_self {
+                RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+                    .with_label_values(&[&room])
+                    .inc();
+            }
             return Ok(());
         }
 
