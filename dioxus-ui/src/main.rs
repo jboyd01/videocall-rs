@@ -16,6 +16,7 @@ mod provider_config;
 mod routing;
 mod shared;
 mod theme;
+mod theme_file;
 mod types;
 mod util;
 
