@@ -120,9 +120,7 @@ test.describe("Theme initialization from localStorage", () => {
     await page.evaluate(() => localStorage.setItem("ui-theme", "system"));
     await page.reload();
 
-    const theme = await page.evaluate(() =>
-      document.documentElement.getAttribute("data-theme"),
-    );
+    const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
     expect(theme).toBeTruthy();
     expect(["light", "dark"]).toContain(theme);
   });
