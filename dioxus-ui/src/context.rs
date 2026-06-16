@@ -9,7 +9,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use dioxus_sdk_storage::{LocalStorage, StorageBacking};
 use videocall_client::VideoCallClient;
 
 /// Per-tile crop state: canvas ID → is-cropped.
@@ -387,34 +386,33 @@ pub const MAX_CUSTOM_COLORS: usize = 10;
 pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
     let mut settings = AppearanceSettings::default();
 
-    if let Some(value) =
-        LocalStorage::get::<String>(&APPEARANCE_GLOW_ENABLED_STORAGE_KEY.to_string())
-    {
+    if let Some(value) = read_local_storage(APPEARANCE_GLOW_ENABLED_STORAGE_KEY) {
         settings.glow_enabled = value != "false";
     }
 
-    if let Some(color) = LocalStorage::get::<String>(&APPEARANCE_COLOR_STORAGE_KEY.to_string()) {
+    if let Some(color) = read_local_storage(APPEARANCE_COLOR_STORAGE_KEY) {
         if let Some(parsed) = GlowColor::from_storage(&color) {
             settings.glow_color = parsed;
         }
     }
 
-    if let Some(value) = LocalStorage::get::<f32>(&APPEARANCE_BRIGHTNESS_STORAGE_KEY.to_string()) {
+    if let Some(value) =
+        read_local_storage(APPEARANCE_BRIGHTNESS_STORAGE_KEY).and_then(|v| v.parse::<f32>().ok())
+    {
         settings.glow_brightness = value.clamp(0.0, 1.0);
     }
 
-    if let Some(value) = LocalStorage::get::<f32>(&APPEARANCE_INNER_STORAGE_KEY.to_string()) {
+    if let Some(value) =
+        read_local_storage(APPEARANCE_INNER_STORAGE_KEY).and_then(|v| v.parse::<f32>().ok())
+    {
         settings.inner_glow_strength = value.clamp(0.0, 1.0);
     }
 
-    if let Some(value) =
-        LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string())
-    {
+    if let Some(value) = read_local_storage(APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY) {
         settings.show_join_leave_notifications = value != "false";
     }
 
-    if let Some(value) = LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string())
-    {
+    if let Some(value) = read_local_storage(APPEARANCE_JOIN_LEAVE_SOUNDS_KEY) {
         settings.play_join_leave_sounds = value != "false";
     }
 
@@ -423,35 +421,35 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
 
 /// Save local-only appearance settings to storage.
 pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
-    LocalStorage::set(
-        APPEARANCE_GLOW_ENABLED_STORAGE_KEY.to_string(),
+    write_local_storage(
+        APPEARANCE_GLOW_ENABLED_STORAGE_KEY,
         &settings.glow_enabled.to_string(),
     );
-    LocalStorage::set(
-        APPEARANCE_COLOR_STORAGE_KEY.to_string(),
-        &settings.glow_color.to_storage().to_string(),
+    write_local_storage(
+        APPEARANCE_COLOR_STORAGE_KEY,
+        &settings.glow_color.to_storage(),
     );
-    LocalStorage::set(
-        APPEARANCE_BRIGHTNESS_STORAGE_KEY.to_string(),
-        &settings.glow_brightness.clamp(0.0, 1.0),
+    write_local_storage(
+        APPEARANCE_BRIGHTNESS_STORAGE_KEY,
+        &settings.glow_brightness.clamp(0.0, 1.0).to_string(),
     );
-    LocalStorage::set(
-        APPEARANCE_INNER_STORAGE_KEY.to_string(),
-        &settings.inner_glow_strength.clamp(0.0, 1.0),
+    write_local_storage(
+        APPEARANCE_INNER_STORAGE_KEY,
+        &settings.inner_glow_strength.clamp(0.0, 1.0).to_string(),
     );
-    LocalStorage::set(
-        APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string(),
+    write_local_storage(
+        APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY,
         &settings.show_join_leave_notifications.to_string(),
     );
-    LocalStorage::set(
-        APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string(),
+    write_local_storage(
+        APPEARANCE_JOIN_LEAVE_SOUNDS_KEY,
         &settings.play_join_leave_sounds.to_string(),
     );
 }
 
 /// Load custom glow colors from local storage.
 pub fn load_custom_colors_from_storage() -> Vec<GlowColor> {
-    let Some(csv) = LocalStorage::get::<String>(&CUSTOM_COLORS_STORAGE_KEY.to_string()) else {
+    let Some(csv) = read_local_storage(CUSTOM_COLORS_STORAGE_KEY) else {
         return Vec::new();
     };
     csv.split(',')
@@ -481,7 +479,7 @@ pub fn save_custom_colors_to_storage(colors: &[GlowColor]) {
         .take(MAX_CUSTOM_COLORS)
         .collect::<Vec<_>>()
         .join(",");
-    LocalStorage::set(CUSTOM_COLORS_STORAGE_KEY.to_string(), &csv);
+    write_local_storage(CUSTOM_COLORS_STORAGE_KEY, &csv);
 }
 
 /// VideoCallClient context for sharing the client instance across components.
@@ -600,23 +598,21 @@ const STORAGE_KEY: &str = "vc_display_name";
 
 /// Load the persisted display name from local storage.
 ///
-/// Uses [`dioxus_sdk_storage::LocalStorage`] which maps to the browser's
-/// `localStorage` on web and the file system on native platforms.  Returns
-/// `None` when no name has been saved yet, or when the stored value is empty.
+/// Reads the plain-text value stored under [`STORAGE_KEY`] in the browser's
+/// `localStorage`.  Returns `None` when no name has been saved yet, or when
+/// the stored value is empty.
 pub fn load_display_name_from_storage() -> Option<String> {
-    LocalStorage::get::<Option<String>>(&STORAGE_KEY.to_string())
-        .flatten()
-        .filter(|s| !s.is_empty())
+    read_local_storage(STORAGE_KEY)
 }
 
 /// Persist the display name to local storage.
 pub fn save_display_name_to_storage(display_name: &str) {
-    LocalStorage::set(STORAGE_KEY.to_string(), &Some(display_name.to_string()));
+    write_local_storage(STORAGE_KEY, display_name);
 }
 
 /// Remove the display name from local storage entirely (e.g. on logout).
 pub fn clear_display_name_from_storage() {
-    LocalStorage::set(STORAGE_KEY.to_string(), &None::<String>);
+    remove_local_storage(STORAGE_KEY);
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +642,43 @@ fn read_local_storage(key: &str) -> Option<String> {
 fn write_local_storage(key: &str, value: &str) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item(key, value);
+    }
+}
+
+fn remove_local_storage(key: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(key);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session-storage helpers (plain-text, no CBOR/zlib)
+// ---------------------------------------------------------------------------
+
+/// Read a plain-text value from the browser's `sessionStorage`.
+///
+/// Returns `None` when `sessionStorage` is unavailable, the key is missing,
+/// or the stored value is empty.
+pub(crate) fn read_session_storage(key: &str) -> Option<String> {
+    web_sys::window()
+        .and_then(|w| w.session_storage().ok().flatten())
+        .and_then(|s| s.get_item(key).ok().flatten())
+        .filter(|v| !v.is_empty())
+}
+
+/// Write a plain-text value to the browser's `sessionStorage`.
+/// Silently ignores failures (e.g. Safari private mode, quota).
+pub(crate) fn write_session_storage(key: &str, value: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = storage.set_item(key, value);
+    }
+}
+
+/// Remove a key from the browser's `sessionStorage`.
+/// Silently ignores failures.
+pub(crate) fn remove_session_storage(key: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = storage.remove_item(key);
     }
 }
 
@@ -785,16 +818,14 @@ const USER_ID_STORAGE_KEY: &str = "vc_user_id";
 ///
 /// When OAuth is enabled the meeting API provides the `user_id` from the
 /// identity service.  When OAuth is disabled we generate a unique identifier
-/// and persist it via [`LocalStorage`] so the same browser/device always
+/// and persist it in `localStorage` so the same browser/device always
 /// presents the same identity.
 pub fn get_or_create_local_user_id() -> String {
-    if let Some(id) =
-        LocalStorage::get::<String>(&USER_ID_STORAGE_KEY.to_string()).filter(|s| !s.is_empty())
-    {
+    if let Some(id) = read_local_storage(USER_ID_STORAGE_KEY) {
         return id;
     }
     let id = generate_local_id();
-    LocalStorage::set(USER_ID_STORAGE_KEY.to_string(), &id);
+    write_local_storage(USER_ID_STORAGE_KEY, &id);
     id
 }
 
@@ -815,63 +846,49 @@ fn generate_local_id() -> String {
 // Legacy storage migration
 // ---------------------------------------------------------------------------
 
-/// One-time migration from the old plain-string `localStorage` format to the
-/// CBOR+zlib encoding used by [`dioxus_sdk_storage::LocalStorage`].
+/// One-time migration of legacy display-name storage formats to plain text.
 ///
-/// Earlier builds stored `vc_display_name` (and `vc_username` in very old
-/// releases) as raw uncompressed strings directly in the browser's
-/// `localStorage`.  The new storage backend uses CBOR+zlib serialisation,
-/// which is unreadable by `load_display_name_from_storage` when the stored
-/// bytes are in the old format.  This function detects that situation on the
-/// first startup after an upgrade and re-writes the value in the new format
-/// so returning users keep their saved display name without re-entry.
+/// Previous builds stored `vc_display_name` in CBOR+zlib encoding via
+/// `dioxus_sdk_storage`. A later Safari ITP fix added a parallel plain-text
+/// key `vc_display_name_raw`. Very old releases used `vc_username`.
 ///
-/// Must be called at app startup **before** the Dioxus component tree mounts,
-/// which is why it lives in `main.rs` before `dioxus::launch`.  It is a
-/// no-op when the new-format value already exists or on non-web platforms
-/// (where there is no legacy plain-string data).
+/// This function migrates those legacy formats to the current plain-text
+/// `vc_display_name` key. Users who only had CBOR-encoded data (without the
+/// parallel raw key) will need to re-enter their name once — this is
+/// acceptable since the raw key was written alongside CBOR for some time.
 ///
-/// **Removal:** once all production deployments have been running the new
-/// code long enough that stale plain-string values are gone (typically a
-/// few weeks), this function and the `web-sys` `Storage` feature it relies
-/// on can be dropped.
+/// Must be called at app startup **before** the Dioxus component tree mounts.
+/// It is a no-op when the primary key already has a readable value or on
+/// non-web platforms.
 pub fn migrate_legacy_storage() {
-    // Only needed on web where the old plain-string format was ever written.
     #[cfg(target_family = "wasm")]
     {
-        // If the new CBOR format already has a value, nothing to migrate.
-        //
-        // Note: `load_display_name_from_storage()` returns `None` for both
-        // "key absent" **and** "key present but encoded in the old plain-string
-        // format" — dioxus_sdk_storage silently returns `None` on a CBOR
-        // deserialisation failure.  That dual-None behaviour is exactly what
-        // makes this guard correct: the early return fires only when new-format
-        // data already exists, never for stale plain-string data.
-        if load_display_name_from_storage().is_some() {
+        // If the primary key already has a readable plain-text value, nothing
+        // to do.  CBOR+zlib blobs are binary data that JS coerces to strings
+        // containing non-printable characters — detect those and treat them as
+        // "not migrated yet" so we fall through to the raw/legacy key checks.
+        if let Some(v) = read_local_storage(STORAGE_KEY) {
+            let looks_like_plain_text = v.chars().all(|c| !c.is_control() || c == '\n');
+            if looks_like_plain_text {
+                return;
+            }
+            // Value is likely a CBOR+zlib blob — remove it and fall through
+            // to migration from the raw/legacy key.
+            remove_local_storage(STORAGE_KEY);
+        }
+
+        // Try the plain-text fallback key added in the Safari ITP fix.
+        // This covers users who saved their name while both keys were written.
+        if let Some(v) = read_local_storage("vc_display_name_raw") {
+            write_local_storage(STORAGE_KEY, &v);
+            remove_local_storage("vc_display_name_raw");
             return;
         }
 
-        let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
-            return;
-        };
-
-        // Try the current key, then the legacy key used in older releases.
-        let value = storage
-            .get_item(STORAGE_KEY)
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                storage
-                    .get_item("vc_username")
-                    .ok()
-                    .flatten()
-                    .filter(|s| !s.is_empty())
-            });
-
-        if let Some(v) = value {
-            // Re-store in the new CBOR+zlib format.
-            save_display_name_to_storage(&v);
+        // Try the legacy "vc_username" key from very old releases.
+        if let Some(v) = read_local_storage("vc_username") {
+            write_local_storage(STORAGE_KEY, &v);
+            remove_local_storage("vc_username");
         }
     }
 }
@@ -1273,7 +1290,7 @@ const THEME_STORAGE_KEY: &str = "ui-theme";
 
 /// Load theme from localStorage; falls back to `Theme::Dark`.
 pub fn load_theme_from_storage() -> Theme {
-    LocalStorage::get::<String>(&THEME_STORAGE_KEY.to_string())
+    read_local_storage(THEME_STORAGE_KEY)
         .and_then(|v| v.parse().ok())
         .unwrap_or_default()
 }
@@ -1307,7 +1324,7 @@ pub fn apply_theme_to_dom(theme: Theme) {
 
 /// Persist theme to localStorage and apply `data-theme` on `<html>`.
 pub fn apply_and_save_theme(theme: Theme) {
-    LocalStorage::set(THEME_STORAGE_KEY.to_string(), &theme.as_str().to_string());
+    write_local_storage(THEME_STORAGE_KEY, theme.as_str());
     apply_theme_to_dom(theme);
 }
 
