@@ -511,19 +511,31 @@ async fn jmap_call(
 /// infinite ~3s reconnect loop. Recognising this frame is what lets the client
 /// break that loop (drop the source, refresh the token, re-establish).
 ///
-/// `status` is matched permissively (any non-`"ok"`/`"valid"` status on a
-/// `type=="auth"` frame is treated as a failure) so a future server adding e.g.
-/// `"token_invalid"` or `"unauthorized"` is still handled — better to attempt a
-/// bounded refresh on an unknown auth status than to ignore it and hot-loop.
+/// `status` is matched permissively (any OTHER status on a `type=="auth"` frame
+/// is treated as a failure) so a future server adding e.g. `"token_invalid"` or
+/// `"unauthorized"` is still handled — better to attempt a bounded refresh on an
+/// unknown terminal status than to ignore it and hot-loop.
+///
+/// `"token_expiring"` is DELIBERATELY excluded from the failure set (it is in the
+/// non-failure match arm below): it is a PROACTIVE WARNING — the credential is
+/// still valid and the frame carries an `expires_in` (e.g. 300s). Treating it as
+/// a failure tore down a still-valid stream ~5 minutes early (the client
+/// cancelled the EventSource ~2ms after the `token_expiring` frame). The terminal
+/// `"token_expired"` frame (no `expires_in`, credential actually dead) is what
+/// drives the re-establish/recovery path; `"token_expiring"` must NOT, so a
+/// premature teardown can't happen.
 pub fn is_sse_auth_failure(value: &serde_json::Value) -> bool {
     if value.get("type").and_then(|v| v.as_str()) != Some("auth") {
         return false;
     }
     match value.get("status").and_then(|v| v.as_str()) {
-        // Explicit healthy statuses are NOT failures.
-        Some("ok") | Some("valid") | Some("authenticated") => false,
+        // Explicit healthy statuses are NOT failures. `token_expiring` is a
+        // proactive warning (credential still valid, carries `expires_in`) and is
+        // intentionally classified here so it never triggers a premature teardown.
+        Some("ok") | Some("valid") | Some("authenticated") | Some("token_expiring") => false,
         // Any other status on a `type=="auth"` frame (incl. the field being
-        // absent) is treated as an auth failure.
+        // absent) is treated as an auth failure (e.g. the terminal
+        // `token_expired`, or an unknown `token_invalid`).
         _ => true,
     }
 }
@@ -797,6 +809,65 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use serde_json::json;
+
+    // ──────────────────── is_sse_auth_failure ────────────────────
+
+    /// `token_expiring` is a proactive WARNING (credential still valid, carries
+    /// `expires_in`) and must NOT be classified as an auth failure — otherwise a
+    /// still-valid stream is torn down minutes early (#1469 secondary).
+    ///
+    /// ADVERSARIAL: remove `Some("token_expiring") => false` from the match and
+    /// this assertion FAILS (it would fall through to the `_ => true` catch-all).
+    #[test]
+    fn token_expiring_is_not_an_auth_failure() {
+        assert!(!is_sse_auth_failure(&json!({
+            "type": "auth",
+            "status": "token_expiring",
+            "expires_in": 300,
+        })));
+    }
+
+    /// The terminal `token_expired` frame (credential actually dead, no
+    /// `expires_in`) MUST still trigger the recovery path.
+    #[test]
+    fn token_expired_is_an_auth_failure() {
+        assert!(is_sse_auth_failure(&json!({
+            "type": "auth",
+            "status": "token_expired",
+        })));
+    }
+
+    /// Explicit healthy statuses are not failures.
+    #[test]
+    fn healthy_auth_statuses_are_not_failures() {
+        for status in ["ok", "valid", "authenticated"] {
+            assert!(
+                !is_sse_auth_failure(&json!({ "type": "auth", "status": status })),
+                "{status} must not be a failure"
+            );
+        }
+    }
+
+    /// Permissive default retained: an UNKNOWN status on an `auth` frame is still
+    /// treated as a failure so a future terminal status isn't silently ignored.
+    #[test]
+    fn unknown_auth_status_is_a_failure() {
+        assert!(is_sse_auth_failure(&json!({
+            "type": "auth",
+            "status": "token_invalid",
+        })));
+        // Missing status field is also a failure.
+        assert!(is_sse_auth_failure(&json!({ "type": "auth" })));
+    }
+
+    /// Non-auth frames are never auth failures regardless of status.
+    #[test]
+    fn non_auth_frame_is_never_an_auth_failure() {
+        assert!(!is_sse_auth_failure(&json!({
+            "type": "StateChange",
+            "status": "token_expired",
+        })));
+    }
 
     /// Build a minimal JWT (header.payload.signature) with the given JSON
     /// payload. Signature is unverified — we only decode the payload.
