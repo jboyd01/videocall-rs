@@ -18,10 +18,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::http::StatusCode;
 use jsonwebtoken::errors::{Error as JwtError, ErrorKind as JwtErrorKind};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use videocall_meeting_types::APIError;
 
 use crate::error::AppError;
 
@@ -167,6 +169,12 @@ pub struct JwksCache {
     last_refresh: RwLock<Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JwksRefreshOutcome {
+    Fetched,
+    SkippedRateLimit,
+}
+
 impl JwksCache {
     /// Create a test-only JwksCache with pre-loaded keys (no HTTP fetching).
     #[cfg(test)]
@@ -201,23 +209,33 @@ impl JwksCache {
         }
 
         // Key not found — try refreshing (rate-limited).
-        self.refresh().await?;
+        let refresh_outcome = self.refresh().await?;
 
         let keys = self.keys.read().await;
         keys.get(kid)
             .map(|(alg, key)| (*alg, key.clone()))
             .ok_or_else(|| {
-                tracing::warn!("JWKS get_key: kid not in JWKS after refresh — rejecting token");
-                AppError::unauthorized_msg("invalid or expired token")
+                if refresh_outcome == JwksRefreshOutcome::SkippedRateLimit {
+                    tracing::warn!(
+                        "JWKS get_key: kid not cached and refresh was rate-limited; treating as retryable"
+                    );
+                    AppError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        APIError::internal_error("authentication keys temporarily unavailable"),
+                    )
+                } else {
+                    tracing::warn!("JWKS get_key: kid not in JWKS after refresh — rejecting token");
+                    AppError::unauthorized_msg("invalid or expired token")
+                }
             })
     }
 
     /// Fetch the JWKS document and update the cache. Rate-limited.
-    async fn refresh(&self) -> Result<(), AppError> {
+    async fn refresh(&self) -> Result<JwksRefreshOutcome, AppError> {
         {
             let last = self.last_refresh.read().await;
             if last.elapsed().as_secs() < JWKS_REFRESH_INTERVAL_SECS {
-                return Ok(());
+                return Ok(JwksRefreshOutcome::SkippedRateLimit);
             }
         }
 
@@ -273,7 +291,7 @@ impl JwksCache {
 
         *self.keys.write().await = new_keys;
         *self.last_refresh.write().await = Instant::now();
-        Ok(())
+        Ok(JwksRefreshOutcome::Fetched)
     }
 }
 
@@ -702,6 +720,22 @@ mod tests {
         let decoded = result.expect("should verify successfully");
         assert_eq!(decoded.email.as_deref(), Some("user@example.com"));
         assert_eq!(decoded.name, "Test User");
+    }
+
+    #[tokio::test]
+    async fn missing_kid_during_rate_limited_refresh_is_retryable() {
+        let jwks = JwksCache::with_keys(HashMap::new());
+
+        let err = match jwks.get_key("new-rotated-kid").await {
+            Ok(_) => panic!("missing kid during a rate-limited refresh must be retryable"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            err.body.engineering_error.as_deref(),
+            Some("authentication keys temporarily unavailable")
+        );
     }
 
     #[tokio::test]

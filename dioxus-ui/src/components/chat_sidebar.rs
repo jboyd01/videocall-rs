@@ -148,6 +148,12 @@ fn should_attempt_refresh(is_pkce: bool) -> bool {
     is_pkce
 }
 
+/// Whether a failed refresh should consume this retry slot without reopening.
+/// This is the pure decision used by the runtime Retry arm.
+fn refresh_failure_blocks_reopen(is_pkce: bool, refresh_failed: bool) -> bool {
+    should_attempt_refresh(is_pkce) && refresh_failed
+}
+
 /// Sample the additive retry jitter (ms) for ONE re-establish attempt. Spread is
 /// `0..SSE_REESTABLISH_BASE_MS` (~0–750ms), drawn from `js_sys::Math::random()`
 /// on the browser target. Kept OUT of `next_reestablish_action` so that pure fn
@@ -578,11 +584,15 @@ pub fn ChatSidebar(
                     // `meeting_api::with_refresh_retry`): on a cookie deployment
                     // skip it and reopen directly — the reopen re-auths via the
                     // HttpOnly `sse_session` cookie / a fresh `POST /sse/session`.
-                    if should_attempt_refresh(crate::constants::is_pkce_flow())
-                        && crate::meeting_api::refresh_token_single_flight()
+                    let is_pkce = crate::constants::is_pkce_flow();
+                    let refresh_failed = if should_attempt_refresh(is_pkce) {
+                        crate::meeting_api::refresh_token_single_flight()
                             .await
                             .is_err()
-                    {
+                    } else {
+                        false
+                    };
+                    if refresh_failure_blocks_reopen(is_pkce, refresh_failed) {
                         log::warn!(
                             "🔐 SSE token refresh failed (attempt {}); will retry within budget",
                             attempt + 1
@@ -1255,9 +1265,8 @@ mod tests {
     // ──────────── #1469: cookie-deployment refresh guard ────────────
     //
     // The Retry arm now gates the provider refresh on
-    // `should_attempt_refresh(is_pkce_flow())`. These tests reference the REAL
-    // source-of-truth fn (`should_attempt_refresh`) used in the runtime arm, so
-    // they break if the guard is removed.
+    // `should_attempt_refresh(is_pkce_flow())`. These tests reference the same
+    // pure decision helper used by the runtime arm.
 
     /// The guard itself: PKCE deployments attempt a refresh; cookie deployments
     /// must NOT (they have no `vc_refresh_token`, so a refresh errors instantly).
@@ -1273,22 +1282,21 @@ mod tests {
         );
     }
 
-    /// Model the FIRST Retry attempt's branch decision, mirroring the runtime arm:
+    /// Model the FIRST Retry attempt's branch decision through the runtime
+    /// arm's pure decision helper:
     ///   * if `should_attempt_refresh(is_pkce)` AND the refresh fails → the arm
     ///     charges the attempt and `continue`s WITHOUT reopening
     ///     (`AttemptOutcome::ChargedNoReopen`);
     ///   * otherwise (non-PKCE skip-refresh, OR PKCE refresh-ok) → the arm charges
     ///     and REOPENS (`AttemptOutcome::Reopened`).
     ///
-    /// This is the exact `&&` short-circuit in the real arm, expressed purely.
     #[derive(Debug, PartialEq, Eq)]
     enum AttemptOutcome {
         Reopened,
         ChargedNoReopen,
     }
-    fn model_retry_attempt(is_pkce: bool, refresh_would_fail: bool) -> AttemptOutcome {
-        // `should_attempt_refresh(is_pkce) && refresh_fails` ⇒ charge + continue.
-        if should_attempt_refresh(is_pkce) && refresh_would_fail {
+    fn retry_attempt_outcome(is_pkce: bool, refresh_would_fail: bool) -> AttemptOutcome {
+        if refresh_failure_blocks_reopen(is_pkce, refresh_would_fail) {
             AttemptOutcome::ChargedNoReopen
         } else {
             AttemptOutcome::Reopened
@@ -1309,20 +1317,20 @@ mod tests {
         // Cookie deployment, refresh always fails → must REOPEN on attempt 0,
         // never burning the budget on instant refresh errors.
         assert_eq!(
-            model_retry_attempt(false, true),
+            retry_attempt_outcome(false, true),
             AttemptOutcome::Reopened,
-            "non-PKCE must skip the doomed refresh and reopen directly (#1469)"
+            "non-PKCE must skip the doomed refresh and reopen directly (issue 1469)"
         );
         // PKCE deployment with a refresh that fails → preserves the OLD behavior:
         // charge the attempt and continue WITHOUT reopening (no regression).
         assert_eq!(
-            model_retry_attempt(true, true),
+            retry_attempt_outcome(true, true),
             AttemptOutcome::ChargedNoReopen,
             "PKCE refresh-fail must keep its charge-and-continue behavior"
         );
         // PKCE deployment with a refresh that succeeds → reopens (unchanged).
         assert_eq!(
-            model_retry_attempt(true, false),
+            retry_attempt_outcome(true, false),
             AttemptOutcome::Reopened,
             "PKCE refresh-ok must fall through to the reopen"
         );

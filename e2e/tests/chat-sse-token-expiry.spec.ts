@@ -20,7 +20,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  *
  * WHY THIS IS INTERCEPTABLE WITHOUT A CHAT BACKEND:
  * In the e2e stack `config.js` sets no `jmapBaseUrl`, so `jmap_base_url()`
- * returns "" and `jmap_origin_base()` (jmap_service.rs:23-32) falls back to the
+ * returns "" and `jmap_origin_base()` (jmap_service.rs) falls back to the
  * page origin. That makes `/jmap`, `/sse/session`, and `/sse` SAME-ORIGIN
  * (http://localhost:3001/...) and therefore interceptable with `page.route()`
  * — no Docker chat service required.
@@ -128,8 +128,8 @@ async function stubJmap(page: Page): Promise<void> {
 }
 
 /** Stub `POST /sse/session`: a 2xx lets `subscribe_chat_sse` proceed to open the
- *  EventSource (jmap_service.rs:664-683). Every reopen re-auths via a fresh POST
- *  here in cookie deployments. */
+ *  EventSource (jmap_service.rs `subscribe_chat_sse`). Every reopen re-auths via
+ *  a fresh POST here in cookie deployments. */
 async function stubSseSession(page: Page): Promise<void> {
   await page.route("**/sse/session", async (route: Route) => {
     await route.fulfill({ status: 200 });
@@ -212,8 +212,8 @@ test.describe("Chat SSE token-expiry bounded re-establish", () => {
 
     // ── Assert the terminal disconnect banner appears ────────────────────────
     // `connection_lost` is set only on the GiveUp arm of the re-establish loop;
-    // it renders a `.chat-error` div with this EXACT text (chat_sidebar.rs:1026-
-    // 1030). The 20s timeout comfortably covers the ~11–13s backoff-to-GiveUp.
+    // it renders a `.chat-error` div with this EXACT text (chat_sidebar.rs
+    // `ChatSidebar`). The 20s timeout covers the ~11-13s backoff-to-GiveUp.
     const banner = sidebar.locator(".chat-error", { hasText: DISCONNECT_BANNER });
     await expect(banner).toBeVisible({ timeout: 20_000 });
 
