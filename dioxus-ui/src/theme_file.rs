@@ -168,6 +168,14 @@ const ALLOWLIST: &[(&str, Extractor)] = &[
     ("--focus-ring", extract_focus_ring),
 ];
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Maximum size of a user-imported theme JSON blob.
+pub const MAX_THEME_JSON_BYTES: usize = 64 * 1024;
+
+/// Maximum length of any single color value string.
+pub const MAX_COLOR_VALUE_LEN: usize = 128;
+
 // ── Validation ───────────────────────────────────────────────────────────────
 
 /// Lightweight format check: hex (#rgb/#rrggbb/#rrggbbaa), rgb()/rgba(), hsl()/hsla().
@@ -179,6 +187,11 @@ const ALLOWLIST: &[(&str, Extractor)] = &[
 /// image(), -webkit-image-set(), attr(), etc. in one rule, case-insensitively,
 /// without enumerating names.
 fn is_valid_color_value(s: &str) -> bool {
+    // Length cap (applied to raw input before trimming).
+    if s.len() > MAX_COLOR_VALUE_LEN {
+        return false;
+    }
+
     let trimmed = s.trim();
 
     // Hex literals.
@@ -204,12 +217,32 @@ fn is_valid_color_value(s: &str) -> bool {
         Some(i) => i,
         None => return false,
     };
-    if lower[open + 1..].contains('(') {
+    let inner = &lower[open + 1..];
+    if inner.contains('(') {
         return false;
     }
 
-    trimmed.ends_with(')')
-        && !trimmed.contains('{')
+    // The LAST character of the trimmed string must be `)` — the close of
+    // the function. Anything between the args close-paren and end-of-string
+    // (trailing junk) is rejected.
+    if !trimmed.ends_with(')') {
+        return false;
+    }
+
+    // Extract the content between the FIRST `(` and the FINAL `)` and
+    // validate the inner grammar: only digits, `.`, `,`, `%`, `/`, and
+    // ASCII whitespace are allowed (rgb/rgba/hsl/hsla numeric args never
+    // need letters).
+    let args_end = trimmed.len() - 1; // index of the final ')'
+    let args_start = trimmed.find('(').unwrap() + 1;
+    let args = &trimmed[args_start..args_end];
+    for ch in args.chars() {
+        if !matches!(ch, '0'..='9' | '.' | ',' | '%' | '/' | ' ' | '\t') {
+            return false;
+        }
+    }
+
+    !trimmed.contains('{')
         && !trimmed.contains('}')
         && !trimmed.contains(';')
         && !trimmed.contains("/*")
@@ -222,6 +255,9 @@ fn is_valid_color_value(s: &str) -> bool {
 pub enum ThemeFileError {
     Json(serde_json::Error),
     UnsupportedVersion(u32),
+    TooLarge,
+    InvalidValue,
+    StorageFull,
 }
 
 impl std::fmt::Display for ThemeFileError {
@@ -229,6 +265,13 @@ impl std::fmt::Display for ThemeFileError {
         match self {
             Self::Json(e) => write!(f, "theme JSON parse error: {e}"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported theme version: {v}"),
+            Self::TooLarge => write!(
+                f,
+                "theme file exceeds maximum size ({} KB)",
+                MAX_THEME_JSON_BYTES / 1024
+            ),
+            Self::InvalidValue => write!(f, "theme contains an unsupported color value"),
+            Self::StorageFull => write!(f, "storage is full"),
         }
     }
 }
@@ -260,17 +303,108 @@ pub fn validate_and_resolve(
     pairs
 }
 
-// ── Active theme source (v1: bundled default) ────────────────────────────────
+/// Validate an imported theme JSON blob (pure, host-testable — no web_sys).
+///
+/// Enforces size limit, version, and strict color-value validation for ALL
+/// present values across both dark and light variants.
+pub fn validate_theme_json(json: &str) -> Result<ThemeFile, ThemeFileError> {
+    if json.len() > MAX_THEME_JSON_BYTES {
+        return Err(ThemeFileError::TooLarge);
+    }
+    let file = parse_theme_file(json)?;
+    // Strict whole-file value check: every present value must pass validation.
+    for &(_css_var, extractor) in ALLOWLIST {
+        for variant in [ResolvedVariant::Dark, ResolvedVariant::Light] {
+            if let Some(value) = extractor(&file, variant) {
+                if !is_valid_color_value(value) {
+                    return Err(ThemeFileError::InvalidValue);
+                }
+            }
+        }
+    }
+    Ok(file)
+}
 
-/// Returns the JSON of the currently-active theme file.
-/// v1: always the bundled default. Future phases will swap in user-imported files.
-fn active_theme_file_json() -> &'static str {
+// ── Active theme source ──────────────────────────────────────────────────────
+
+/// Returns the bundled default theme JSON (compile-time embedded).
+fn bundled_default_json() -> &'static str {
     include_str!("../static/themes/default.json")
 }
+
+/// Storage key for the user-imported custom theme JSON.
+const CUSTOM_THEME_STORAGE_KEY: &str = "vc_theme_custom";
+
+/// Load and validate the custom theme from localStorage.
+///
+/// Returns `None` when no custom theme is stored, or when the stored blob
+/// fails validation (in which case the corrupt key is removed — self-heal).
+pub fn load_validated_custom_theme_json() -> Option<String> {
+    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten())?;
+    let raw = storage.get_item(CUSTOM_THEME_STORAGE_KEY).ok().flatten()?;
+    match validate_theme_json(&raw) {
+        Ok(_) => Some(raw),
+        Err(_) => {
+            let _ = storage.remove_item(CUSTOM_THEME_STORAGE_KEY);
+            None
+        }
+    }
+}
+
+/// Persist a validated custom theme JSON to localStorage.
+pub fn persist_custom_theme_json(json: &str) -> Result<(), ThemeFileError> {
+    validate_theme_json(json)?;
+    let storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .ok_or(ThemeFileError::StorageFull)?;
+    storage
+        .set_item(CUSTOM_THEME_STORAGE_KEY, json)
+        .map_err(|_| ThemeFileError::StorageFull)?;
+    Ok(())
+}
+
+/// Remove the custom theme from localStorage.
+pub fn clear_custom_theme() {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(CUSTOM_THEME_STORAGE_KEY);
+    }
+}
+
+/// Maximum number of characters shown for a custom theme's display name.
+/// Bounds layout overflow from an adversarially long `name` field so the
+/// reset escape-hatch can never be pushed off-screen.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+/// Get the display name of the active custom theme, if any.
+///
+/// The name is truncated to [`MAX_DISPLAY_NAME_CHARS`] so a hostile file
+/// cannot overflow the label and hide the reset control.
+pub fn custom_theme_display_name() -> Option<String> {
+    let raw = load_validated_custom_theme_json()?;
+    let file = parse_theme_file(&raw).ok()?;
+    let name = file.name.unwrap_or_else(|| "Custom Theme".to_string());
+    Some(name.chars().take(MAX_DISPLAY_NAME_CHARS).collect())
+}
+
+/// App-controlled gradient backdrop used when a custom theme is active.
+///
+/// This is a compile-time constant that references already-validated CSS custom
+/// property tokens via `var(--...)`. It is NEVER derived from user-provided file
+/// content. The gradient replaces the decorative PNG so the page background
+/// visibly reflects the imported theme's palette.
+///
+/// Security invariant: this string must contain NO `url(` — it uses only
+/// `var()`, `color-mix()`, `radial-gradient()`, and `linear-gradient()`.
+pub const CUSTOM_THEME_BACKDROP_GRADIENT: &str = "\
+radial-gradient(900px 600px at 50% -10%, color-mix(in oklch, var(--accent) 22%, transparent), transparent 70%), \
+radial-gradient(700px 500px at 85% 110%, color-mix(in oklch, var(--accent-hover) 18%, transparent), transparent 65%), \
+linear-gradient(160deg, var(--bg) 0%, var(--surface) 100%)";
 
 // ── DOM application ──────────────────────────────────────────────────────────
 
 /// Remove all managed CSS custom properties from documentElement inline style.
+/// Also removes the `--bg-image` inline override to ensure the stylesheet PNG
+/// wins when no custom theme is active.
 fn clear_theme_overrides() {
     let style = match document_element_style() {
         Some(s) => s,
@@ -279,6 +413,8 @@ fn clear_theme_overrides() {
     for &(var_name, _) in ALLOWLIST {
         let _ = style.remove_property(var_name);
     }
+    // Always clear the backdrop override so the bundled PNG is restored.
+    let _ = style.remove_property("--bg-image");
 }
 
 /// Apply the active theme file's tokens for the given resolved variant.
@@ -286,12 +422,22 @@ fn clear_theme_overrides() {
 ///
 /// On any parse/load failure, clears all inline overrides so the CSS fallback
 /// remains authoritative.
+///
+/// When a custom (user-imported) theme is active, also sets `--bg-image` to
+/// [`CUSTOM_THEME_BACKDROP_GRADIENT`] so the page background visibly reflects
+/// the theme palette. When the bundled default is active, `--bg-image` inline
+/// override is absent and the stylesheet PNG wins.
 pub fn apply_theme_file_tokens(resolved_variant_str: &str) {
     // Always clear first — prevents stale dark values shadowing light (or vice-versa).
+    // Also clears any inline --bg-image from a previous custom theme.
     clear_theme_overrides();
 
-    let json = active_theme_file_json();
-    let file = match parse_theme_file(json) {
+    // Single localStorage read: decide the active source once, then reuse it
+    // for both token selection and the backdrop-gradient decision.
+    let custom_json = load_validated_custom_theme_json();
+    let is_custom = custom_json.is_some();
+    let json = custom_json.unwrap_or_else(|| bundled_default_json().to_string());
+    let file = match parse_theme_file(&json) {
         Ok(f) => f,
         Err(e) => {
             log::warn!("theme_file: failed to parse active theme, using CSS fallback: {e}");
@@ -309,6 +455,14 @@ pub fn apply_theme_file_tokens(resolved_variant_str: &str) {
     for (var_name, value) in pairs {
         let _ = style.set_property(var_name, &value);
     }
+
+    // If a user-imported custom theme is active, replace the decorative PNG
+    // with the app-controlled gradient that references the themed tokens.
+    if is_custom {
+        let _ = style.set_property("--bg-image", CUSTOM_THEME_BACKDROP_GRADIENT);
+    }
+    // Otherwise: clear_theme_overrides already removed --bg-image, so the
+    // stylesheet PNG (dark or light) remains authoritative.
 }
 
 /// Helper: get the CSSStyleDeclaration of documentElement.
@@ -329,7 +483,7 @@ mod tests {
 
     #[test]
     fn parse_bundled_default() {
-        let file = parse_theme_file(active_theme_file_json()).expect("bundled default must parse");
+        let file = parse_theme_file(bundled_default_json()).expect("bundled default must parse");
         assert_eq!(file.version, 1);
 
         let dark_pairs = validate_and_resolve(&file, ResolvedVariant::Dark);
@@ -416,5 +570,108 @@ mod tests {
         assert!(parse_theme_file("not json at all").is_err());
         assert!(parse_theme_file("").is_err());
         assert!(parse_theme_file("{}").is_err()); // missing version
+    }
+
+    // ── New tests for validate_theme_json and hardened is_valid_color_value ──
+
+    #[test]
+    fn validate_theme_json_accepts_valid() {
+        let json = bundled_default_json();
+        let file = validate_theme_json(json).expect("bundled default must validate");
+        assert_eq!(file.version, 1);
+    }
+
+    #[test]
+    fn validate_theme_json_rejects_oversize() {
+        // 65 KB of spaces + minimal valid JSON structure
+        let big = " ".repeat(MAX_THEME_JSON_BYTES + 1);
+        assert!(matches!(
+            validate_theme_json(&big),
+            Err(ThemeFileError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn validate_theme_json_rejects_version_0() {
+        let json = r#"{"version": 0, "color": {}}"#;
+        assert!(matches!(
+            validate_theme_json(json),
+            Err(ThemeFileError::UnsupportedVersion(0))
+        ));
+    }
+
+    #[test]
+    fn validate_theme_json_rejects_version_2() {
+        let json = r#"{"version": 2, "color": {}}"#;
+        assert!(matches!(
+            validate_theme_json(json),
+            Err(ThemeFileError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[test]
+    fn validate_theme_json_rejects_smuggled_values() {
+        // url()
+        let json = r##"{"version": 1, "color": {"surface": {"base": {"dark": "url(https://evil)", "light": "#fff"}}}}"##;
+        assert!(matches!(
+            validate_theme_json(json),
+            Err(ThemeFileError::InvalidValue)
+        ));
+
+        // var()
+        let json = r##"{"version": 1, "color": {"surface": {"base": {"dark": "var(--x)", "light": "#fff"}}}}"##;
+        assert!(matches!(
+            validate_theme_json(json),
+            Err(ThemeFileError::InvalidValue)
+        ));
+
+        // nested paren inside function
+        let json = r##"{"version": 1, "color": {"surface": {"base": {"dark": "rgb(expression(1), 0, 0)", "light": "#fff"}}}}"##;
+        assert!(matches!(
+            validate_theme_json(json),
+            Err(ThemeFileError::InvalidValue)
+        ));
+
+        // semicolon breakout
+        let json = r##"{"version": 1, "color": {"surface": {"base": {"dark": "rgb(0,0,0); body{display:none}", "light": "#fff"}}}}"##;
+        assert!(matches!(
+            validate_theme_json(json),
+            Err(ThemeFileError::InvalidValue)
+        ));
+    }
+
+    #[test]
+    fn is_valid_color_value_rejects_over_max_len() {
+        let long = format!("#{}", "a".repeat(MAX_COLOR_VALUE_LEN));
+        assert!(!is_valid_color_value(&long));
+    }
+
+    #[test]
+    fn is_valid_color_value_rejects_trailing_junk() {
+        // Trailing junk after close paren — must be rejected
+        assert!(!is_valid_color_value("rgba(0,0,0,1) anything)"));
+        assert!(!is_valid_color_value("rgb(0,0,0) extra"));
+    }
+
+    // ── Backdrop gradient security invariant tests ───────────────────────────
+
+    #[test]
+    fn backdrop_gradient_is_nonempty_and_references_tokens() {
+        assert!(!CUSTOM_THEME_BACKDROP_GRADIENT.is_empty());
+        assert!(CUSTOM_THEME_BACKDROP_GRADIENT.contains("var(--bg)"));
+        assert!(CUSTOM_THEME_BACKDROP_GRADIENT.contains("var(--accent)"));
+        assert!(CUSTOM_THEME_BACKDROP_GRADIENT.contains("var(--surface)"));
+        assert!(CUSTOM_THEME_BACKDROP_GRADIENT.contains("var(--accent-hover)"));
+    }
+
+    #[test]
+    fn backdrop_gradient_contains_no_url() {
+        // Security: the gradient must never embed a url() — it is a static
+        // app-controlled string referencing only validated token vars.
+        let lower = CUSTOM_THEME_BACKDROP_GRADIENT.to_ascii_lowercase();
+        assert!(
+            !lower.contains("url("),
+            "backdrop gradient must not contain url()"
+        );
     }
 }

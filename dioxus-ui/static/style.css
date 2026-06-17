@@ -6584,6 +6584,116 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   }
 }
 
+/* ============================================================
+   Theme source row — custom import / reset controls
+   Uses @token-exempt literal colors so a hostile custom theme
+   cannot hide the escape hatch (reset button).
+   ============================================================ */
+
+.theme-source-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.theme-source-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.theme-source-active {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.82); /* @token-exempt: active label (dark) */
+}
+
+.theme-import-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 14px;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.72); /* @token-exempt: ghost button text (dark) */
+  background: rgba(255, 255, 255, 0.06); /* @token-exempt: ghost pill bg (dark) */
+  border: 1px solid rgba(255, 255, 255, 0.12); /* @token-exempt: ghost pill border (dark) */
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 200ms ease, color 200ms ease;
+}
+
+.theme-import-btn:hover {
+  background: rgba(255, 255, 255, 0.10); /* @token-exempt: ghost pill hover (dark) */
+  color: rgba(255, 255, 255, 0.92); /* @token-exempt: ghost pill hover text (dark) */
+}
+
+.theme-import-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.6); /* @token-exempt: focus ring (dark) */
+}
+
+.theme-reset-btn {
+  -webkit-appearance: none;
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: #0a84ff; /* @token-exempt: accent link (dark) — NOT overridable by theme tokens */
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.theme-reset-btn:hover {
+  text-decoration: underline;
+}
+
+.theme-reset-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.6); /* @token-exempt: focus ring (dark) */
+  border-radius: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .theme-import-btn {
+    transition: none;
+  }
+}
+
+/* Light-mode overrides for theme source row */
+html[data-theme="light"] .theme-source-active {
+  color: rgba(0, 0, 0, 0.82); /* @token-exempt: active label (light) */
+}
+
+html[data-theme="light"] .theme-import-btn {
+  color: rgba(0, 0, 0, 0.62); /* @token-exempt: ghost button text (light) */
+  background: rgba(0, 0, 0, 0.04); /* @token-exempt: ghost pill bg (light) */
+  border-color: rgba(0, 0, 0, 0.10); /* @token-exempt: ghost pill border (light) */
+}
+
+html[data-theme="light"] .theme-import-btn:hover {
+  background: rgba(0, 0, 0, 0.07); /* @token-exempt: ghost pill hover (light) */
+  color: rgba(0, 0, 0, 0.88); /* @token-exempt: ghost pill hover text (light) */
+}
+
+html[data-theme="light"] .theme-import-btn:focus-visible {
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.5); /* @token-exempt: focus ring (light) */
+}
+
+html[data-theme="light"] .theme-reset-btn {
+  color: #005ec4; /* @token-exempt: accent link (light) — NOT overridable by theme tokens */
+}
+
+html[data-theme="light"] .theme-reset-btn:focus-visible {
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.5); /* @token-exempt: focus ring (light) */
+}
+
 html[data-theme="light"] .device-settings-modal-overlay {
   background: var(--device-settings-overlay-bg-image);
   backdrop-filter: blur(3px) saturate(100%);
