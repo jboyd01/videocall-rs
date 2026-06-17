@@ -611,6 +611,7 @@ mod tests {
 
     #[test]
     fn validate_theme_json_rejects_smuggled_values() {
+        // @token-exempt: the strings below are hostile validation inputs, not real CSS colors.
         // url()
         let json = r##"{"version": 1, "color": {"surface": {"base": {"dark": "url(https://evil)", "light": "#fff"}}}}"##;
         assert!(matches!(
@@ -648,6 +649,7 @@ mod tests {
 
     #[test]
     fn is_valid_color_value_rejects_trailing_junk() {
+        // @token-exempt: trailing-junk rejection inputs, not real CSS colors.
         // Trailing junk after close paren — must be rejected
         assert!(!is_valid_color_value("rgba(0,0,0,1) anything)"));
         assert!(!is_valid_color_value("rgb(0,0,0) extra"));
