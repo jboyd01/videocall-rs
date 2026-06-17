@@ -80,9 +80,30 @@ impl FromRequestParts<AppState> for AuthUser {
                     None,
                 )
                 .await
-                .map_err(|e| {
-                    tracing::warn!("Bearer token validation failed: {e:?}");
-                    AppError::unauthorized_msg("invalid or expired bearer token")
+                .map_err(|inner| {
+                    // Distinguish a token-validation rejection (401) from a
+                    // genuine server fault (e.g. JWKS endpoint unreachable /
+                    // unknown kid, which `JwksCache::get_key` raises as a 500).
+                    //
+                    // For a 401, verify_and_decode_id_token has already logged
+                    // the specific reason server-side (without token material),
+                    // so we return a generic bearer-auth message and do NOT log
+                    // the token. For anything else we preserve the original
+                    // status and surface the server-generated `engineering_error`
+                    // (token-free) so an outage is not silently masked as a 401.
+                    if inner.status == StatusCode::UNAUTHORIZED {
+                        tracing::warn!(
+                            "Bearer auth rejected (401): invalid or expired bearer token"
+                        );
+                        AppError::unauthorized_msg("invalid or expired bearer token")
+                    } else {
+                        tracing::error!(
+                            status = %inner.status,
+                            detail = inner.body.engineering_error.as_deref().unwrap_or(""),
+                            "Bearer auth failed due to a server fault (not a token rejection)"
+                        );
+                        inner
+                    }
                 })?;
 
                 let name = claims.display_name();
@@ -752,6 +773,49 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// HCL #1468 regression: a genuine server fault on the Bearer path (JWKS
+    /// endpoint unreachable / unknown kid → `get_key` 500) must NOT be masked
+    /// as a 401. The structurally-valid token forces `verify_and_decode_id_token`
+    /// past header parsing into `get_key`, which fails to resolve the kid and
+    /// (with an unreachable JWKS URL) returns a 500 the extractor must preserve.
+    #[tokio::test]
+    async fn jwks_path_server_fault_not_masked_as_401() {
+        let (enc, _dec, _kid) = test_rsa_keypair();
+
+        // Empty cache backed by an unreachable JWKS URL. The token's kid is not
+        // cached, so get_key() triggers a refresh against the dead URL → 500.
+        // Port 1 is unbound/privileged → connection fails fast.
+        let jwks = JwksCache::new("http://127.0.0.1:1/jwks".to_string());
+
+        let token = sign_id_token(
+            &enc,
+            "kid-not-in-jwks",
+            "alice@example.com",
+            "Alice",
+            "test-client",
+            "https://provider.example.com",
+            3600, // not expired — only the missing key should fail
+        );
+
+        let state = make_jwks_state(jwks);
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "JWKS-retrieval server fault must surface as 500, not be flattened to 401"
+        );
     }
 
     #[tokio::test]
