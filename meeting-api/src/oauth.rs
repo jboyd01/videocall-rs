@@ -206,7 +206,10 @@ impl JwksCache {
         let keys = self.keys.read().await;
         keys.get(kid)
             .map(|(alg, key)| (*alg, key.clone()))
-            .ok_or_else(|| AppError::internal(&format!("JWKS key not found for kid: {kid}")))
+            .ok_or_else(|| {
+                tracing::warn!("JWKS get_key: kid not in JWKS after refresh — rejecting token");
+                AppError::unauthorized_msg("invalid or expired token")
+            })
     }
 
     /// Fetch the JWKS document and update the cache. Rate-limited.
