@@ -599,11 +599,21 @@ pub fn effective_cap(
 /// still meaningful, and an `Auto`→`Auto` non-transition must not clear (it
 /// would let a single spurious re-render wipe the user's requests).
 ///
-/// Pure / DOM-free / signal-free so the return-to-Auto contract is host-testable
-/// — the `use_effect` in `attendants.rs` calls this and only writes/clears the
-/// `user_requested_decode` signal when it returns `true`. Extracting the
-/// decision here is what lets a test pin the clear: an inline `.clear()` in the
-/// effect was mutation-invisible (deleting it passed every test, #1471).
+/// Pure / DOM-free / signal-free so the return-to-Auto DECISION is host-testable
+/// — the `use_effect` in `attendants.rs` calls this and only clears the
+/// `user_requested_decode` signal when it returns `true`. This pins the
+/// *decision* — which transitions clear — that the inline `.clear()` could not:
+/// `should_clear_..._tests` fails if the predicate is mutated. That decision was
+/// the subtle part (#1471 named the risk of a mutation flipping which
+/// transitions clear).
+///
+/// SCOPE (honest): the unit test does NOT cover the effect→helper *wiring* — a
+/// Dioxus `use_effect` body needs a runtime — so deleting the
+/// `user_requested_decode.write().clear()` call in `attendants.rs` would still
+/// pass the unit test. That call is a single line gated directly by this
+/// helper's result; it has no host test. An end-to-end return-to-Auto assertion
+/// would need the multi-publisher budget-shed setup (see
+/// `decode-budget-play-button.spec.ts`), which is not added here.
 pub fn should_clear_force_decode_on_override_change(
     previous: crate::context::DecodeBudgetOverride,
     current: crate::context::DecodeBudgetOverride,
