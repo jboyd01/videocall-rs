@@ -530,28 +530,117 @@ h3 {
   opacity: 0.82;
 }
 
-.decode-paused-badge {
+/* Issue #1466 (B1): the per-tile PLAY control. Previously a corner badge
+   anchored at top/right -6px with a 44px hit box created via negative margin —
+   but that box grew UP and RIGHT into the tile corner, where
+   `.canvas-container { overflow: hidden }` CLIPPED it, and its right edge ran
+   under the corner-pinned `.tile-top-icons` (z-index:3, which holds the
+   interactive signal button). The real tap area was well under 44px and
+   ambiguous taps landed on the signal button.
+
+   The control is now a CENTERED overlay over the PeerIcon. The placeholder
+   (`.placeholder-content--paused`) is `position: relative` and is itself
+   centered within the flex `.canvas-container`, so an absolutely-centered
+   element sits over the avatar in the middle of the visible tile — comfortably
+   inside the unclipped region and far from the corner icons. A 48px circular
+   target (> the 44px minimum) keeps it easily tappable on mobile. */
+.decode-play-overlay {
   position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 22px;
-  height: 22px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 48px;
+  height: 48px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
+  border: none;
   border-radius: var(--radius-pill, 999px);
   background: var(--btn-warning-bg);
   color: var(--warning);
   box-shadow: 0 0 0 1px var(--btn-warning-border);
-  pointer-events: none;
+  cursor: pointer;
+  font: inherit;
+  /* Sit above the dimmed PeerIcon, but below the corner `.tile-top-icons`
+     (z-index:3) which it never overlaps anyway. */
+  z-index: 2;
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.1s ease;
 }
 
-/* Override the generic `.placeholder-content svg` sizing/tint for the badge
-   glyph: it is a small amber pause icon, not the large tertiary PeerIcon. */
-.decode-paused-badge svg {
-  width: 14px;
-  height: 14px;
+/* Override the generic `.placeholder-content svg` sizing/tint for the play
+   glyph: a small amber triangle, not the large tertiary PeerIcon. */
+.decode-play-overlay svg {
+  width: 20px;
+  height: 20px;
   fill: currentColor;
+}
+
+.decode-play-overlay:hover {
+  background: var(--btn-warning-bg-hover);
+  box-shadow: 0 0 0 1px var(--btn-warning-border-hover);
+  /* Keep the centering translate while adding the hover bump. */
+  transform: translate(-50%, -50%) scale(1.06);
+}
+
+.decode-play-overlay:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
+}
+
+/* Issue #1466 (S2): respect prefers-reduced-motion. Suppress ONLY the hover
+   scale animation — but the button uses `transform` for centering too, so we
+   cannot use `transform: none` (that would un-center it). Reset the hover
+   transform back to the centering-only translate, and drop the transform from
+   the transition. Background/box-shadow hover feedback is preserved. */
+@media (prefers-reduced-motion: reduce) {
+  .decode-play-overlay {
+    transition:
+      background 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+
+  .decode-play-overlay:hover {
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* Issue #1466: the persistent "show all paused videos" / "back to automatic"
+   escape hatch in the Appearance panel's Video-tiles area. Styled to match the
+   panel's warning-accent action buttons (same token family as the banner's
+   `.decode-budget-banner-action`), set apart from the segmented tile-count
+   picker above it. */
+.decode-budget-show-all-btn {
+  margin-top: 10px;
+  min-height: 36px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md, 10px);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.decode-budget-show-all-btn:hover {
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
+}
+
+.decode-budget-show-all-btn:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
 }
 
 /* ============================================================
@@ -1802,8 +1891,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   position: fixed;
   inset: 0;
   background: var(--device-settings-overlay-bg-image);
-  backdrop-filter: blur(6px) saturate(100%);
-  -webkit-backdrop-filter: blur(6px) saturate(100%);
+  backdrop-filter: blur(3px) saturate(100%);
+  -webkit-backdrop-filter: blur(3px) saturate(100%);
   z-index: 9500;
 
   display: flex;
@@ -6586,8 +6675,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 html[data-theme="light"] .device-settings-modal-overlay {
   background: var(--device-settings-overlay-bg-image);
-  backdrop-filter: blur(6px) saturate(100%);
-  -webkit-backdrop-filter: blur(6px) saturate(100%);
+  backdrop-filter: blur(3px) saturate(100%);
+  -webkit-backdrop-filter: blur(3px) saturate(100%);
 }
 
 
@@ -7148,6 +7237,14 @@ html[data-theme="light"]
   color: var(--text-tertiary);
 }
 
+/* Unified diagnostics timeline (issue 173 / upstream 712). The chart body reuses
+   the `.neteq-chart-*` scroll/axis layout and the `.signal-chart-legend` checkbox
+   styling verbatim; these rules only add the drawer-local spacing so the legend
+   sits a little tighter under the overlaid timeline. */
+.unified-timeline-chart .unified-timeline-legend {
+  margin-top: 10px;
+}
+
 .signal-chart-legend {
   display: flex;
   flex-wrap: wrap;
@@ -7170,6 +7267,13 @@ html[data-theme="light"]
   cursor: pointer;
   accent-color: var(--text-tertiary);
 }
+/* Keyboard focus ring on the legend checkboxes so keyboard users can see which
+   series toggle is focused (a11y, issue 173). Matches the project's existing
+   `:focus-visible` outline idiom; benefits the shared signal-quality legend too. */
+.signal-chart-legend .legend-item input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .signal-chart-legend span {
   display: flex;
   align-items: center;
@@ -7179,6 +7283,13 @@ html[data-theme="light"]
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  display: inline-block;
+}
+/* Unified-timeline legend swatch: a short line carrying the SAME stroke + dash
+   pattern as the chart line, so the legend distinguishes series by shape (not
+   hue alone — color-blind safety, issue 173). */
+.signal-chart-legend .legend-swatch {
+  flex-shrink: 0;
   display: inline-block;
 }
 .legend-help-btn {
@@ -7780,18 +7891,18 @@ html[data-theme="dark"] .settings-modal {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.045) 0% /* @token-exempt: theme variant */,
-    rgba(255, 255, 255, 0.028) 100% /* @token-exempt: theme variant */
+    rgba(28, 26, 24, 0.92) 0% /* @token-exempt: theme variant */,
+    rgba(22, 21, 19, 0.88) 100% /* @token-exempt: theme variant */
   );
 
-  border: 1px solid rgba(255, 255, 255, 0.085); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.10); /* @token-exempt: theme variant */
 
   box-shadow:
     0 42px 120px rgba(0, 0, 0, 0.58) /* @token-exempt: theme variant */,
     0 18px 48px rgba(0, 0, 0, 0.34); /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(26px) saturate(145%) contrast(104%);
-  -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
+  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
 }
 
 .settings-sidebar-title-icon {
@@ -7816,15 +7927,15 @@ html[data-theme="dark"] .settings-panel {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.055) 0% /* @token-exempt: theme variant */,
-    rgba(255, 255, 255, 0.035) 100% /* @token-exempt: theme variant */
+    rgba(255, 255, 255, 0.08) 0% /* @token-exempt: theme variant */,
+    rgba(255, 255, 255, 0.055) 100% /* @token-exempt: theme variant */
   );
 
   box-shadow:
-    inset 1px 0 0 rgba(255, 255, 255, 0.045) /* @token-exempt: theme variant */,
-    inset 0 1px 0 rgba(255, 255, 255, 0.035); /* @token-exempt: theme variant */
+    inset 1px 0 0 rgba(255, 255, 255, 0.06) /* @token-exempt: theme variant */,
+    inset 0 1px 0 rgba(255, 255, 255, 0.05); /* @token-exempt: theme variant */
 
-  border: 1px solid rgba(255, 255, 255, 0.055); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.08); /* @token-exempt: theme variant */
 }
 
 html:not([data-theme]) .settings-panel::before,
@@ -7865,7 +7976,7 @@ html[data-theme="dark"] .settings-nav-button.active {
 
   margin: 8px 0 0;
 
-  background: rgba(255, 255, 255, 0.038); /* @token-exempt: theme variant */
+  background: rgba(255, 255, 255, 0.07); /* @token-exempt: theme variant */
 }
 
 /* INPUTS */
@@ -7899,8 +8010,8 @@ html[data-theme="dark"] .settings-input {
 html[data-theme="light"] .settings-modal {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.52) 0% /* @token-exempt: theme variant */,
-    rgba(238, 242, 248, 0.38) 100% /* @token-exempt: theme variant */
+    rgba(255, 255, 255, 0.78) 0% /* @token-exempt: theme variant */,
+    rgba(238, 242, 248, 0.72) 100% /* @token-exempt: theme variant */
   );
 
   border: 1px solid rgba(255, 255, 255, 0.7); /* @token-exempt: theme variant */
@@ -7909,8 +8020,8 @@ html[data-theme="light"] .settings-modal {
     0 42px 120px rgba(90, 105, 130, 0.22) /* @token-exempt: theme variant */,
     0 18px 48px rgba(90, 105, 130, 0.14); /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(26px) saturate(145%) contrast(104%);
-  -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
+  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
 }
 
 html[data-theme="light"] .settings-layout {
@@ -7928,12 +8039,12 @@ html[data-theme="light"] .settings-panel {
 
   background: linear-gradient(
     180deg,
-    rgba(244, 243, 248, 0.94) 0% /* @token-exempt: theme variant */,
-    rgba(232, 233, 240, 0.92) 100% /* @token-exempt: theme variant */
+    rgba(244, 243, 248, 0.97) 0% /* @token-exempt: theme variant */,
+    rgba(232, 233, 240, 0.95) 100% /* @token-exempt: theme variant */
   );
 
-  backdrop-filter: blur(30px) saturate(130%);
-  -webkit-backdrop-filter: blur(30px) saturate(130%);
+  backdrop-filter: blur(16px) saturate(120%);
+  -webkit-backdrop-filter: blur(16px) saturate(120%);
 }
 
 html[data-theme="light"] .settings-panel::before,

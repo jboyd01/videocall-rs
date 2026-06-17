@@ -161,16 +161,54 @@ pub fn save_density_mode(mode: DensityMode) {
 /// forces exactly `n` decoded tiles and bypasses the auto-loop entirely. This
 /// type is purely the persisted/shared state — the bypass behavior lives in
 /// the control loop (task 1a.3), not here.
+///
+/// `All` (issue #1466) is a second hard override meaning "decode all the tiles
+/// the layout would show". Like `Fixed(n)` it bypasses the adaptive loop, but
+/// instead of a literal count it tracks the live natural tile count, so it
+/// stays correct as peers join/leave. It is the persistent "show all paused
+/// videos" escape hatch reachable from the Appearance/Settings panel,
+/// independent of the banner's `pressured && avatar_count > 0` gate. The #1286
+/// iOS device ceiling STILL binds on `All` (see `effective_cap`): "All" means
+/// "everything the layout shows, still subject to the hardware ceiling", never
+/// a ceiling bypass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DecodeBudgetOverride {
     #[default]
     Auto,
     Fixed(usize),
+    /// Issue #1466: decode every natural tile (clamped at `CANVAS_LIMIT` and the
+    /// #1286 device ceiling). A hard override like `Fixed`, but count-free.
+    All,
 }
 
 /// Context for the decode-budget override.
 #[derive(Clone, Copy)]
 pub struct DecodeBudgetCtx(pub Signal<DecodeBudgetOverride>);
+
+/// Issue #1466: the set of peer `session_id`s the local user has explicitly
+/// asked to keep decoding via the per-tile PLAY button, even when the decode
+/// budget would otherwise pause (avatar) them.
+///
+/// Holds `session_id`s (the `key`/`peer_id` `generate_for_peer` receives, which
+/// `parse::<u64>()` cleanly into the wire id). The merge into `active_decode_set`
+/// is the single union point (see `decode_budget::merge_user_requested_decode`).
+///
+/// NOT persisted to `localStorage` — deliberately. Each entry is a per-session,
+/// transient request bounded by the live peer set: a `session_id` is unique to
+/// one browser connection and is regenerated on every reload, so a persisted id
+/// would be stale (match no live peer) the moment the page reloads. Persisting
+/// it would therefore be inert at best and confusing at worst, so this state
+/// lives only in render-scope signal memory and is cleaned up when its peer
+/// leaves (`attendants.rs` stale-request prune).
+///
+/// The parent (`AttendantsComponent`) owns the backing signal directly and
+/// threads a `toggle` `EventHandler` down to the per-tile PLAY button, so the
+/// current wiring does not read this context back out — it is provided for API
+/// symmetry with the other decode-budget contexts and for future child access.
+/// Hence `#[allow(dead_code)]` on the field (mirrors `LocalAudioLevelCtx`).
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct UserRequestedDecodeCtx(pub Signal<std::collections::HashSet<String>>);
 
 const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
 
@@ -182,6 +220,8 @@ const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
 fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
     match raw {
         "auto" => DecodeBudgetOverride::Auto,
+        // Issue #1466: the persistent "show all paused videos" choice.
+        "all" => DecodeBudgetOverride::All,
         other => match other.parse::<usize>() {
             Ok(n) if n > 0 => DecodeBudgetOverride::Fixed(n),
             _ => DecodeBudgetOverride::Auto,
@@ -190,10 +230,12 @@ fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
 }
 
 /// Serialize a decode-budget override to its compact storage string: `"auto"`
-/// for `Auto`, or the bare integer for `Fixed(n)`.
+/// for `Auto`, `"all"` for `All` (issue #1466), or the bare integer for
+/// `Fixed(n)`.
 fn serialize_decode_budget_override(value: DecodeBudgetOverride) -> String {
     match value {
         DecodeBudgetOverride::Auto => "auto".to_string(),
+        DecodeBudgetOverride::All => "all".to_string(),
         DecodeBudgetOverride::Fixed(n) => n.to_string(),
     }
 }
@@ -214,6 +256,9 @@ pub fn save_decode_budget_override(value: DecodeBudgetOverride) {
     match value {
         DecodeBudgetOverride::Fixed(n) => {
             log::info!("DecodeBudget: override=fixed n={n} source=user_setting")
+        }
+        DecodeBudgetOverride::All => {
+            log::info!("DecodeBudget: override=all source=user_setting")
         }
         DecodeBudgetOverride::Auto => {
             log::info!("DecodeBudget: override=auto source=user_setting")
@@ -596,6 +641,7 @@ impl HostSetCtx {
 
 const STORAGE_KEY: &str = "vc_display_name";
 
+/// Secondary plain-text key that bypasses CBOR+zlib serialization.  On Safari,
 /// Load the persisted display name from local storage.
 ///
 /// Reads the plain-text value stored under [`STORAGE_KEY`] in the browser's
@@ -848,14 +894,23 @@ fn generate_local_id() -> String {
 
 /// One-time migration of legacy display-name storage formats to plain text.
 ///
-/// Previous builds stored `vc_display_name` in CBOR+zlib encoding via
-/// `dioxus_sdk_storage`. A later Safari ITP fix added a parallel plain-text
-/// key `vc_display_name_raw`. Very old releases used `vc_username`.
+/// Previous builds stored `vc_display_name` via `dioxus_sdk_storage` which
+/// serialises as **CBOR → zlib → lowercase hex**. The resulting localStorage
+/// value is an even-length string of ASCII hex digits (`[0-9a-f]`), *not*
+/// binary — so it looks printable but is not a valid display name.
+///
+/// A later Safari ITP fix added a parallel plain-text key
+/// `vc_display_name_raw`. Very old releases used `vc_username`.
 ///
 /// This function migrates those legacy formats to the current plain-text
 /// `vc_display_name` key. Users who only had CBOR-encoded data (without the
 /// parallel raw key) will need to re-enter their name once — this is
 /// acceptable since the raw key was written alongside CBOR for some time.
+///
+/// **Note on appearance settings** (`vc_appearance_glow_brightness`, etc.):
+/// old CBOR-encoded f32 values are also hex blobs that `parse::<f32>()` will
+/// reject, causing a silent reset to defaults. This is acceptable — the
+/// correct value self-heals on the next user save.
 ///
 /// Must be called at app startup **before** the Dioxus component tree mounts.
 /// It is a no-op when the primary key already has a readable value or on
@@ -863,17 +918,19 @@ fn generate_local_id() -> String {
 pub fn migrate_legacy_storage() {
     #[cfg(target_family = "wasm")]
     {
-        // If the primary key already has a readable plain-text value, nothing
-        // to do.  CBOR+zlib blobs are binary data that JS coerces to strings
-        // containing non-printable characters — detect those and treat them as
-        // "not migrated yet" so we fall through to the raw/legacy key checks.
+        // If the primary key exists, check whether it is a legacy hex blob.
+        // dioxus_sdk_storage encodes as CBOR → zlib → lowercase hex, producing
+        // an even-length string of `[0-9a-f]` characters. Real display names
+        // virtually never satisfy all three conditions (even length, ≥4 chars,
+        // all hex digits), so this is a reliable discriminator.
         if let Some(v) = read_local_storage(STORAGE_KEY) {
-            let looks_like_plain_text = v.chars().all(|c| !c.is_control() || c == '\n');
-            if looks_like_plain_text {
+            let is_legacy_hex_blob =
+                v.len() >= 4 && v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
+            if !is_legacy_hex_blob {
+                // Genuinely plain text — already migrated, nothing to do.
                 return;
             }
-            // Value is likely a CBOR+zlib blob — remove it and fall through
-            // to migration from the raw/legacy key.
+            // Legacy hex blob — drop it and fall through to fallback keys.
             remove_local_storage(STORAGE_KEY);
         }
 
@@ -1320,6 +1377,7 @@ pub fn apply_theme_to_dom(theme: Theme) {
     {
         let _ = root.set_attribute("data-theme", resolved);
     }
+    crate::theme_file::apply_theme_file_tokens(resolved);
 }
 
 /// Persist theme to localStorage and apply `data-theme` on `<html>`.
@@ -1485,6 +1543,30 @@ mod tests {
             parse_decode_budget_override(&serialized),
             DecodeBudgetOverride::Fixed(12)
         );
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_all() {
+        // Issue #1466: `All` serializes to the independent literal "all" and
+        // parses back. The literal is the external storage contract (the string
+        // the persisted value must use), not derived from the enum — so a
+        // mutation that emitted/parsed any other token breaks this.
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::All);
+        assert_eq!(serialized, "all");
+        assert_eq!(
+            parse_decode_budget_override("all"),
+            DecodeBudgetOverride::All
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_all_is_distinct() {
+        // `All` is its own variant: not Auto, not any Fixed(n). A mutation that
+        // collapsed `All` into Auto or Fixed (e.g. parsing "all" => Auto) breaks
+        // at least one of these.
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Auto);
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Fixed(6));
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Fixed(1));
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod pkce;
 mod provider_config;
 mod routing;
 mod theme;
+mod theme_file;
 mod types;
 
 use crate::components::search_modal::SearchVisibleCtx;
@@ -82,7 +83,7 @@ fn App() -> Element {
     // Keep html[data-theme] in sync whenever the user changes the signal.
     // Skip the first firing: initialize_document_theme() already applied the
     // correct theme synchronously before the first render, so re-running it
-    // here would cause a redundant (and potentially slower CBOR) write.
+    // here would cause a redundant write.
     let is_first_effect = use_hook(|| std::cell::Cell::new(true));
     use_effect(move || {
         let current_theme = theme();
