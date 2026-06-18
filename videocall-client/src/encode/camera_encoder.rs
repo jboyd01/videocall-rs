@@ -4609,7 +4609,7 @@ mod tests {
     ///
     /// Mutation guards:
     /// - Removing the `wallclock_periodic` disjunction from `periodic_keyframe_due`
-    ///   makes it return `false` at frame 36 → `periodic_at[1]` would be 50 → FAILS.
+    ///   prevents the wall-clock trigger → `periodic_at[1]` would be 50 → FAILS.
     /// - Setting `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` too high makes the wall-clock
     ///   check never fire within the simulated window → FAILS.
     #[test]

@@ -462,7 +462,7 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 2500,
         min_bitrate_kbps: 1500,
         max_bitrate_kbps: 4000,
-        keyframe_interval_frames: 30, // ~3s at 10fps (text readability); wall-clock cap ≤5s
+        keyframe_interval_frames: 30, // ~3s at 10fps (text readability); wall-clock cap ≤3s
     },
     VideoQualityTier {
         label: "medium",
@@ -472,7 +472,7 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 1200,
         min_bitrate_kbps: 700,
         max_bitrate_kbps: 2000,
-        keyframe_interval_frames: 24, // ~3s at 8fps (text readability); wall-clock cap ≤5s
+        keyframe_interval_frames: 24, // ~3s at 8fps (text readability); wall-clock cap ≤3s
     },
     VideoQualityTier {
         label: "low",
@@ -482,7 +482,7 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 500,
         min_bitrate_kbps: 250,
         max_bitrate_kbps: 1000,
-        keyframe_interval_frames: 15, // ~3s at 5fps (text readability); wall-clock cap ≤5s
+        keyframe_interval_frames: 15, // ~3s at 5fps (text readability); wall-clock cap ≤3s
     },
 ];
 
