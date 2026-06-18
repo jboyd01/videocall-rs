@@ -18,7 +18,7 @@
 
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
-    is_sole_real_tile, merge_user_requested_decode, partition_camera_tiles,
+    is_sole_real_tile, merge_pinned_decode, merge_user_requested_decode, partition_camera_tiles,
     promote_pinned_into_decoded, promote_requested_into_decoded,
     should_clear_force_decode_on_override_change, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
@@ -28,6 +28,7 @@ use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
+    chat_sidebar::ChatSidebar,
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
@@ -39,8 +40,9 @@ use crate::components::{
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
-        CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
-        MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
+        CameraButton, ChatButtonWithBadge, DensityModeButton, DeviceSettingsButton,
+        DiagnosticsButton, HangUpButton, MicButton, MockPeersButton, PeerListButton,
+        ScreenShareButton,
     },
 };
 use crate::console_log_collector::{
@@ -546,6 +548,9 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut chat_open = use_signal(|| false);
+    // True when a chat message has arrived while the sidebar is closed.
+    let mut chat_has_unread = use_signal(|| false);
     // Latch: set true the first time the Diagnostics drawer is opened, never
     // reset. Once the drawer has been opened at least once, CLOSING it keeps a
     // lightweight `#diagnostics-sidebar` placeholder in the DOM (without the
@@ -3695,15 +3700,17 @@ pub fn AttendantsComponent(
     }
 
     // --- Pinned-peer promotion (HCL #987 review FIX 7; bounded per issue #1470) ---
-    // A pinned peer is force-added to `active_decode_set` (phase 3, below), so
-    // it is ALWAYS decoded regardless of the budget cap. If that peer is ranked
-    // in the displayed off-budget window, it would otherwise land in
-    // `avatar_tiles` and render with `force_avatar = true` ("Video paused")
-    // while it is in fact being decoded — wasted decode AND a misleading UI.
-    // `promote_pinned_into_decoded` swaps it into the LAST decoded slot so
-    // decode and render agree, BOUNDED to `[visible_tile_count,
-    // displayed_tile_count)` so a true-overflow pin can't evict a displayed tile
-    // off the grid (issue #1470 — the same defect bounded on the PLAY path).
+    // A pinned peer is force-added to `active_decode_set` (phase 3, below) when it
+    // got a decoded slot this render. If that peer is ranked in the displayed
+    // off-budget window, it would otherwise land in `avatar_tiles` and render with
+    // `force_avatar = true` ("Video paused") while it is in fact being decoded —
+    // wasted decode AND a misleading UI. `promote_pinned_into_decoded` swaps it
+    // into the LAST decoded slot so decode and render agree, BOUNDED to
+    // `[visible_tile_count, displayed_tile_count)` so a true-overflow pin can't
+    // evict a displayed tile off the grid (issue #1470 — the same defect bounded
+    // on the PLAY path). A true-overflow pin is NOT promoted, gets no decoded
+    // slot, and so phase 3's `decoded_bucket` intersection (#1489) keeps it OUT of
+    // the decode set — it is neither decoded nor shown live (decode⇄render agree).
     if visible_tile_count > 0 && visible_tile_count < all_tiles.len() {
         if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
             // `all_tiles` holds session_ids; the pin is keyed by user_id. Find
@@ -3977,9 +3984,10 @@ pub fn AttendantsComponent(
         // --- SS pin-swap (mirrors the normal grid's pin-swap at lines above) ---
         // If the pinned peer is ranked beyond `ss_budget`, swap it into the
         // last decoded slot so it renders with live video instead of avatar.
-        // Without this, a pinned off-budget SS peer gets force-added to
-        // `active_decode_set` (phase 3) which silently exceeds budget_cap,
-        // AND renders as avatar despite being decoded (wasted decode +
+        // The SS panel renders ALL tiles (no +N badge), so this swap always lands
+        // the pin in `ss_decoded_tiles` → `decoded_bucket`, so phase 3's #1489
+        // intersection admits it. Without the swap a pinned off-budget SS peer
+        // would render as avatar despite being decoded (wasted decode +
         // misleading UI).
         if ss_budget > 0 && ss_budget < ss_all.len() {
             if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
@@ -4005,34 +4013,34 @@ pub fn AttendantsComponent(
         // expansion could NOT admit (beyond the device ceiling #1286) have no
         // slot, correctly stay paused avatars, and are kept OUT of
         // `active_decode_set` by the decoded-bucket-intersecting phase-4 merge.
-        if ss_budget > 0 && ss_budget < ss_all.len() {
+        {
             let requested = user_requested_decode.read();
-            if !requested.is_empty() {
-                let pinned_slot: Option<usize> = pinned_peer_id.peek().as_deref().and_then(|pu| {
-                    ss_all
-                        .iter()
-                        .take(ss_budget)
-                        .position(|tile_id| client.get_peer_user_id(tile_id).as_deref() == Some(pu))
-                });
-                let mut next_free_slot: isize = ss_budget as isize - 1;
-                let promote_indices: Vec<usize> = ss_all
-                    .iter()
-                    .enumerate()
-                    .skip(ss_budget)
-                    .filter(|(_, tile_id)| requested.contains(*tile_id))
-                    .map(|(idx, _)| idx)
-                    .collect();
-                for idx in promote_indices {
-                    while next_free_slot >= 0 && Some(next_free_slot as usize) == pinned_slot {
-                        next_free_slot -= 1;
-                    }
-                    if next_free_slot < 0 {
-                        break;
-                    }
-                    ss_all.swap(next_free_slot as usize, idx);
-                    next_free_slot -= 1;
-                }
-            }
+            // Resolve the pinned peer's post-swap decoded slot (needs `client`, not
+            // host-testable) and pass it into the shared pure helper. The SS panel renders ALL
+            // tiles (vertical scroll, no +N badge), so `displayed_tile_count = ss_all.len()` —
+            // every off-budget tile is renderable, so the helper's true-overflow bound (#1470)
+            // never excludes an SS peer, preserving the prior inline-loop behaviour.
+            // `ss_budget < ss_all.len()` mirrors the helper's own early-return bound, so we skip
+            // the `get_peer_user_id` scan in the budget-covers-all-tiles case (where the helper
+            // does nothing anyway).
+            let pinned_slot: Option<usize> =
+                if ss_budget > 0 && ss_budget < ss_all.len() && !requested.is_empty() {
+                    pinned_peer_id.peek().as_deref().and_then(|pu| {
+                        ss_all.iter().take(ss_budget).position(|tile_id| {
+                            client.get_peer_user_id(tile_id).as_deref() == Some(pu)
+                        })
+                    })
+                } else {
+                    None
+                };
+            let ss_displayed = ss_all.len();
+            promote_requested_into_decoded(
+                &mut ss_all,
+                ss_budget,
+                ss_displayed,
+                &requested,
+                pinned_slot,
+            );
         }
 
         // Split: first ss_budget tiles get video decode, rest get avatars.
@@ -4047,7 +4055,9 @@ pub fn AttendantsComponent(
     // ORDERING INVARIANT: the active decode set is built in 4 phases:
     //   1. Visible layout peers (here)
     //   2. Active screen sharer (here)
-    //   3. Pinned peer (below, after tile rendering)
+    //   3. Pinned peer (below, after tile rendering) — INTERSECTED with the
+    //      decoded bucket (issue #1489) so a true-overflow pin with no decoded
+    //      slot is not decoded-but-invisible (mirrors phase 4).
     //   4. User-requested force-decode peers (below, issue #1466) — the
     //      `merge_user_requested_decode` call after the stale-request prune,
     //      INTERSECTED with the decoded bucket so it can only re-affirm peers
@@ -4366,6 +4376,17 @@ pub fn AttendantsComponent(
     }
 
     // Phase 3 of active_decode_set construction (see ordering invariant above).
+    // INTERSECTED with `decoded_bucket` (issue #1489), mirroring the phase-4 PLAY
+    // merge: the pin-swap above already moved a promotable pin
+    // (`[visible_tile_count, displayed_tile_count)`) into a decoded slot, so it is
+    // in `decoded_bucket` and is admitted. A true-overflow pin
+    // (`idx >= displayed_tile_count`) is deliberately NOT promoted (#1470 — it
+    // would evict a displayed tile off-grid) and so stays in the +N badge with no
+    // decoded slot; gating the insert here keeps it OUT of the decode set rather
+    // than decoding it while it renders in no grid bucket (decode⇄render agree).
+    // A camera-OFF pin is never in `decoded_bucket` (it is in `camera_off_tiles`,
+    // not `visible_tiles`/`ss_decoded_tiles`) so it is intentionally excluded —
+    // it has no video to decode and its audio is independent of this set.
     let current_pinned = pinned_peer_id();
     if let Some(pinned_user_id) = current_pinned.as_deref() {
         if let Some(pinned_session_id) = display_peers
@@ -4373,7 +4394,7 @@ pub fn AttendantsComponent(
             .find(|peer_id| client.get_peer_user_id(peer_id).as_deref() == Some(pinned_user_id))
             .and_then(|peer_id| peer_id.parse::<u64>().ok())
         {
-            active_decode_set.insert(pinned_session_id);
+            merge_pinned_decode(&mut active_decode_set, pinned_session_id, &decoded_bucket);
         }
     }
 
@@ -4474,6 +4495,7 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
+            style:"display:flex;gap:0.5rem",
             div { id: "main-container", class: "meeting-page",
                 onclick: move |_| {
                     dock_menu_open.set(false);
@@ -4793,8 +4815,15 @@ pub fn AttendantsComponent(
                         // separate `camera_off_tiles` group (#1465); counting
                         // those would over-state "N videos paused" and re-surface
                         // the "camera-off looks sheddable" inconsistency #1465
-                        // set out to kill.
-                        avatar_count: avatar_tiles.len(),
+                        // set out to kill. During screen share the active layout
+                        // is the SS panel, whose paused-video tiles live in
+                        // `ss_avatar_tiles` — use that count so "N videos paused"
+                        // matches what the user actually sees (#1472).
+                        avatar_count: if has_screen_share {
+                            ss_avatar_tiles.len()
+                        } else {
+                            avatar_tiles.len()
+                        },
                         natural: total_tiles,
                     }
 
@@ -5175,6 +5204,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+
                                     // Primary: Camera button - always visible
                                     {
                                         let mda_cam = mda.clone();
@@ -5209,6 +5239,11 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+                                    // Reactive read of `chat_has_unread` is
+                                    // scoped INSIDE this child, so flipping the
+                                    // unread flag re-renders only the button, not
+                                    // the whole in-call view.
+                                    ChatButtonWithBadge { chat_has_unread, chat_open }
                                     // (в) Secondary buttons — hidden by default, expand on hover
                                     div { class: "controls-secondary",
                                         if !is_ios() {
@@ -5917,6 +5952,9 @@ pub fn AttendantsComponent(
                     }
                 }
 
+
+
+
                 // Waiting room controls (host or admitted participants when allowed)
                 if is_owner || admitted_can_admit_toggle() {
                     HostControls {
@@ -6174,6 +6212,20 @@ pub fn AttendantsComponent(
                     }
                 }
             }
+            // Chat sidebar
+                ChatSidebar {
+                    is_show: chat_open(),
+                    onclose: move |_| chat_open.set(false),
+                    conv_id: id.clone(),
+                    on_new_message: move |_| {
+                        // Event closure — not a reactive render-body read.
+                        // `peek()` keeps it explicitly non-subscribing so the
+                        // badge flip stays scoped to ChatButtonWithBadge.
+                        if !*chat_has_unread.peek() {
+                            chat_has_unread.set(true);
+                        }
+                    },
+                }
         }
     }
 }

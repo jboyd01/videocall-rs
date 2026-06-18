@@ -184,6 +184,22 @@ jobs:
           ref: ${{ steps.setup.outputs.ref }}
           clean: false
 
+      - name: Prepare E2E temp storage
+        run: |
+          # Chromium is launched with --disable-dev-shm-usage, so it writes
+          # shared-memory files to the process temp dir. The self-hosted
+          # runner's /tmp can retain stale Playwright/Chromium dirs between
+          # jobs and has failed with "No space left on device"; keep this run's
+          # browser profiles and shared-memory files under the checked-out
+          # workspace instead.
+          sudo rm -rf /tmp/playwright_* /tmp/.org.chromium.Chromium.* 2>/dev/null || true
+          rm -rf .tmp/e2e
+          mkdir -p .tmp/e2e/playwright
+          echo "TMPDIR=${GITHUB_WORKSPACE}/.tmp/e2e/playwright" >> "$GITHUB_ENV"
+
+          echo "=== E2E temp storage before test setup ==="
+          df -h /tmp /dev/shm "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}/.tmp/e2e/playwright" || true
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -274,6 +290,11 @@ jobs:
         if: always()
         run: |
           kill "$(cat /tmp/vmstat-pid)" 2>/dev/null || true
+          echo "=== E2E temp storage after tests ==="
+          df -h /tmp /dev/shm "${GITHUB_WORKSPACE}" "${TMPDIR:-/tmp}" || true
+          du -sh "${TMPDIR:-/tmp}" 2>/dev/null || true
+          du -sh e2e/test-results e2e/playwright-report 2>/dev/null || true
+          echo ""
           echo "=== Resource usage during E2E tests ==="
           echo "Columns: r=runnable procs, b=blocked, us=user%, sy=system%, id=idle%, wa=iowait%"
           cat /tmp/e2e-vmstat.log
