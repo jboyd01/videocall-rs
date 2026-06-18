@@ -222,6 +222,25 @@ jobs:
       - name: Tear down any prior E2E stack state
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down --remove-orphans || true
 
+      # Authenticate to Docker Hub before any public base-image pull. The shared
+      # HCL CI runner pulls postgres/nats anonymously, draining Docker Hub's
+      # unauthenticated per-IP rate limit (100 pulls/6h) across all concurrent
+      # e2e jobs + daily deploys — runs then fail at "Start E2E stack" with
+      # "You have reached your unauthenticated pull rate limit". An authenticated
+      # login lifts the ceiling (per-account, not per-IP). Tolerant: if the
+      # secret is absent (forks / ad-hoc runs) it warns and continues.
+      - name: Login to Docker Hub (lift anonymous pull rate limit)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "${DOCKERHUB_TOKEN:-}" ] && [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
+            echo "✅ Docker Hub login successful (${DOCKERHUB_USERNAME})"
+          else
+            echo "::warning::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN not set — pulling anonymously (rate-limit risk)"
+          fi
+
       - name: Build E2E stack images
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
 

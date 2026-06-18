@@ -96,6 +96,22 @@ jobs:
             exit 1
           fi
 
+      # Authenticate to Docker Hub so public base-image pulls (e.g. nixos/nix,
+      # debian, nginx in the image builds) don't drain Docker Hub's anonymous
+      # per-IP rate limit on the shared HCL runner. Tolerant: warns and
+      # continues if the secret is absent.
+      - name: Login to Docker Hub (lift anonymous pull rate limit)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "${DOCKERHUB_TOKEN:-}" ] && [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
+            echo "✅ Docker Hub login successful (${DOCKERHUB_USERNAME})"
+          else
+            echo "::warning::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN not set — pulling anonymously (rate-limit risk)"
+          fi
+
       - name: Verify Harbor images exist
         id: verify-images
         env:
