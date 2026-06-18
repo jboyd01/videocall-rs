@@ -48,6 +48,24 @@ jobs:
           echo "$HARBOR_PASSWORD" | docker login hclcr.io -u "$HARBOR_USERNAME" --password-stdin
           echo "✅ Harbor login successful"
 
+      # Authenticate to Docker Hub before the image builds pull public base
+      # images (Dockerfile.actix/.meeting-api → securityunion/actix-base +
+      # debian; Dockerfile.dioxus → nixos/nix + nginx) so the shared HCL runner
+      # doesn't hit Docker Hub's anonymous per-IP rate limit. This is the
+      # heaviest pull site (5 distinct public bases, daily). Tolerant: warns and
+      # continues if the secret is absent.
+      - name: Login to Docker Hub (lift anonymous pull rate limit)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "${DOCKERHUB_TOKEN:-}" ] && [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
+            echo "✅ Docker Hub login successful (${DOCKERHUB_USERNAME})"
+          else
+            echo "::warning::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN not set — pulling anonymously (rate-limit risk)"
+          fi
+
       - name: Build and push all images (parallel)
         env:
           REGISTRY: ${{ vars.DOCKER_REGISTRY }}
