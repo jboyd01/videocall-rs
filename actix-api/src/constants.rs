@@ -730,23 +730,21 @@ pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_se
 ///
 /// The relay enters relief mode for a receiver when that receiver's REAL
 /// downlink backpressure surface — the bounded per-session `outbound_tx`
-/// channel overflowing on a slow socket — drives the windowed
-/// [`CongestionTracker`](crate::actors::session_logic::CongestionTracker) across
-/// its drop threshold (`is_actively_congested()`). The transport actor stamps a
-/// monotonic epoch into a shared atomic on each such crossing
-/// (`SessionLogic::on_outbound_drop`), and the per-receiver fan-out closure
-/// reads it against THIS window. While the most recent crossing is within the
-/// window, the closure (a) discards non-base-layer VIDEO/SCREEN BEFORE
-/// `try_send`, giving the downlink headroom to drain, and (b) emits one
-/// DOWNLINK_CONGESTION control packet so the client's LayerChooser steps its own
-/// receive layers down. AUDIO and base layer are NEVER shed.
+/// channel overflowing on a slow socket — fires an outbound drop
+/// (`SessionLogic::on_outbound_drop`). The transport actor stamps a monotonic
+/// epoch into a shared atomic on EVERY drop unconditionally (#1481), and the
+/// per-receiver fan-out closure reads it against THIS window. While the most
+/// recent drop is within the window, the closure (a) discards non-base-layer
+/// VIDEO/SCREEN BEFORE `try_send`, giving the downlink headroom to drain, and
+/// (b) emits one DOWNLINK_CONGESTION control packet so the client's
+/// LayerChooser steps its own receive layers down. AUDIO and base layer are
+/// NEVER shed.
 ///
 /// This is DELIBERATELY NOT keyed off the relay's actor-mailbox `Full` (which an
 /// earlier draft used): the mailbox sits in front of `outbound_tx` and overflows
 /// on a room-wide fan-out / scheduling burst that says nothing about any single
-/// receiver's downlink. The `CongestionTracker` one queue downstream is the
-/// genuine per-receiver signal — the same one the #979 keyframe-relax path
-/// already trusts.
+/// receiver's downlink. The per-receiver outbound channel overflow is the
+/// genuine per-receiver signal.
 ///
 /// ## Why a windowed decay, not a consecutive-success exit (B2)
 ///
@@ -759,15 +757,26 @@ pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_se
 /// time-decaying window recovers automatically: once the receiver stops
 /// overflowing for `RECEIVER_DOWNLINK_RELIEF_WINDOW`, full layers resume.
 ///
-/// ## Why 2 s
+/// ## Why 8 s (widened from 2 s in #1481)
 ///
-/// Set equal to [`KEYFRAME_CONGESTION_RELAX_WINDOW`] so the relay-side shed, the
-/// #979 keyframe relaxation, and the client step-down all reason about "recently
-/// congested" over the SAME horizon. 2 s is long enough that a brief stall keeps
-/// relief armed through the recovery (avoiding flap), short enough that a
-/// receiver whose downlink genuinely recovers is back to full quality within a
-/// couple of seconds.
-pub const RECEIVER_DOWNLINK_RELIEF_WINDOW: Duration = Duration::from_secs(2);
+/// Field data (CC7, 2026-06-18) showed the shed flapping on WebTransport in a
+/// cycle: shed activates → drops stop (works!) → epoch ages over 2 s → shed
+/// deactivates → L1+L2 resume → buffer slowly refills over 10-14 s → overflow
+/// → shed reactivates. The 2 s window was too short to bridge the quiet gap
+/// that naturally follows a successful shed on a constrained downlink.
+///
+/// 8 s bridges the typical 5-10 s quiet gap after a successful shed. The
+/// buffer drains in 2-5 s (only L0 = low bitrate), so 8 s gives 3-6 s of
+/// additional hold after the buffer is drained — enough for the receiver to
+/// stabilize. Recovery is still bounded: if drops truly stop (link improves),
+/// shedding releases after 8 s.
+///
+/// NOTE: [`KEYFRAME_CONGESTION_RELAX_WINDOW`] (2 s) is a SEPARATE concern
+/// (per-pair keyframe budget expansion) and is intentionally NOT changed here.
+/// They were previously equal but serve different purposes: the keyframe relax
+/// window arms a short budget burst for immediate recovery retries, while the
+/// downlink relief window holds the L1/L2 shed for sustained stabilization.
+pub const RECEIVER_DOWNLINK_RELIEF_WINDOW: Duration = Duration::from_secs(8);
 
 #[cfg(test)]
 mod tests {
