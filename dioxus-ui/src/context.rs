@@ -892,6 +892,12 @@ fn generate_local_id() -> String {
 // Legacy storage migration
 // ---------------------------------------------------------------------------
 
+/// Sentinel key written after the one-time legacy migration completes.
+/// Prevents `migrate_legacy_storage` from re-running on every startup, which
+/// would perpetually wipe any legitimate all-hex display name (e.g. "1234").
+#[cfg(target_family = "wasm")]
+const MIGRATION_DONE_KEY: &str = "vc_storage_migrated";
+
 /// One-time migration of legacy display-name storage formats to plain text.
 ///
 /// Previous builds stored `vc_display_name` via `dioxus_sdk_storage` which
@@ -899,13 +905,22 @@ fn generate_local_id() -> String {
 /// value is an even-length string of ASCII hex digits (`[0-9a-f]`), *not*
 /// binary — so it looks printable but is not a valid display name.
 ///
+/// A real zlib stream is at least 6 bytes (2-byte header + empty DEFLATE +
+/// 4-byte Adler-32), and CBOR wrapping adds more, so the hex representation
+/// of even the shortest name is ≥ 16 hex chars.  We use that as the length
+/// floor to avoid false-positives on short numeric/hex names like "1234".
+/// As a second discriminator, the first two hex chars are decoded and checked
+/// against the zlib magic: first byte must be `0x78` (deflate, 32K window)
+/// and the two-byte big-endian value must be divisible by 31.
+///
 /// A later Safari ITP fix added a parallel plain-text key
 /// `vc_display_name_raw`. Very old releases used `vc_username`.
 ///
 /// This function migrates those legacy formats to the current plain-text
-/// `vc_display_name` key. Users who only had CBOR-encoded data (without the
-/// parallel raw key) will need to re-enter their name once — this is
-/// acceptable since the raw key was written alongside CBOR for some time.
+/// `vc_display_name` key and writes a sentinel so it never runs again.
+/// Users who only had CBOR-encoded data (without the parallel raw key) will
+/// need to re-enter their name once — acceptable since the raw key was
+/// written alongside CBOR for some time.
 ///
 /// **Note on appearance settings** (`vc_appearance_glow_brightness`, etc.):
 /// old CBOR-encoded f32 values are also hex blobs that `parse::<f32>()` will
@@ -913,21 +928,36 @@ fn generate_local_id() -> String {
 /// correct value self-heals on the next user save.
 ///
 /// Must be called at app startup **before** the Dioxus component tree mounts.
-/// It is a no-op when the primary key already has a readable value or on
-/// non-web platforms.
+/// It is a no-op after the first successful run, when the primary key already
+/// has a readable value, or on non-web platforms.
 pub fn migrate_legacy_storage() {
     #[cfg(target_family = "wasm")]
     {
+        // If migration already ran once, nothing to do.
+        if read_local_storage(MIGRATION_DONE_KEY).is_some() {
+            return;
+        }
+
         // If the primary key exists, check whether it is a legacy hex blob.
-        // dioxus_sdk_storage encodes as CBOR → zlib → lowercase hex, producing
-        // an even-length string of `[0-9a-f]` characters. Real display names
-        // virtually never satisfy all three conditions (even length, ≥4 chars,
-        // all hex digits), so this is a reliable discriminator.
+        //
+        // dioxus_sdk_storage encodes as CBOR → zlib → lowercase hex.  A real
+        // zlib stream is ≥ 6 bytes → ≥ 12 hex chars; with the CBOR envelope
+        // the realistic minimum is ~18-30 hex chars.  We use a floor of 16 to
+        // avoid false-positives on short legitimate names like "1234" or
+        // "cafe".
+        //
+        // As a secondary check we verify the zlib magic: the first byte must
+        // be 0x78 (deflate, 32K window) and the two-byte header interpreted
+        // as a big-endian u16 must be divisible by 31.
         if let Some(v) = read_local_storage(STORAGE_KEY) {
-            let is_legacy_hex_blob =
-                v.len() >= 4 && v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
+            let is_legacy_hex_blob = v.len() >= 16
+                && v.len() % 2 == 0
+                && v.chars().all(|c| c.is_ascii_hexdigit())
+                && has_zlib_magic(&v);
             if !is_legacy_hex_blob {
-                // Genuinely plain text — already migrated, nothing to do.
+                // Genuinely plain text (or too short / wrong header to be a
+                // zlib stream) — mark migration done and return.
+                write_local_storage(MIGRATION_DONE_KEY, "1");
                 return;
             }
             // Legacy hex blob — drop it and fall through to fallback keys.
@@ -939,6 +969,7 @@ pub fn migrate_legacy_storage() {
         if let Some(v) = read_local_storage("vc_display_name_raw") {
             write_local_storage(STORAGE_KEY, &v);
             remove_local_storage("vc_display_name_raw");
+            write_local_storage(MIGRATION_DONE_KEY, "1");
             return;
         }
 
@@ -947,7 +978,38 @@ pub fn migrate_legacy_storage() {
             write_local_storage(STORAGE_KEY, &v);
             remove_local_storage("vc_username");
         }
+
+        // Mark migration complete so this function becomes a no-op on
+        // subsequent startups.
+        write_local_storage(MIGRATION_DONE_KEY, "1");
     }
+}
+
+/// Check whether the first two bytes of a hex string match the zlib magic.
+///
+/// A valid zlib header starts with `0x78` (CMF: deflate method, 32K window)
+/// and the two-byte CMF+FLG value interpreted as big-endian u16 must satisfy
+/// `value % 31 == 0`.  We decode the first 4 hex chars (= 2 bytes) and apply
+/// both checks.  Returns `false` on any parse failure, keeping the
+/// false-positive rate near zero without pulling in a zlib dependency.
+#[cfg(target_family = "wasm")]
+fn has_zlib_magic(hex: &str) -> bool {
+    if hex.len() < 4 {
+        return false;
+    }
+    let Ok(b0) = u8::from_str_radix(&hex[..2], 16) else {
+        return false;
+    };
+    let Ok(b1) = u8::from_str_radix(&hex[2..4], 16) else {
+        return false;
+    };
+    // CMF byte must be 0x78 (deflate, 32K window size).
+    if b0 != 0x78 {
+        return false;
+    }
+    // The two-byte header (big-endian) must be divisible by 31.
+    let header = (b0 as u16) << 8 | b1 as u16;
+    header.is_multiple_of(31)
 }
 
 // ---------------------------------------------------------------------------
