@@ -139,6 +139,11 @@ jobs:
     secrets:
       HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
       HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+      # Forward Docker Hub creds so the reusable builder can authenticate public
+      # base-image pulls (lifts the anonymous per-IP rate limit). Optional in the
+      # reusable workflow — empty if the repo secret is unset.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
   comment-success:
     name: Comment on build success
