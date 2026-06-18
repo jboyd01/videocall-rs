@@ -33,6 +33,12 @@ Key files:
 
 See the `e2e-*` targets in the `Makefile` for available commands.
 
+Choose the lowest test layer that proves the behavior:
+
+- Use unit or backend integration tests when they can catch the bug.
+- Use Dioxus browser integration tests for DOM, browser APIs, component behavior, and lightweight routing.
+- Use Playwright E2E when behavior crosses UI, backend, and realtime boundaries, involves multiple participants, or depends on WebSocket/WebTransport behavior.
+
 ## Change Impact Policy
 
 Every code change must be evaluated in the context of a real-time conferencing app running across diverse networks and devices.
@@ -46,6 +52,14 @@ Every code change must be evaluated in the context of a real-time conferencing a
 ## Source Code Rules
 
 - No symlinks or hardlinks for source files. Each crate or UI must own its files independently.
+- WebSocket and WebTransport transport adapters have protocol-specific differences by design. Do not mechanically consolidate adapter I/O, keep-alive, or send-path code just because the high-level behavior is shared.
+- Adaptive-quality thresholds, timing, tier, and tuning values should stay centralized in `videocall-client/src/adaptive_quality_constants.rs`. Do not scatter magic numbers across encoders, PID/controller logic, or connection code.
+- `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` in `actix-api/src/constants.rs` is the source of truth for WebTransport outbound queue depth. The Helm env override is redundant; raise the value only for exceptional workloads because deep queues buffer stale video for slow receivers.
+
+## Runtime Config Files
+
+- `dioxus-ui/scripts/config.js` is a committed fallback and is also rewritten by the E2E/dev container from environment variables. Do not casually stage it while the E2E stack is running; check whether changes are intentional source edits or generated env noise.
+- When adding a field to the wasm `RuntimeConfig`, either give `dioxus-ui/scripts/config.js` a value that works against a vanilla `make e2e-up` stack or make the field optional with `#[serde(default)]`.
 
 ## Linter And Formatter Rules
 
