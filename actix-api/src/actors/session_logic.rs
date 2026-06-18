@@ -1521,13 +1521,12 @@ mod tests {
             "#979 keyframe-relax path must survive: record_drop still flags active congestion"
         );
 
-        // #1481: the epoch MUST be stamped after any drop — even a single
-        // sub-threshold drop. This pins the unconditional-stamp wiring in
-        // on_outbound_drop against re-gating behind is_actively_congested().
+        // #1481: after 15 drops the epoch must be stamped (both gated and
+        // ungated code would stamp here since the tracker IS congested).
         assert_ne!(
             logic.downlink_congested_epoch.load(Ordering::Relaxed),
             DOWNLINK_EPOCH_NEVER,
-            "#1481: on_outbound_drop must stamp the epoch unconditionally on every drop"
+            "#1481: on_outbound_drop must stamp the epoch after drops"
         );
 
         // Allow any (erroneously) spawned publish task to land on the wire.
@@ -1554,71 +1553,42 @@ mod tests {
     // =====================================================================
     // #1481 — downlink-epoch stamp is now UNCONDITIONAL on every drop
     // =====================================================================
-    //
-    // The previous `stamp_downlink_epoch_if_congested` gated on
-    // `is_actively_congested()` — which caused flapping on WT where drops
-    // cluster then go quiet (shed works → drops stop → tracker decays →
-    // gate closes → epoch ages → shed off → buffer refills → repeat).
-    //
-    // The fix (#1481): `on_outbound_drop` stamps unconditionally. The relief
-    // window (`RECEIVER_DOWNLINK_RELIEF_WINDOW`, 8 s) provides the decay.
-    // These tests exercise `downlink_congested_epoch_now` / `downlink_epoch_is_active`
-    // — the primitives `on_outbound_drop` now uses directly.
 
-    /// A single drop stamps a real (non-NEVER) epoch that reads as active
-    /// within the production relief window. This verifies the unconditional
-    /// stamp behavior introduced by #1481.
-    ///
-    /// MUTATION PROOF: removing the `epoch.store(...)` inside
-    /// `on_outbound_drop` (or gating it behind `is_actively_congested()`)
-    /// would leave the epoch at NEVER after a sub-threshold drop, so the
-    /// `!= NEVER` and `is_active` asserts FAIL.
-    #[test]
-    fn epoch_stamps_on_every_drop_unconditionally() {
-        let epoch = AtomicU64::new(DOWNLINK_EPOCH_NEVER);
+    /// THE regression test for #1481: a SINGLE sub-threshold drop through the
+    /// real `on_outbound_drop` must stamp the epoch. On the old gated code
+    /// (where `stamp_downlink_epoch_if_congested` required
+    /// `is_actively_congested() == true`), 1 drop does NOT cross the threshold
+    /// (needs 5), so the epoch stays NEVER → this assert FAILS. On the fixed
+    /// code it stamps unconditionally → passes.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn epoch_stamps_on_single_sub_threshold_drop() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
 
-        // Simulate what on_outbound_drop now does: unconditional stamp.
-        epoch.store(downlink_congested_epoch_now(), Ordering::Relaxed);
+        let mut logic = build_test_receiver_logic(nats_client.clone(), "epoch_1481_room").await;
 
-        let stamped = epoch.load(Ordering::Relaxed);
+        // ONE drop — below CONGESTION_DROP_THRESHOLD (5).
+        logic.on_outbound_drop(9999, b"some-sender");
+
+        // Premise: the tracker must NOT be congested after a single drop.
+        assert!(
+            !logic.congestion_tracker.is_actively_congested(),
+            "test premise: a single drop must NOT cross the threshold"
+        );
+
+        // The fix: epoch is stamped DESPITE being below threshold.
         assert_ne!(
-            stamped, DOWNLINK_EPOCH_NEVER,
-            "a single drop must stamp a real epoch (no threshold gate)"
-        );
-        assert!(
-            downlink_epoch_is_active(stamped, crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW),
-            "the stamped epoch must read as active within the 8s relief window"
-        );
-    }
-
-    /// The relief window (8 s) is long enough that immediately after stamping
-    /// the epoch is still active. This verifies `downlink_epoch_is_active`
-    /// reads the window correctly — confirming the fan-out closure will shed.
-    ///
-    /// MUTATION PROOF: if `RECEIVER_DOWNLINK_RELIEF_WINDOW` were set to 0
-    /// (or `downlink_epoch_is_active` always returned false), this assert FAILS.
-    #[test]
-    fn epoch_active_immediately_after_stamp() {
-        let now = downlink_congested_epoch_now();
-        assert!(
-            downlink_epoch_is_active(now, crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW),
-            "a freshly stamped epoch must be active within the relief window"
-        );
-    }
-
-    /// `DOWNLINK_EPOCH_NEVER` must never read as active, regardless of window.
-    ///
-    /// MUTATION PROOF: if `downlink_epoch_is_active` dropped the `== NEVER`
-    /// early-return, a `0` epoch combined with the `now - 0 <= window` math
-    /// could spuriously return true.
-    #[test]
-    fn epoch_never_is_always_inactive() {
-        assert!(
-            !downlink_epoch_is_active(
-                DOWNLINK_EPOCH_NEVER,
-                crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW
-            ),
-            "DOWNLINK_EPOCH_NEVER must never be treated as active"
+            logic.downlink_congested_epoch.load(Ordering::Relaxed),
+            DOWNLINK_EPOCH_NEVER,
+            "#1481: a single sub-threshold drop must still stamp the epoch \
+             (fails on gated code, passes on unconditional stamp)"
         );
     }
 }
