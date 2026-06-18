@@ -270,4 +270,46 @@ test.describe("Custom theme import in AppearanceSettingsPanel", () => {
     await expect(page.locator('[data-testid="theme-source-active"]')).toContainText("Default");
     await expect(resetBtn).not.toBeVisible();
   });
+
+  // ── 8. Keyboard: Import input is focusable (pins visually-hidden fix) ───
+  test("import input is keyboard-focusable and triggers focus-within styling", async ({ page }) => {
+    const meetingId = `e2e_import_focus_${Date.now()}`;
+    await openAppearanceTab(page, meetingId, "import-focus-user");
+
+    // Before import: source shows Default, import control is visible.
+    await expect(page.locator('[data-testid="theme-source-active"]')).toContainText("Default");
+
+    const fileInput = page.locator('[data-testid="theme-import-input"]');
+
+    // Assert the input is NOT hidden via display:none or visibility:hidden.
+    // This is what made the element unfocusable in the pre-fix markup.
+    const computedStyles = await fileInput.evaluate((el) => {
+      const styles = window.getComputedStyle(el);
+      return { display: styles.display, visibility: styles.visibility };
+    });
+    expect(computedStyles.display).not.toBe("none");
+    expect(computedStyles.visibility).not.toBe("hidden");
+
+    // Focus the input programmatically and assert it becomes activeElement.
+    // Under the old `display:none` markup this would FAIL because
+    // display:none elements cannot receive focus.
+    await fileInput.focus();
+    await expect(fileInput).toBeFocused();
+
+    // Verify the wrapping .theme-import-btn matches :focus-within when the
+    // input inside it is focused — this pins the CSS focus-ring indicator.
+    const focusWithinActive = await page.evaluate(
+      () => document.querySelector(".theme-import-btn")?.matches(":focus-within") ?? false,
+    );
+    expect(focusWithinActive).toBe(true);
+
+    // Verify the input has the correct aria-label for screen readers.
+    await expect(fileInput).toHaveAttribute("aria-label", "Import theme file (.json)");
+
+    // Finally, confirm the import path still works end-to-end:
+    // use setInputFiles (bypasses native dialog) to apply the theme.
+    await fileInput.setInputFiles(VALID_THEME_PATH);
+    await expect.poll(async () => getBgColor(page), { timeout: 5_000 }).toBe(CUSTOM_DARK_BG);
+    await expect(page.locator('[data-testid="theme-source-active"]')).toContainText("E2E Neon");
+  });
 });

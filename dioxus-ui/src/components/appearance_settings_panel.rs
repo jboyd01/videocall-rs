@@ -312,13 +312,13 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
                             label {
                                 class: "theme-import-btn",
-                                "aria-label": "Import theme file (.json)",
                                 "Import\u{2026}"
                                 input {
                                     r#type: "file",
                                     accept: ".json,application/json",
+                                    "aria-label": "Import theme file (.json)",
                                     "data-testid": "theme-import-input",
-                                    style: "display:none",
+                                    class: "visually-hidden",
                                     onchange: move |evt: Event<FormData>| {
                                         let theme_mode = theme_ctx.0();
                                         let mut custom_sig = custom_theme_ctx.0;

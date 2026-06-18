@@ -6632,7 +6632,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   color: rgba(255, 255, 255, 0.92); /* @token-exempt: ghost pill hover text (dark) */
 }
 
-.theme-import-btn:focus-visible {
+.theme-import-btn:focus-visible,
+.theme-import-btn:focus-within {
   outline: none;
   box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.6); /* @token-exempt: focus ring (dark) */
 }
@@ -6682,7 +6683,8 @@ html[data-theme="light"] .theme-import-btn:hover {
   color: rgba(0, 0, 0, 0.88); /* @token-exempt: ghost pill hover text (light) */
 }
 
-html[data-theme="light"] .theme-import-btn:focus-visible {
+html[data-theme="light"] .theme-import-btn:focus-visible,
+html[data-theme="light"] .theme-import-btn:focus-within {
   box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.5); /* @token-exempt: focus ring (light) */
 }
 
