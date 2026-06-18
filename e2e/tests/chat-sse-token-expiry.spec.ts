@@ -43,8 +43,9 @@ import { waitForServices } from "../helpers/wait-for-services";
  * `continue`d WITHOUT reopening, so chat receive died permanently and `sseHits`
  * stayed ~1. The second test in this file is the regression proof for that fix.)
  *
- * Backoff schedule (base 750ms, doubling, +0–375ms jitter): 750 / 1500 / 3000 /
- * 6000ms ≈ 11–13s total before GiveUp.
+ * Backoff schedule (base 750ms, doubling, +0–750ms jitter): 750 / 1500 / 3000 /
+ * 6000ms ≈ 11–14s total before GiveUp. (PR #1393 widened the jitter spread to
+ * `0..SSE_REESTABLISH_BASE_MS` ≈ 0–750ms; it was 0–375ms pre-#1393.)
  */
 
 const TOKEN_EXPIRED_FRAME = 'data: {"type":"auth","status":"token_expired"}\n\n';
