@@ -53,13 +53,15 @@ use super::super::client::VideoCallClient;
 use super::classify_encode_error::{
     classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
 };
-use super::encoder_state::{keyframe_tick_decision, EncoderState, KeyframeTickInput};
+use super::encoder_state::{
+    keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
+};
 use super::transform::transform_screen_chunk;
 use crate::crypto::aes::Aes128State;
 
 use crate::adaptive_quality_constants::{
     simulcast_screen_layers, BITRATE_CHANGE_THRESHOLD, DEFAULT_SCREEN_TIER_INDEX,
-    ENCODER_PLI_COOLDOWN_MS, PERIODIC_KEYFRAME_MAX_INTERVAL_MS, SCREEN_QUALITY_TIERS,
+    ENCODER_PLI_COOLDOWN_MS, SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS, SCREEN_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 // Reuse the SEND-side simulcast diagnostics types defined alongside the camera
@@ -3160,18 +3162,13 @@ impl ScreenEncoder {
                             .performance()
                             .expect("Performance API not available")
                             .now();
-                        // Use tier-controlled keyframe interval.
-                        // Using `%` instead of `.is_multiple_of()` for compatibility
-                        // with Rust toolchains older than 1.87.
-                        #[allow(clippy::manual_is_multiple_of)]
-                        let frame_count_periodic = local_keyframe_interval > 0
-                            && screen_frame_counter % local_keyframe_interval == 0;
-                        // Issue #1510: wall-clock ceiling (same as camera encoder).
-                        let wallclock_periodic = match last_keyframe_emit_ms {
-                            Some(last) => (now - last) >= PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
-                            None => false,
-                        };
-                        let is_periodic_keyframe = frame_count_periodic || wallclock_periodic;
+                        let is_periodic_keyframe = periodic_keyframe_due(
+                            screen_frame_counter,
+                            local_keyframe_interval,
+                            now,
+                            last_keyframe_emit_ms,
+                            SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                        );
                         // Resolve the keyframe decision via the shared single source of
                         // truth (issue #1347 item 2: the screen AND camera loops call
                         // the same pure `keyframe_tick_decision`, which the host tests

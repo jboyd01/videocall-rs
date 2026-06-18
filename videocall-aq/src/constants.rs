@@ -1008,12 +1008,17 @@ pub const CAMERA_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 /// Periodic keyframes ensure recovery from packet loss on screen share streams.
 pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 
-/// Wall-clock ceiling on the periodic keyframe interval (milliseconds).
+/// Wall-clock ceiling on the camera periodic keyframe interval (milliseconds).
 /// The frame-counted `keyframe_interval_frames` only guarantees ~5s at the tier's
 /// nominal fps. Under CPU load or at low AQ tiers the actual fps drops and the
 /// frame-counted floor stretches to 10–17s. This wall-clock cap guarantees a
 /// periodic keyframe at least every 5s regardless of actual encode rate (issue #1510).
 pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 5000.0;
+
+/// Wall-clock ceiling for screen-share periodic keyframes (milliseconds).
+/// Screen tiers use a ~3s nominal GOP for text readability. The screen-specific
+/// cap preserves that 3s design intent under low-fps conditions (issue #1510).
+pub const SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 3000.0;
 
 /// Max time to wait for a keyframe before requesting one (milliseconds).
 /// After packet loss is detected, if no keyframe arrives within this window, send PLI.
