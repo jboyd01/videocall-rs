@@ -944,6 +944,22 @@ lazy_static! {
     )
     .expect("Failed to create capability_score metric");
 
+    /// Client battery level (0.0–1.0) as a NUMERIC gauge (#1392). PR #1368 widened
+    /// the TELEM-7 `CLIENT_INFO` publish gate to admit a battery-only health packet,
+    /// but the battery *value* rode on no metric — `CLIENT_INFO`'s labels are
+    /// cores/architecture/gpu_family/network_effective_type/capability_score only.
+    /// This exposes the reported level as a real measurement so it can be
+    /// thresholded/averaged/quantiled in PromQL (e.g. "fraction of clients under
+    /// 20% battery"). Mirrors `CAPABILITY_SCORE`: same per-reporter label set, set
+    /// only when actually reported so an absent battery stays absent (not a
+    /// misleading 0).
+    pub static ref BATTERY_LEVEL: GaugeVec = register_gauge_vec!(
+        "videocall_client_battery_level",
+        "Client battery level as a numeric value in [0,1] (0.0 = empty, 1.0 = full); absent when the client did not report a battery level",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_battery_level metric");
+
     /// Effective simulcast layer count the publisher is configured to encode/send
     /// (#1143). p90==1 across a meeting is the inert-simulcast signal that the
     /// cc7tp analysis could only see in console logs. `media_kind` distinguishes
