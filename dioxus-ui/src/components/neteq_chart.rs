@@ -909,6 +909,10 @@ pub fn UnifiedTimelineChart(
                         let visible_for_move = visible_map.clone();
                         rsx! {
                             div {
+                                // Stable hook for the crosshair-tooltip E2E (#1452): the
+                                // onmousemove handler lives on this absolute HTML overlay, NOT
+                                // the SVG, so tests must hover THIS element to show the tooltip.
+                                "data-testid": "unified-timeline-crosshair",
                                 style: "{overlay_style}",
                                 onmousemove: move |evt: MouseEvent| {
                                     let client = evt.client_coordinates();
