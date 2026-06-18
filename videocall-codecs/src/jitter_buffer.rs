@@ -70,10 +70,11 @@ const PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS: f64 = 1000.0;
 /// the proactive-PLI cadence at `1000 * 2^3 = 8000ms` — i.e. once recovery is clearly not
 /// arriving, this receiver pokes the speaker at most ~1/8s instead of ~1/s, damping the
 /// self-sustaining PLI storm. Going quiet is safe: the binding lower bound on freeze recovery is
-/// the *publisher's periodic GOP keyframe* (~5s camera / ~3s screen — the encoder's own
-/// `keyframe_interval_frames` cadence, NOT gated by the PLI cooldown; see `videocall-aq`'s tier
-/// `keyframe_interval_frames` and `camera_encoder`'s emit coalescer, which exempts the periodic
-/// keyframe). The reactive gap-driven path (`peer_decode_manager::should_request_keyframe`) is an
+/// the *publisher's periodic GOP keyframe* (wall-clock-bounded at 5s via
+/// `PERIODIC_KEYFRAME_MAX_INTERVAL_MS`, NOT gated by the PLI cooldown; see `videocall-aq`'s
+/// `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` and the camera/screen encoder emit coalescer, which
+/// exempts the periodic keyframe). The reactive gap-driven path
+/// (`peer_decode_manager::should_request_keyframe`) is an
 /// additional accelerator but does NOT fire on a contiguous-delta *lossless* (WS) keyframe-less
 /// stall — the exact #1479 shape — because it gates on `lost_count > 0`. So this proactive path is
 /// one accelerator above the periodic-keyframe floor, and the whole point of #1479 is to stop it

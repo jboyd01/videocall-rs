@@ -59,7 +59,7 @@ use crate::crypto::aes::Aes128State;
 
 use crate::adaptive_quality_constants::{
     simulcast_screen_layers, BITRATE_CHANGE_THRESHOLD, DEFAULT_SCREEN_TIER_INDEX,
-    ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
+    ENCODER_PLI_COOLDOWN_MS, PERIODIC_KEYFRAME_MAX_INTERVAL_MS, SCREEN_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 // Reuse the SEND-side simulcast diagnostics types defined alongside the camera
@@ -3164,8 +3164,14 @@ impl ScreenEncoder {
                         // Using `%` instead of `.is_multiple_of()` for compatibility
                         // with Rust toolchains older than 1.87.
                         #[allow(clippy::manual_is_multiple_of)]
-                        let is_periodic_keyframe = local_keyframe_interval > 0
+                        let frame_count_periodic = local_keyframe_interval > 0
                             && screen_frame_counter % local_keyframe_interval == 0;
+                        // Issue #1510: wall-clock ceiling (same as camera encoder).
+                        let wallclock_periodic = match last_keyframe_emit_ms {
+                            Some(last) => (now - last) >= PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                            None => false,
+                        };
+                        let is_periodic_keyframe = frame_count_periodic || wallclock_periodic;
                         // Resolve the keyframe decision via the shared single source of
                         // truth (issue #1347 item 2: the screen AND camera loops call
                         // the same pure `keyframe_tick_decision`, which the host tests

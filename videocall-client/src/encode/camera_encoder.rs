@@ -156,7 +156,8 @@ use super::encoder_state::{keyframe_tick_decision, EncoderState, KeyframeTickInp
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
+    simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD,
+    PERIODIC_KEYFRAME_MAX_INTERVAL_MS, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -3322,8 +3323,17 @@ impl CameraEncoder {
                             // Using `%` instead of `.is_multiple_of()` for compatibility
                             // with Rust toolchains older than 1.87.
                             #[allow(clippy::manual_is_multiple_of)]
-                            let is_periodic_keyframe = local_keyframe_interval > 0
+                            let frame_count_periodic = local_keyframe_interval > 0
                                 && video_frame_counter % local_keyframe_interval == 0;
+                            // Issue #1510: wall-clock ceiling. At low fps (CPU-bound
+                            // or low AQ tier) the frame-counted interval stretches
+                            // well past 5s. Emit a periodic keyframe if wall-clock
+                            // since last keyframe exceeds the ceiling.
+                            let wallclock_periodic = match last_keyframe_emit_ms {
+                                Some(last) => (now_ms - last) >= PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                                None => false, // first keyframe handled by frame_count_periodic (frame 0)
+                            };
+                            let is_periodic_keyframe = frame_count_periodic || wallclock_periodic;
                             // Resolve the keyframe decision via the shared single
                             // source of truth (issue #1347 item 2: the camera AND
                             // screen loops call the same pure `keyframe_tick_decision`,
@@ -4595,6 +4605,87 @@ mod tests {
         assert!(
             !decision.step_down,
             "a flat-at-0 saturation counter must never step down (WS users / healthy WT)"
+        );
+    }
+
+    /// Issue #1510: the wall-clock periodic keyframe ceiling fires `is_periodic`
+    /// when elapsed time since the last keyframe exceeds `PERIODIC_KEYFRAME_MAX_INTERVAL_MS`,
+    /// even when the frame-count modulo has not triggered. This simulates a low-fps
+    /// publisher (10fps) whose frame-counted interval (50 frames = 5s at nominal)
+    /// stretches because actual fps is only 7fps.
+    ///
+    /// Mutation guards:
+    /// - Removing the `wallclock_periodic` disjunction makes the periodic keyframe
+    ///   NOT fire at frame 35 (only 35 < 50 frames) → `periodic_at` stays empty → FAILS.
+    /// - Setting `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` too high makes the wall-clock
+    ///   check never fire within the simulated window → FAILS.
+    #[test]
+    fn wallclock_periodic_keyframe_fires_at_low_fps() {
+        use crate::adaptive_quality_constants::PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+
+        let keyframe_interval_frames: u32 = 50; // "minimal" tier
+        let actual_fps = 7.0_f64; // CPU-bound, well below nominal 10fps
+        let frame_interval_ms = 1000.0 / actual_fps;
+        let cd = FORCED_KEYFRAME_COOLDOWN_MS;
+
+        let mut last_keyframe_emit_ms: Option<f64> = None;
+        let mut now = 0.0_f64;
+        let mut periodic_at: Vec<u32> = Vec::new();
+
+        // Simulate 60 frames (~8.6s at 7fps). The frame-counted modulo fires at
+        // frame 0 and frame 50. The wall-clock ceiling should fire BEFORE frame 50
+        // (at ~frame 35: 35 * 142.9ms = ~5000ms).
+        for frame in 0u32..60 {
+            #[allow(clippy::manual_is_multiple_of)]
+            let frame_count_periodic =
+                keyframe_interval_frames > 0 && frame % keyframe_interval_frames == 0;
+            let wallclock_periodic = match last_keyframe_emit_ms {
+                Some(last) => (now - last) >= PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                None => false,
+            };
+            let is_periodic = frame_count_periodic || wallclock_periodic;
+
+            let decision = keyframe_tick_decision(KeyframeTickInput {
+                now_ms: now,
+                pli_pending: false,
+                is_periodic,
+                cooldown_reset: false,
+                last_keyframe_emit_ms,
+                cooldown_ms: cd,
+            });
+
+            if decision.want_keyframe {
+                periodic_at.push(frame);
+            }
+            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+            now += frame_interval_ms;
+        }
+
+        // Frame 0 always fires (frame_count_periodic: 0 % 50 == 0).
+        assert_eq!(periodic_at[0], 0, "frame 0 must emit a periodic keyframe");
+
+        // The wall-clock ceiling must fire BEFORE the frame-counted boundary (frame 50).
+        // At 7fps, frame 35 = 5000ms after frame 0 → first wall-clock trigger.
+        assert!(
+            periodic_at.len() >= 2,
+            "the wall-clock ceiling must trigger at least one extra periodic keyframe \
+             before the frame-counted boundary at frame 50"
+        );
+        let wallclock_fire = periodic_at[1];
+        assert!(
+            wallclock_fire < 50,
+            "wall-clock periodic must fire before the frame-counted boundary (frame 50), \
+             but fired at frame {wallclock_fire}"
+        );
+        // Verify it fires at approximately the right time (~5000ms / 142.9ms ≈ frame 35-36).
+        // The first eligible frame is the one AFTER elapsed >= 5000ms, so allow up to
+        // one extra frame interval of overshoot.
+        let fire_time_ms = wallclock_fire as f64 * frame_interval_ms;
+        assert!(
+            fire_time_ms >= PERIODIC_KEYFRAME_MAX_INTERVAL_MS
+                && fire_time_ms < PERIODIC_KEYFRAME_MAX_INTERVAL_MS + frame_interval_ms * 2.0,
+            "wall-clock periodic should fire within two frames of {PERIODIC_KEYFRAME_MAX_INTERVAL_MS}ms, \
+             but fired at {fire_time_ms:.1}ms (frame {wallclock_fire})"
         );
     }
 }
