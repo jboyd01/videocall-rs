@@ -3552,6 +3552,14 @@ html[data-theme="light"] #invite-overlay p {
   grid-template-columns: minmax(110px, 0.45fr) 1fr;
 }
 
+/* issue 1480: server build-info table loses its Commit column in production
+   (github info hidden), so 4 spans -> 3. Collapse the grid to 3 columns to
+   match. Base .about-modal-row is 4-col; this modifier wins by source order. */
+.about-modal-row--server-nogit {
+  grid-template-columns: minmax(96px, 0.6fr) repeat(2, 1fr);
+  min-width: 0;
+}
+
 .about-modal-row--header {
   background: var(--glass-bg-hover);
   font-size: 0.75rem;
@@ -3605,6 +3613,10 @@ html[data-theme="light"] #invite-overlay p {
   .about-modal-row {
     grid-template-columns: 1fr;
     gap: 0.125rem;
+  }
+  /* issue 1480: keep the no-git server table single-column on narrow screens */
+  .about-modal-row--server-nogit {
+    grid-template-columns: 1fr;
   }
   .about-modal-section:first-of-type .about-modal-row {
     grid-template-columns: 1fr;

@@ -1497,6 +1497,17 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-size: 0.85em;
 }
 
+/* issue 1480: build-info grid column count tracks whether github info
+   (Commit + Branch) is shown. --git = Component/Commit/Branch/Built (4 col);
+   --nogit = Component/Built (2 col). Cells use display:contents rows so the
+   grid column count must equal the spans rendered per row. */
+.build-info-table--git {
+  grid-template-columns: 1fr auto auto auto;
+}
+.build-info-table--nogit {
+  grid-template-columns: 1fr auto;
+}
+
 .build-info-header {
   display: contents;
 }

@@ -1188,29 +1188,55 @@ pub fn Diagnostics(
                             }
                             "Build info"
                         }
-                        div { class: "build-info-table",
-                            div { class: "build-info-header",
-                                span { class: "build-info-cell", "Component" }
-                                span { class: "build-info-cell", "Commit" }
-                                span { class: "build-info-cell", "Branch" }
-                            }
-                            div { class: "build-info-row",
-                                span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
-                                span { class: "build-info-cell monospace", "" }
-                                span { class: "build-info-cell", "" }
-                            }
-                            for comp in backend_versions() {
-                                {
-                                    let svc = comp["service"].as_str().unwrap_or("?").to_string();
-                                    let ver = comp["version"].as_str().unwrap_or("").to_string();
-                                    let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
-                                    let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
-                                    let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
-                                    rsx! {
-                                        div { class: "build-info-row",
-                                            span { class: "build-info-cell build-info-service", "{label}" }
-                                            span { class: "build-info-cell monospace", "{sha}" }
-                                            span { class: "build-info-cell", "{br}" }
+                        {
+                            // Issue #1480: github info (Commit + Branch) is gated on
+                            // showBuildGitInfo. When hidden, columns collapse to
+                            // Component / Built (2). When shown: Component / Commit /
+                            // Branch / Built (4). The grid column count tracks via the
+                            // --git / --nogit modifier so cell count == column count.
+                            let show_git = crate::constants::show_build_git_info();
+                            let table_class = if show_git {
+                                "build-info-table build-info-table--git"
+                            } else {
+                                "build-info-table build-info-table--nogit"
+                            };
+                            rsx! {
+                                div { class: "{table_class}",
+                                    div { class: "build-info-header",
+                                        span { class: "build-info-cell", "Component" }
+                                        if show_git {
+                                            span { class: "build-info-cell", "Commit" }
+                                            span { class: "build-info-cell", "Branch" }
+                                        }
+                                        span { class: "build-info-cell", "Built" }
+                                    }
+                                    div { class: "build-info-row",
+                                        span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
+                                        if show_git {
+                                            span { class: "build-info-cell monospace", "{crate::constants::short_sha(env!(\"GIT_SHA\"))}" }
+                                            span { class: "build-info-cell", "{env!(\"GIT_BRANCH\")}" }
+                                        }
+                                        span { class: "build-info-cell", "{crate::constants::build_date(env!(\"BUILD_TIMESTAMP\")).unwrap_or_default()}" }
+                                    }
+                                    for comp in backend_versions() {
+                                        {
+                                            let svc = comp["service"].as_str().unwrap_or("?").to_string();
+                                            let ver = comp["version"].as_str().unwrap_or("").to_string();
+                                            let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
+                                            let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
+                                            let raw_ts = comp["build_timestamp"].as_str().unwrap_or("");
+                                            let built = crate::constants::build_date(raw_ts).unwrap_or_else(|| raw_ts.to_string());
+                                            let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
+                                            rsx! {
+                                                div { class: "build-info-row",
+                                                    span { class: "build-info-cell build-info-service", "{label}" }
+                                                    if show_git {
+                                                        span { class: "build-info-cell monospace", "{sha}" }
+                                                        span { class: "build-info-cell", "{br}" }
+                                                    }
+                                                    span { class: "build-info-cell", "{built}" }
+                                                }
+                                            }
                                         }
                                     }
                                 }
