@@ -555,6 +555,11 @@ impl NetEq {
     pub fn flush(&mut self) {
         self.packet_buffer.flush(&mut self.statistics);
         self.leftover_samples.clear();
+        // Drain any decoded-PCM backlog held in bypass mode too, so flush() fully
+        // empties every audio-holding structure regardless of mode (issue #1402).
+        // No-op on the shipped wasm path (bypass mode is never enabled there), but
+        // keeps the primitive correct-by-construction if it ever is.
+        self.bypass_audio_queue.clear();
         self.reset();
     }
 
@@ -574,8 +579,15 @@ impl NetEq {
         self.leftover_time_stretched_samples.clear();
         self.timestretch_added_samples = 0;
         // Resync-to-live governor (issue #1299): clear the cooldown anchor so a stale lag episode
-        // (e.g. a full flush or a prolonged disconnect/safety-valve reset) cannot mis-gate a
-        // freshly recalibrating stream.
+        // cannot mis-gate a freshly recalibrating stream. `reset()` has exactly two LIVE callers in
+        // the shipped wasm path — the ~6 s expand safety-valve (`get_decision`, below) and `flush()`
+        // — so this clear runs on those recalibration points. `flush()` is reached on the peer
+        // audio-off path (`peer_decode_manager::force_media_off` → `audio.flush()` →
+        // `WorkerMsg::Flush` → `eq.flush()`), which #1402 made an actual flush (it was formerly a
+        // no-op log). `WorkerMsg::Clear` is never sent. NOTE the governor's own `flush_to_live` does
+        // NOT go through `reset()` — it resets the delay manager directly and manages `last_resync`
+        // itself (setting it to `Some(now)` to anchor the cooldown) — so it is not counted among
+        // these `reset()` callers.
         self.last_resync = None;
     }
 
@@ -715,6 +727,13 @@ impl NetEq {
 
         // Hysteresis/cooldown: do not fire again until `resync_cooldown_ms` has elapsed since the
         // last flush, so the governor cannot thrash while the filter settles to the new level.
+        //
+        // BOUNDED-TARGET ASSUMPTION: the one-shot 5 s cooldown is safe only because the production
+        // wasm path bounds the adaptive target (`max_delay_ms = 300`, #1299 part 2), which keeps
+        // Accelerate engaged to drain between flushes — so lag cannot re-accumulate to the ceiling
+        // within a cooldown window. With an UNBOUNDED target (`max_delay_ms = 0`) a true standing
+        // wave could re-accumulate up to ~1 s of lag per cooldown window before the next flush. If
+        // the target is ever unbounded in production, this cooldown must be revisited.
         let now = Instant::now();
         if let Some(last) = self.last_resync {
             if now.duration_since(last) < Duration::from_millis(self.config.resync_cooldown_ms) {
@@ -1151,7 +1170,28 @@ mod tests {
     use std::{thread::sleep, time::Duration};
 
     use super::*;
+    use crate::codec::AudioDecoder;
     use crate::packet::RtpHeader;
+
+    struct TestPcmDecoder {
+        sample_rate: u32,
+        channels: u8,
+        samples: usize,
+    }
+
+    impl AudioDecoder for TestPcmDecoder {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn channels(&self) -> u8 {
+            self.channels
+        }
+
+        fn decode(&mut self, _encoded: &[u8]) -> Result<Vec<f32>> {
+            Ok(vec![0.25; self.samples])
+        }
+    }
 
     fn create_test_packet(seq: u16, ts: u32, duration_ms: u32) -> AudioPacket {
         let header = RtpHeader::new(seq, ts, 12345, 96, false);
@@ -1177,6 +1217,89 @@ mod tests {
             payload.extend_from_slice(&sample.to_le_bytes());
         }
         AudioPacket::new(header, payload, 48000, 1, 20)
+    }
+
+    /// Regression guard: `NetEq::flush` must keep draining the packet buffer.
+    ///
+    /// The worker's wasm `WebNetEq` wrapper has no host-runnable harness here, so
+    /// this host test does not prove the worker dispatch. It preserves the
+    /// existing core flush contract that the worker dispatch delegates to.
+    #[test]
+    fn test_flush_drains_packet_buffer() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Buffer several packets, as a live peer stream would.
+        for i in 0..5u32 {
+            neteq
+                .insert_packet(create_48k_20ms_packet(i as u16, i * 960))
+                .unwrap();
+        }
+        assert!(
+            !neteq.packet_buffer.is_empty(),
+            "precondition: packets should be buffered before flush (was {})",
+            neteq.packet_buffer.len()
+        );
+
+        // The peer's audio stream ends; flush should leave no queued packets.
+        neteq.flush();
+
+        assert_eq!(
+            neteq.packet_buffer.len(),
+            0,
+            "flush must drain the packet buffer so no concealment is emitted for the \
+             ended stream; {} packet(s) remained",
+            neteq.packet_buffer.len()
+        );
+    }
+
+    /// Issue #1402: `flush()` must also drain the decoded-PCM bypass queue.
+    ///
+    /// Packet-buffer draining already existed before this PR. The host-testable
+    /// behavior added here is the `bypass_audio_queue.clear()` path: in bypass
+    /// mode, `insert_packet` decodes immediately and stores PCM outside the
+    /// packet buffer, so `flush()` must empty that backlog too.
+    ///
+    /// MUTATION CHECK: removing `self.bypass_audio_queue.clear()` from
+    /// `NetEq::flush` leaves this test's final assertion non-empty.
+    #[test]
+    fn test_flush_drains_bypass_audio_queue() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            bypass_mode: true,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+        neteq.register_decoder(
+            96,
+            Box::new(TestPcmDecoder {
+                sample_rate: 48_000,
+                channels: 1,
+                samples: 960,
+            }),
+        );
+
+        neteq.insert_packet(create_48k_20ms_packet(0, 0)).unwrap();
+        assert!(
+            !neteq.bypass_audio_queue.is_empty(),
+            "precondition: bypass mode should queue decoded PCM before flush"
+        );
+        assert!(
+            neteq.packet_buffer.is_empty(),
+            "precondition: bypass mode should not use the packet buffer"
+        );
+
+        neteq.flush();
+
+        assert!(
+            neteq.bypass_audio_queue.is_empty(),
+            "flush must drain bypass decoded PCM; {} sample(s) remained",
+            neteq.bypass_audio_queue.len()
+        );
     }
 
     /// Regression guard for issue #624: NetEQ's `delay_manager` treats the per-packet
@@ -2524,14 +2647,15 @@ mod tests {
     }
 
     /// Part 2 (issue #1299): the bounded `max_delay_ms` caps `target_delay_ms`, so the adaptive
-    /// target can never ratchet to the 3000ms regime that gates Accelerate off.
+    /// target can never ratchet into the multi-second regime that gates Accelerate off.
     ///
     /// Drives a pathological all-identical-timestamp burst (the same pattern that
     /// `test_buffer_duration_calculation_with_identical_timestamps` shows pushes the delay manager
     /// to high targets) and asserts the target stays at/below the configured cap. FAILS if the
-    /// `max_delay_ms` plumbing (NetEqConfig field → set_maximum_delay) is removed: the default
-    /// derived cap is 3000ms (200 packets × 20 × 3/4), so without the bound the target can climb far
-    /// past 300ms.
+    /// `max_delay_ms` plumbing (NetEqConfig field → set_maximum_delay) is removed: 3000ms is the
+    /// configured `base_maximum_delay_ms` ceiling (200 × 20 × 3/4), while the EFFECTIVE uncapped
+    /// target tops out near 2000ms (the histogram is 100 buckets × 20ms) — either way, without the
+    /// bound the target climbs far past 300ms.
     #[test]
     fn bounded_target_cannot_reach_3s() {
         const CAP_MS: u32 = 300;
@@ -2556,7 +2680,7 @@ mod tests {
         let target = neteq.target_delay_ms();
         assert!(
             target <= CAP_MS,
-            "target_delay_ms must be capped at {CAP_MS}ms by max_delay_ms, got {target}ms (would ratchet toward the 3000ms cap unbounded)"
+            "target_delay_ms must be capped at {CAP_MS}ms by max_delay_ms, got {target}ms (would ratchet into the multi-second regime unbounded)"
         );
     }
 
