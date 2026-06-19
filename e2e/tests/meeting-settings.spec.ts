@@ -516,10 +516,15 @@ async function navigateToMeetingFromHome(
   await page.locator("#username").pressSequentially(username, { delay: 50 });
   await page.locator("#username").press("Enter");
   await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+  // Accept any of the three valid post-navigation states: the pre-join
+  // Start/Join button, the waiting-room message, or — if the prejoin flow
+  // auto-advanced — the in-meeting grid itself. Without the grid fallback the
+  // helper hangs whenever a peer skips the prejoin screen.
   await expect(
     page
       .getByRole("button", { name: /Start Meeting|Join Meeting/ })
-      .or(page.getByText("Waiting to be admitted")),
+      .or(page.getByText("Waiting to be admitted"))
+      .or(page.locator("#grid-container")),
   ).toBeVisible({
     timeout: 20_000,
   });
@@ -740,27 +745,35 @@ test.describe("Meeting settings – live participant count refresh (issue 1551)"
       const hostPage = await hostCtx.newPage();
       const peerPage = await peerCtx.newPage();
 
-      // Host starts the meeting so it is "active", then opens its settings page.
+      // Host joins the live meeting in its own tab and STAYS there for the whole
+      // test. The host must remain present in the grid so the meeting never goes
+      // idle/host-less — otherwise a joining peer has no host to admit it and
+      // the participant-count dynamics become racy (count could drop to 0 before
+      // the peer arrives). This mirrors the proven host+peer sequence used by the
+      // passing "admitted_can_admit live propagation" test above.
       await navigateToMeetingFromHome(hostPage, meetingId, "HostUser");
       await expect(joinMeetingWhenReady(hostPage)).resolves.toBe("in-meeting");
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
-      await hostPage.goto(`/meeting/${meetingId}/settings`);
-      await expect(hostPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
+      // Open the settings page in a SEPARATE tab so the host's meeting tab keeps
+      // the meeting active. The Activity count read here should already be >= 1
+      // with the host present.
+      const settingsPage = await hostCtx.newPage();
+      await settingsPage.goto(`/meeting/${meetingId}/settings`);
+      await expect(settingsPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
 
-      const countValue = participantsStatValue(hostPage);
+      const countValue = participantsStatValue(settingsPage);
       await expect(countValue).toBeVisible({ timeout: 5_000 });
       const initialCount = parseInt((await countValue.textContent())?.trim() || "0", 10);
 
-      // A second peer joins the live meeting. Waiting-room default is ON, so the
-      // host may need to admit them; admitting moves them to present and bumps
-      // the participant count.
+      // A second peer joins the live meeting. Waiting-room default is ON and the
+      // host is present, so the peer deterministically lands in the waiting room
+      // and is admitted from the host's meeting tab (which is in the grid and has
+      // the Admit UI). Admitting moves the peer to present and bumps the count.
       await navigateToMeetingFromHome(peerPage, meetingId, "PeerUser");
       const peerJoinState = await joinMeetingWhenReady(peerPage);
       if (peerJoinState === "waiting") {
-        // Admit from a fresh meeting tab (the settings page has no admit UI).
-        const hostMeetingPage = await hostCtx.newPage();
-        await hostMeetingPage.goto(`/meeting/${meetingId}`);
-        const admit = hostMeetingPage.getByTitle("Admit").first();
+        const admit = hostPage.getByTitle("Admit").first();
         await expect(admit).toBeVisible({ timeout: 20_000 });
         await admit.dispatchEvent("click");
 
@@ -775,7 +788,6 @@ test.describe("Meeting settings – live participant count refresh (issue 1551)"
         if (peerTransition === "join") {
           await ensureJoinedFromTransition(peerJoinButton, peerGrid);
         }
-        await hostMeetingPage.close();
       }
       await expect(peerPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
