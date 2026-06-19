@@ -916,6 +916,7 @@ pub fn Host(
             // #1482: a second client handle for the per-peer device-info reader;
             // the `per_peer_receive` closure below moves the first one.
             let client_dev = client.clone();
+            let client_dev_all = client.clone();
             DiagnosticsReader {
                 summary,
                 // Gate the camera snapshot on the camera being enabled, mirroring
@@ -938,6 +939,11 @@ pub fn Host(
                 // Reads through to the client on every call (no captured value),
                 // so the diagnostics panel always renders the current metrics.
                 per_peer_device_info: Rc::new(move |sid| client_dev.peer_device_info(sid)),
+                // issue 1482: live ALL-peers device-info reader for the
+                // diagnostics "Device (per peer)" section. Independent of the
+                // receive list, so a camera-off peer with HEALTH-reported device
+                // metrics still renders.
+                per_peer_device_all: Rc::new(move || client_dev_all.all_peer_device_info()),
             }
         })
     };

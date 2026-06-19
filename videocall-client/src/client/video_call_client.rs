@@ -2144,6 +2144,20 @@ impl VideoCallClient {
             .and_then(|inner| inner.peer_decode_manager.peer_device_info(session_id))
     }
 
+    /// issue 1482: every known peer's self-reported device info for the
+    /// diagnostics "Device (per peer)" section. Unlike `per_peer_received_snapshots`
+    /// (which lists only peers with media flowing), this returns device metrics for
+    /// ALL peers — including a camera-off peer whose HEALTH packets carry device
+    /// info but who isn't currently in the receive list. Returns `(session_id,
+    /// label, info)`; empty on a transient borrow clash so the render never blocks.
+    pub fn all_peer_device_info(&self) -> Vec<(u64, String, crate::decode::PeerDeviceInfo)> {
+        self.inner
+            .try_borrow()
+            .ok()
+            .map(|inner| inner.peer_decode_manager.all_peer_device_info())
+            .unwrap_or_default()
+    }
+
     /// Returns a shared reference to the camera force-keyframe flag.
     ///
     /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets

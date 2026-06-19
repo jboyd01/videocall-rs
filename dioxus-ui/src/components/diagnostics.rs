@@ -1225,7 +1225,7 @@ pub fn Diagnostics(
                                             span { class: "build-info-cell monospace", "{crate::constants::short_sha(env!(\"GIT_SHA\"))}" }
                                             span { class: "build-info-cell", "{env!(\"GIT_BRANCH\")}" }
                                         }
-                                        span { class: "build-info-cell", "{crate::constants::build_date(env!(\"BUILD_TIMESTAMP\")).unwrap_or_default()}" }
+                                        span { class: "build-info-cell", "{crate::constants::build_datetime(env!(\"BUILD_TIMESTAMP\")).unwrap_or_else(|| env!(\"BUILD_TIMESTAMP\").to_string())}" }
                                     }
                                     for comp in backend_versions() {
                                         {
@@ -1234,13 +1234,13 @@ pub fn Diagnostics(
                                             let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
                                             let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
                                             let raw_ts = comp["build_timestamp"].as_str().unwrap_or("");
-                                            let built = crate::constants::build_date(raw_ts).unwrap_or_else(|| raw_ts.to_string());
+                                            let built = crate::constants::build_datetime(raw_ts).unwrap_or_else(|| if raw_ts.is_empty() { "-".to_string() } else { raw_ts.to_string() });
                                             let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
                                             rsx! {
                                                 div { class: "build-info-row",
                                                     span { class: "build-info-cell build-info-service", "{label}" }
                                                     if show_git {
-                                                        span { class: "build-info-cell monospace", "{sha}" }
+                                                        span { class: "build-info-cell monospace", "{crate::constants::short_sha(&sha)}" }
                                                         span { class: "build-info-cell", "{br}" }
                                                     }
                                                     span { class: "build-info-cell", "{built}" }
@@ -1744,23 +1744,24 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
     let send_screen_snap = (reader.send_screen)();
     let per_peer_receive = (reader.per_peer_receive)();
 
-    // #1482: resolve the per-peer device blocks here (live, each tick) while the
-    // reader is in scope. ONE entry per unique session_id (a peer can appear in
-    // several kind blocks), preserving first-seen order; a peer whose info is
-    // `None` (nothing reported / unknown) or whose formatted lines are empty
-    // contributes no block — never an empty-labeled row.
+    // issue 1482: resolve the per-peer device blocks here (live, each tick)
+    // while the reader is in scope. Iterate the ALL-PEERS device reader (NOT the
+    // media-receive list) so a peer that reports device metrics via HEALTH but
+    // whose media isn't currently flowing (e.g. camera off) still renders. The
+    // label comes from the reader tuple, which mirrors the receive-list label
+    // (display name → user id → session id), so a receiving peer's label is
+    // unchanged. A peer whose formatted lines are empty contributes no block —
+    // never an empty-labeled row; an empty list → no `.diag-device` container.
     let device_blocks: Vec<DeviceBlock> = {
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut blocks: Vec<DeviceBlock> = Vec::new();
-        for p in per_peer_receive.iter() {
-            if !seen.insert(p.session_id) {
+        for (session_id, label, info) in (reader.per_peer_device_all)().into_iter() {
+            if !seen.insert(session_id) {
                 continue;
             }
-            if let Some(info) = (reader.per_peer_device_info)(p.session_id) {
-                let lines = format_peer_device_lines(&info);
-                if !lines.is_empty() {
-                    blocks.push((p.session_id, p.label.clone(), lines));
-                }
+            let lines = format_peer_device_lines(&info);
+            if !lines.is_empty() {
+                blocks.push((session_id, label, lines));
             }
         }
         blocks

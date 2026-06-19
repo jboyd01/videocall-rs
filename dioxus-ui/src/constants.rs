@@ -493,6 +493,28 @@ pub(crate) fn build_date(ts: &str) -> Option<String> {
     Some(trimmed.split('T').next().unwrap_or(trimmed).to_string())
 }
 
+/// Issue #1480: render a build timestamp as date + FULL time (down to seconds)
+/// with the trailing zone preserved, so the About modal and the diagnostics
+/// build-info table show the SAME complete Built value on both surfaces. The
+/// only transform is replacing the FIRST `'T'` of an ISO `2026-06-19T15:43:50Z`
+/// with a space, yielding `2026-06-19 15:43:50Z` — seconds AND the trailing
+/// `Z`/timezone are kept verbatim. Mirrors `build_date`'s degradation contract:
+/// returns `None` for the build.rs failure sentinel `"unknown"` or an empty
+/// string (after trim) so callers can omit the token. An already-bare date
+/// (no `'T'`) passes through unchanged, because `replacen(..., 1)` finds no `'T'`
+/// to replace. Uses `replacen` (not byte-index slicing) so it is scalar-safe and
+/// never panics on a multi-byte boundary.
+pub(crate) fn build_datetime(ts: &str) -> Option<String> {
+    let trimmed = ts.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return None;
+    }
+    // Replace only the FIRST `'T'` (date/time separator) with a space; the rest
+    // of the timestamp — seconds and trailing `Z`/zone — is kept verbatim. A
+    // bare date has no `'T'`, so it passes through unchanged.
+    Some(trimmed.replacen('T', " ", 1))
+}
+
 /// Issue #1480: truncate a git SHA to its first 7 characters (canonical short
 /// form). Returns `"unknown"` when empty and the input unchanged when already
 /// shorter than 7 chars (or non-ASCII — `chars().take` is scalar-safe). Moved
@@ -880,7 +902,7 @@ mod log_level_tests {
 
 #[cfg(test)]
 mod build_info_tests {
-    use super::{build_date, git_info_visible, short_sha};
+    use super::{build_date, build_datetime, git_info_visible, short_sha};
 
     /// Issue #1480: pins the FAIL-CLOSED default. Empty / falsey -> github info
     /// hidden; only an explicit truthy ("true"/"1") shows it. The accessor
@@ -914,6 +936,32 @@ mod build_info_tests {
             build_date("2026-06-18"),
             Some("2026-06-18".to_string()),
             "already-bare date returned unchanged"
+        );
+    }
+
+    /// Issue #1480: the full ISO timestamp keeps its ENTIRE time component down to
+    /// seconds plus the trailing `Z` — only the first `'T'` becomes a space. The
+    /// build.rs failure sentinel and blank inputs return None (caller omits the
+    /// token); an already-bare date passes through unchanged. Real literal
+    /// assertions — would FAIL if the format regressed to `HH:MM`-only or to the
+    /// bare date.
+    #[test]
+    fn build_datetime_keeps_full_seconds() {
+        assert_eq!(
+            build_datetime("2026-06-19T13:48:11Z"),
+            Some("2026-06-19 13:48:11Z".to_string())
+        );
+        assert_eq!(
+            build_datetime("2026-06-18T14:30:00Z"),
+            Some("2026-06-18 14:30:00Z".to_string())
+        );
+        assert_eq!(build_datetime("unknown"), None);
+        assert_eq!(build_datetime(""), None);
+        assert_eq!(build_datetime("  "), None);
+        assert_eq!(
+            build_datetime("2026-06-19"),
+            Some("2026-06-19".to_string()),
+            "already-bare date returned unchanged (no time component to expand)"
         );
     }
 
