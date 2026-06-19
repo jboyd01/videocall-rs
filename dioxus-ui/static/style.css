@@ -4384,6 +4384,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 2px;
   font-size: 13px;
   max-width: calc(100% - 90px);
+  white-space: nowrap;
   overflow: hidden;
   line-height: 1.3;
   display: inline-flex;
