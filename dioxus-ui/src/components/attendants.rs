@@ -4112,7 +4112,7 @@ pub fn AttendantsComponent(
         "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
          display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
          padding: 16px 16px 80px 16px; \
-         align-items: center; box-sizing: border-box; \
+         align-items: stretch; box-sizing: border-box; \
          grid-template-columns: none; grid-template-rows: none;"
             .to_string()
     } else {
@@ -4832,6 +4832,7 @@ pub fn AttendantsComponent(
                         {
                             let left_pct = screen_share_ratio() * 100.0;
                             let right_pct = (1.0 - screen_share_ratio()) * 100.0 - 0.4; // account for handle
+
                             let handle_class = if ss_resizing() {
                                 "screen-share-resize-handle dragging"
                             } else {
@@ -4865,7 +4866,7 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — CSS flex-wrap panel.
+                                // Right panel — CSS grid, columns & row height set by compute_layout.
                                 div {
                                     class: "ss-peer-panel",
                                     style: "width: {right_pct:.2}%;",
