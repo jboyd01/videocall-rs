@@ -177,7 +177,7 @@ pub fn format_send_layer(
 }
 
 /// Format the SEND simulcast header for a kind, e.g.
-/// `"3 of 3 layers active"` (active vs effective). For single-stream it reads
+/// `"Currently 3 of 3 layers active"` (active vs effective). For single-stream it reads
 /// `"Single layer"` (capitalized to match the footer's display copy). Pure /
 /// host-tested.
 pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
@@ -185,7 +185,7 @@ pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
         "Single layer".to_string()
     } else {
         format!(
-            "{} of {} layers active",
+            "Currently {} of {} layers active",
             snap.active_layers, snap.effective_layers
         )
     }
@@ -448,7 +448,7 @@ pub fn format_mbps(kbps: u32) -> String {
 // the spec's literal phrasings; live numbers are filled from the snapshots. Pure
 // so the copy is a host-tested source of truth (a wording change breaks a test).
 
-/// VIDEO SEND summary, e.g. `"Sending 3 of 3 layers · 540p–720p"`. Camera off
+/// VIDEO SEND summary, e.g. `"Currently sending 3 of 3 layers · 540p–720p"`. Camera off
 /// (`snap` is `None`) → `"Camera — off"`. Single-stream → `"Sending single
 /// layer · {res}"` (the one adaptive layer's short res, when known). The res
 /// span uses the SEND snapshot's per-layer short resolutions across the EFFECTIVE
@@ -469,12 +469,12 @@ pub fn format_video_send_summary(snap: Option<&SimulcastSendSnapshot>) -> String
     let span = send_layer_res_span(s);
     if span.is_empty() {
         format!(
-            "Sending {} of {} layers",
+            "Currently sending {} of {} layers",
             s.active_layers, s.effective_layers
         )
     } else {
         format!(
-            "Sending {} of {} layers · {span}",
+            "Currently sending {} of {} layers · {span}",
             s.active_layers, s.effective_layers
         )
     }
@@ -670,9 +670,9 @@ fn source_on_phrase(kind: PrefMediaKind) -> &'static str {
 /// The SEND layer count caption ("range value" line) — STATE-AWARE about whether
 /// the source is actually capturing.
 ///
-/// - Source ACTIVE (camera on / sharing / mic on): the present-tense
-///   "Sending {active} of {total} layers" (or "Sending 1 layer" for a 1-rung
-///   ladder) — the live count.
+/// - Source ACTIVE (camera on / sharing / mic on): a capacity ceiling form
+///   "Up to {active} of {total} layers" (or "Up to 1 layer" for a 1-rung
+///   ladder) — the CONFIGURED ceiling the user picked, not live throughput.
 /// - Source OFF: a future/conditional form using the CONFIGURED count so we never
 ///   claim to be "sending" when nothing is captured, e.g.
 ///   "Will send {active} layers when the camera is on" (the configured ceiling is
@@ -690,9 +690,9 @@ pub fn format_send_layer_caption(
     let layers_word = if active == 1 { "layer" } else { "layers" };
     if source_active {
         if total <= 1 {
-            "Sending 1 layer".to_string()
+            "Up to 1 layer".to_string()
         } else {
-            format!("Sending {active} of {total} layers")
+            format!("Up to {active} of {total} layers")
         }
     } else {
         let phrase = source_on_phrase(kind);
@@ -2516,7 +2516,7 @@ fn SendLayerCell(
     let rungs = layer_send_rungs(&labels, ceiling_pos);
     let rungs_aria = send_rungs_aria(&rungs);
     let active_count = ceiling_pos + 1;
-    // Human caption: present-tense "Sending N of M layers" when the source is
+    // Human caption: capacity "Up to N of M layers" when the source is
     // capturing, else the future "Will send N layers {when …}" using the
     // configured count (source-aware, pure / host-tested).
     let count_caption = format_send_layer_caption(kind, active_count, labels.len(), source_active);
@@ -4338,7 +4338,7 @@ mod tests {
             active_layers: 2,
             layers: Vec::new(),
         };
-        assert_eq!(format_send_header(&multi), "2 of 3 layers active");
+        assert_eq!(format_send_header(&multi), "Currently 2 of 3 layers active");
         let single = SimulcastSendSnapshot {
             simulcast_active: false,
             effective_layers: 1,
@@ -4578,11 +4578,11 @@ mod tests {
     fn video_send_summary_camera_off_and_active() {
         // Camera off (None) → the spec's off line.
         assert_eq!(format_video_send_summary(None), "Camera — off");
-        // Active simulcast → "Sending A of E layers · lo–hi".
+        // Active simulcast → "Currently sending A of E layers · lo–hi".
         let s = send_snap_3layer();
         assert_eq!(
             format_video_send_summary(Some(&s)),
-            "Sending 3 of 3 layers · 360p–720p"
+            "Currently sending 3 of 3 layers · 360p–720p"
         );
         // Single-layer → "Sending single layer · {res}".
         let single = SimulcastSendSnapshot {
@@ -5545,15 +5545,15 @@ mod tests {
     #[test]
     fn send_layer_caption_is_source_aware() {
         use PrefMediaKind::{Audio, Screen, Video};
-        // SOURCE ON: present-tense "Sending N of M layers".
+        // SOURCE ON: capacity "Up to N of M layers".
         assert_eq!(
             format_send_layer_caption(Video, 2, 3, true),
-            "Sending 2 of 3 layers"
+            "Up to 2 of 3 layers"
         );
-        // Single-layer ladder, on → "Sending 1 layer".
+        // Single-layer ladder, on → "Up to 1 layer".
         assert_eq!(
             format_send_layer_caption(Video, 1, 1, true),
-            "Sending 1 layer"
+            "Up to 1 layer"
         );
         // SOURCE OFF: future form using the CONFIGURED count + per-kind phrase;
         // never claims to be "sending". Each kind names its own trigger.
