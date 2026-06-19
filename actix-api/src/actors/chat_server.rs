@@ -4769,50 +4769,72 @@ fn handle_msg(
             };
 
             if is_video {
-                // ----- Viewport filter (#988): "is this SENDER wanted?" -----
+                // ----- #1436 kill switch for the #988 viewport filter -----
                 //
-                // Read the viewport set ONCE: derive both the drop decision and
-                // the current set size from a single guard so the debug log on
-                // the drop path costs no extra RwLock read (the drop path runs
-                // at near-full inbound VIDEO rate per receiver during a viewport
-                // collapse — exactly when this log matters most). A poisoned
-                // lock fails OPEN (forward); an unparseable source (`None`) also
-                // fails OPEN.
-                let (drop_video, viewport_len) = match source {
-                    Some(src) => desired_streams
-                        .read()
-                        .map(|st| (!st.ids.is_empty() && !st.ids.contains(&src), st.ids.len()))
-                        .unwrap_or((false, 0)),
-                    None => (false, 0),
-                };
-                if drop_video {
-                    // Intentional, viewport-driven drop — accounted on a
-                    // DEDICATED counter so it never pollutes the backpressure
-                    // (mailbox-full) drop metric / its dashboards & alerts.
-                    RELAY_VIEWPORT_FILTERED_TOTAL
+                // Read the kill-switch flag ONCE via the memoized OnceLock
+                // accessor (cheap atomic load on this hot path). When the
+                // filter is DISABLED, the entire viewport decision AND its
+                // accounting (the FILTERED / FORWARDED counters) are skipped —
+                // the counters intentionally do not run because the filter is
+                // off — and VIDEO falls straight through to the #989 layer
+                // filter below, dropping nothing on the viewport.
+                let viewport_enabled = crate::constants::viewport_filter_enabled();
+                if viewport_enabled {
+                    // ----- Viewport filter (#988): "is this SENDER wanted?" -----
+                    //
+                    // Read the viewport set ONCE: derive both the drop decision and
+                    // the current set size from a single guard so the debug log on
+                    // the drop path costs no extra RwLock read (the drop path runs
+                    // at near-full inbound VIDEO rate per receiver during a viewport
+                    // collapse — exactly when this log matters most). A poisoned
+                    // lock fails OPEN (forward); an unparseable source (`None`) also
+                    // fails OPEN.
+                    let (drop_video, viewport_len) = match source {
+                        // `viewport_should_drop`'s first arg is `true` ON PURPOSE: the
+                        // enclosing `if viewport_enabled` is the live #1436 kill switch,
+                        // so the filter is already known-enabled here. The helper's
+                        // `enabled` flag is exercised by its unit tests (forward-all when
+                        // false); the hot path never reaches it disabled.
+                        Some(_) => desired_streams
+                            .read()
+                            .map(|st| {
+                                (
+                                    crate::constants::viewport_should_drop(true, &st.ids, source),
+                                    st.ids.len(),
+                                )
+                            })
+                            .unwrap_or((false, 0)),
+                        None => (false, 0),
+                    };
+                    if drop_video {
+                        // Intentional, viewport-driven drop — accounted on a
+                        // DEDICATED counter so it never pollutes the backpressure
+                        // (mailbox-full) drop metric / its dashboards & alerts.
+                        RELAY_VIEWPORT_FILTERED_TOTAL
+                            .with_label_values(&[&room])
+                            .inc();
+                        // DEBUG (not trace) so a SCOPED `RUST_LOG=...chat_server=debug`
+                        // — not global trace — can reconstruct who-dropped-what-from-whom
+                        // for one room: receiver session, the SUBJECT-derived source
+                        // (#994: derived from the NATS subject, not the forgeable payload
+                        // session_id), and the current viewport set size (a collapse
+                        // toward 0/1 is the wrongly-dropping signature). Per-source
+                        // forensics live HERE, never in metric labels (cardinality).
+                        // `viewport_len` was captured from the single decision read
+                        // above — no second lock on the hot drop path.
+                        debug!(
+                            "Viewport drop: off-screen VIDEO from subject-derived source {:?} for receiver session {} in room {} (viewport set size {})",
+                            source, session, room, viewport_len
+                        );
+                        return Ok(());
+                    }
+                    // Forwarded VIDEO — the denominator complement of the filtered
+                    // counter (HCL #988). Mutually exclusive with the drop branch
+                    // above; together they cover every VIDEO packet at the filter.
+                    RELAY_VIEWPORT_FORWARDED_TOTAL
                         .with_label_values(&[&room])
                         .inc();
-                    // DEBUG (not trace) so a SCOPED `RUST_LOG=...chat_server=debug`
-                    // — not global trace — can reconstruct who-dropped-what-from-whom
-                    // for one room: receiver session, the SUBJECT-derived source
-                    // (#994: derived from the NATS subject, not the forgeable payload
-                    // session_id), and the current viewport set size (a collapse
-                    // toward 0/1 is the wrongly-dropping signature). Per-source
-                    // forensics live HERE, never in metric labels (cardinality).
-                    // `viewport_len` was captured from the single decision read
-                    // above — no second lock on the hot drop path.
-                    debug!(
-                        "Viewport drop: off-screen VIDEO from subject-derived source {:?} for receiver session {} in room {} (viewport set size {})",
-                        source, session, room, viewport_len
-                    );
-                    return Ok(());
                 }
-                // Forwarded VIDEO — the denominator complement of the filtered
-                // counter (HCL #988). Mutually exclusive with the drop branch
-                // above; together they cover every VIDEO packet at the filter.
-                RELAY_VIEWPORT_FORWARDED_TOTAL
-                    .with_label_values(&[&room])
-                    .inc();
             }
 
             // ----- Layer filter (#989): "which LAYER of a wanted sender?" -----
