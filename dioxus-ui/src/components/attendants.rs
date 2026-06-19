@@ -3907,7 +3907,7 @@ pub fn AttendantsComponent(
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     //
-    // Screen-share right panel: compact tiles via CSS flex-wrap layout.
+    // Screen-share right panel: compact tiles via CSS grid layout.
     // All visual sizing is handled purely by CSS (.ss-peer-panel).
     //
     // ALL participants are rendered in the DOM (vertical scroll handles
@@ -4866,7 +4866,7 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — CSS grid, columns & row height set by compute_layout.
+                                // Right panel — CSS grid via auto-fill (see .ss-peer-panel in style.css).
                                 div {
                                     class: "ss-peer-panel",
                                     style: "width: {right_pct:.2}%;",
