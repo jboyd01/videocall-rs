@@ -685,8 +685,10 @@ pub struct LogoutQuery {
 /// Accepts an optional `?id_token_hint=<token>` parameter which is forwarded
 /// to the IdP for session identification.
 ///
-/// If no session cookie is present, returns 200 with the clear-cookie header
-/// but does NOT redirect to the IdP (mitigates logout CSRF).
+/// Redirects to the IdP when a session cookie is present OR an `id_token_hint`
+/// is provided (browser-PKCE clients carry no server cookie but pass the hint).
+/// If NEITHER is present, returns 200 with the clear-cookie header but does NOT
+/// redirect (mitigates logout CSRF from unauthenticated requests).
 pub async fn logout(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
