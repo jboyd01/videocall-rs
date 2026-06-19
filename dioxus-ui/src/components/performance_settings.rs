@@ -3038,6 +3038,10 @@ pub mod receive {
         PeerKindSnap,
     };
     use dioxus::prelude::*;
+    // issue 1164: `WebEventExt::as_web_event` lets the <details> ontoggle handler
+    // read the native open-state back off the event target. Same import path used
+    // elsewhere in this crate (diagnostics.rs, attendants.rs, home.rs).
+    use dioxus::web::WebEventExt;
     use std::rc::Rc;
     use videocall_client::{
         max_layers_for_kind, quality_state, PrefMediaKind, ReceivedLayerSnapshot,
@@ -3664,6 +3668,11 @@ pub mod receive {
         };
         let id_prefix = meta.id_prefix;
 
+        // issue 1164: track the <details> open state so the per-peer rows are
+        // built lazily — only while the disclosure is expanded. Default CLOSED, so a
+        // large meeting pays nothing (no PeerRow build/diff) until the user expands.
+        let mut peers_open = use_signal(|| false);
+
         rsx! {
             div { class: "perf-side perf-side--recv",
                 div { class: "perf-side__head",
@@ -3761,6 +3770,28 @@ pub mod receive {
                     details {
                         class: "perf-peers",
                         "data-testid": "{id_prefix}-peers",
+                        // issue 1164: a fresh <details> always mounts collapsed
+                        // (we add no `open:` attr), so re-seed the mirror to match
+                        // and avoid building rows for a collapsed remounted cell
+                        // after a peers-empty -> peers-return re-entry.
+                        onmounted: move |_| {
+                            peers_open.set(false);
+                        },
+                        // issue 1164: mirror the native open state into the signal so
+                        // the per-peer rows below render lazily. The native <details>
+                        // toggles itself (click + keyboard) and reflects open-ness to
+                        // the `open` content attribute; we just read it back here.
+                        // ontoggle fires ONLY on an actual open/close transition, so
+                        // writing the signal here cannot cause a render loop.
+                        ontoggle: move |evt| {
+                            let native = evt.as_web_event();
+                            let is_open = native
+                                .target()
+                                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                                .map(|el| el.has_attribute("open"))
+                                .unwrap_or(false);
+                            peers_open.set(is_open);
+                        },
                         summary {
                             class: "perf-peers__summary",
                             "data-testid": "{id_prefix}-peers-summary",
@@ -3775,15 +3806,17 @@ pub mod receive {
                             }
                             span { class: "perf-peers__agg", "{agg}" }
                         }
-                        ul { class: "perf-peers__list", role: "list",
-                            for p in peers.iter() {
-                                PeerRow {
-                                    key: "{p.session_id}",
-                                    id_prefix,
-                                    kind,
-                                    stream_noun,
-                                    full_ladder_len,
-                                    peer: p.clone(),
+                        if peers_open() {
+                            ul { class: "perf-peers__list", role: "list",
+                                for p in peers.iter() {
+                                    PeerRow {
+                                        key: "{p.session_id}",
+                                        id_prefix,
+                                        kind,
+                                        stream_noun,
+                                        full_ladder_len,
+                                        peer: p.clone(),
+                                    }
                                 }
                             }
                         }

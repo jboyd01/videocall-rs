@@ -1533,7 +1533,7 @@ impl Peer {
                 ),
                 metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
                 metric!("audio_level", self.audio_level as f64),
-                metric!("peer_transport", transport_str.to_string()),
+                metric!("peer_transport", transport_str),
             ],
         };
         let _ = global_sender().try_broadcast(evt);

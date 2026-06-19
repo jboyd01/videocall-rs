@@ -184,6 +184,8 @@ pub fn forget_room_metrics(room: &str) {
     let _ = RELAY_LAYER_FORWARDED_TOTAL.remove_label_values(&[room]);
     // relay_congestion_filtered_total{room} (#1220).
     let _ = RELAY_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
+    // relay_inner_session_self_filtered_total{room} (#618, #629).
+    let _ = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL.remove_label_values(&[room]);
     // relay_downlink_congestion_filtered_total{room} (#1219 Half 2) — same
     // room-keyed unicast-filter sibling; swept alongside its CONGESTION cousin.
     let _ = RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
@@ -1219,6 +1221,47 @@ lazy_static! {
     )
     .expect("Failed to create relay_congestion_filtered_total metric");
 
+    /// Packets dropped at the relay because the embedded inner `session_id`
+    /// matched the receiver's OWN current session even though the NATS subject
+    /// pointed at a STALE (post-reconnect) session — the #618 leak (#629 — this
+    /// metric).
+    ///
+    /// On 2026-05-08 a production meeting leaked self-DIAGNOSTICS: a stale
+    /// subscription survived a reconnect and delivered a packet whose subject
+    /// differed from the receiver's CURRENT session but whose embedded
+    /// `session_id` (stamped by `Handler<ClientMessage>`) still belonged to this
+    /// connection. The subject-only self-skip missed it; #618 added the
+    /// inner-`session_id` self-skip (`inner_session_self` in
+    /// `chat_server.rs::handle_msg`) to close the leak. This counter records each
+    /// packet dropped where the inner `session_id` matched our own session BUT
+    /// the subject did NOT (`inner_session_self && !subject_self`) — i.e. the
+    /// subject pointed at a stale/different session: the post-reconnect leak
+    /// shape and nothing else.
+    ///
+    /// It does NOT count ordinary `subject_self` self-echoes. Those are normal
+    /// and uninteresting, and — critically — they ALSO have `inner_session_self`
+    /// true: the relay stamps `session_id = session` on publish (the publish
+    /// path in `chat_server.rs`), so a routine echo arrives with BOTH
+    /// `subject_self` AND `inner_session_self` true. The `!subject_self` arm in
+    /// the increment guard is what excludes them, so the leak signal is not
+    /// drowned by routine self-echo volume. It is an EXPECTED,
+    /// fan-out-/reconnect-correctness drop — like
+    /// [`RELAY_CONGESTION_FILTERED_TOTAL`] / [`RELAY_VIEWPORT_FILTERED_TOTAL`] /
+    /// [`RELAY_LAYER_FILTERED_TOTAL`] it is deliberately kept OFF
+    /// `relay_packet_drops_total` (which is backpressure loss). #629 wants
+    /// operators to see the rate of THIS specific filter so a recurrence of the
+    /// stale-subscription leak is observable.
+    ///
+    /// CARDINALITY: `room` only (user-provided, unbounded over time; bounded to
+    /// live rooms by the room-drain GC `forget_room_metrics`), same caveats as
+    /// the other room-labeled counters above.
+    pub static ref RELAY_INNER_SESSION_SELF_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_inner_session_self_filtered_total",
+        "Total packets dropped at the relay where the inner session_id matched the receiver's own session but the subject did NOT (stale post-reconnect subject); excludes routine subject-matched self-echoes (#618 leak; #629 metric)",
+        &["room"]
+    )
+    .expect("Failed to create relay_inner_session_self_filtered_total metric");
+
     /// Simulcast media packets that ENTERED the per-receiver layer filter and
     /// were forwarded — the denominator complement of `relay_layer_filtered_total`
     /// (#989), measured over EXACTLY the same population as the filtered counter.
@@ -2140,6 +2183,9 @@ mod tests {
         RELAY_CONGESTION_FILTERED_TOTAL
             .with_label_values(&[room])
             .inc();
+        RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .inc();
         RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
             .with_label_values(&[room])
             .inc();
@@ -2234,6 +2280,12 @@ mod tests {
         );
         assert_eq!(
             RELAY_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
                 .with_label_values(&[room])
                 .get(),
             0.0

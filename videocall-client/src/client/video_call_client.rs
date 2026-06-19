@@ -1126,17 +1126,13 @@ impl VideoCallClient {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
 
         let diagnostics = if options.enable_diagnostics {
-            let diagnostics = Rc::new(DiagnosticManager::new(options.user_id.clone()));
+            let mut diagnostics = DiagnosticManager::new(options.user_id.clone());
 
             if let Some(interval) = options.diagnostics_update_interval_ms {
-                let mut diag = DiagnosticManager::new(options.user_id.clone());
-                diag.set_reporting_interval(interval);
-                let diagnostics = Rc::new(diag);
-
-                Some(diagnostics)
-            } else {
-                Some(diagnostics)
+                diagnostics.set_reporting_interval(interval);
             }
+
+            Some(Rc::new(diagnostics))
         } else {
             None
         };
