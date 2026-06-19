@@ -729,7 +729,15 @@ pub async fn logout(
             );
             Redirect::to(&redirect_url).into_response()
         } else {
-            StatusCode::OK.into_response()
+            // No end_session_endpoint configured — redirect back to the app so
+            // the user doesn't land on a blank page after the top-level navigation.
+            let fallback = state
+                .oauth
+                .as_ref()
+                .and_then(|o| o.after_logout_url.as_deref())
+                .or_else(|| state.oauth.as_ref().map(|o| o.after_login_url.as_str()))
+                .unwrap_or("/");
+            Redirect::to(fallback).into_response()
         }
     } else {
         StatusCode::OK.into_response()
@@ -1315,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_returns_200_when_no_end_session_endpoint() {
+    async fn logout_redirects_to_app_root_when_no_end_session_endpoint() {
         use tower::ServiceExt;
         let state = make_handler_state(None);
         let app = axum::Router::new()
@@ -1329,7 +1337,18 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "should redirect to app when no end_session_endpoint"
+        );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("Location header must be present")
+            .to_str()
+            .unwrap();
+        assert_eq!(location, "/", "should redirect to app root as fallback");
         let set_cookie = resp
             .headers()
             .get(header::SET_COOKIE)
