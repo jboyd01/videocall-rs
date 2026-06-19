@@ -15366,7 +15366,14 @@ mod tests {
         join_member(&chat, publisher, "i1118n1-pub", &room).await;
         join_member(&chat, receiver, "i1118n1-rcv", &room).await;
 
-        // Drain the JoinRoom-restore recomputes (fail-open, no timers armed).
+        // Wait out the join-driven coalesce window (#1288) so the join recomputes
+        // fire before the churn phase begins. Without this, the coalesced join flush
+        // fires mid-churn and increments RECOMPUTE_LAYER_HINTS_INVOCATIONS, causing
+        // the "no orphan" assertion at the end to see a non-zero count.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 50,
+        ))
+        .await;
         let _ = chat
             .send(TestCoalesceState)
             .await
