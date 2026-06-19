@@ -20,10 +20,19 @@ permissions:
   pull-requests: write
   issues: write
 
-# workflow_dispatch deliberately groups by github.ref_name (not inputs.branch) so a
-# manual rerun can cancel-in-progress an automated push run on the same branch.
+# Concurrency grouping:
+# - issue_comment (/run-e2e on a PR): groups by PR number so same-PR dispatches cancel.
+# - workflow_dispatch: groups by source ref + inputs.branch so scoped dispatches
+#   targeting different branches don't collide, but re-dispatches from the same
+#   source ref to the same target branch cancel-in-progress.
+# - push: groups by the pushed branch (github.ref_name).
 concurrency:
-  group: e2e-hcl-${{ github.event_name == 'issue_comment' && github.event.issue.number || github.ref_name }}
+  group: >-
+    e2e-hcl-${{
+      github.event_name == 'issue_comment' && github.event.issue.number ||
+      github.event_name == 'workflow_dispatch' && format('{0}-{1}', github.ref_name, inputs.branch) ||
+      github.ref_name
+    }}
   cancel-in-progress: true
 
 defaults:
@@ -105,7 +114,9 @@ jobs:
   e2e:
     name: Playwright E2E
     runs-on: [self-hosted, linux, x64, hcl-ci]
-    timeout-minutes: 60
+    timeout-minutes: 90
+    # Serialize the full E2E stack on the shared runner. With cancel-in-progress
+    # false, a wedged run can hold this gate until the 90-minute job timeout.
     concurrency:
       group: hcl-ci-e2e
       cancel-in-progress: false
