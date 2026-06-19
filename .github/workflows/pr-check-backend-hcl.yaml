@@ -240,7 +240,7 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           if [ -n "${DOCKERHUB_TOKEN:-}" ] && [ -n "${DOCKERHUB_USERNAME:-}" ]; then
-            echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
+            echo "${DOCKERHUB_TOKEN}" | docker login docker.io -u "${DOCKERHUB_USERNAME}" --password-stdin
             echo "✅ Docker Hub login successful (${DOCKERHUB_USERNAME})"
           else
             echo "::warning::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN not set — pulling anonymously (rate-limit risk)"
