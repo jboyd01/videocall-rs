@@ -47,6 +47,8 @@ Always delegate work to the specialized roster agents instead of making changes 
 
 Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes. Always run `e2e-test-sync` after any change that affects user-facing behavior — E2E tests must be updated to cover the change and must pass before the work is considered complete.
 
+**Do not defer an E2E test by assumption.** Before claiming a user-facing change can't be tested ("needs a harness that doesn't exist"), grep `e2e/tests/` for an existing spec that already stands up the needed harness (a 2-peer call, the diagnostics drawer, a camera-on canvas, the screen-share panel, etc.) — a deferral must cite that search, never an assumption. If the harness exists, the test is writable: extend that spec. And "covered" means the spec has actually **run green** (local docker e2e stack or a scoped CI dispatch), not merely written — note that an untagged spec (no `@bvt0`/`@bvt1`) does **not** run in per-PR CI, so it must be validated another way before the work is considered complete.
+
 **Never generate your own general-purpose agents.** Only use the agents listed on this roster. If no roster agent fits the task, stop everything and ask the user for direction.
 
 ## Change Impact Policy
