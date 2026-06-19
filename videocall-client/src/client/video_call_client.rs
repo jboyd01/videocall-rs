@@ -33,6 +33,8 @@ use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::future::LocalBoxFuture;
 use gloo_timers::callback::{Interval, Timeout};
+#[cfg(target_arch = "wasm32")]
+use videocall_diagnostics::MetricValue;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, trace, warn};
@@ -734,6 +736,167 @@ fn arm_camera_keyframe_cooldown_reset(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>
     let _ = arm_keyframe_cooldown_reset_slot(slot);
 }
 
+// === Issue #1460: layer-switch ↔ freshness_skip correlation observability ===
+
+/// Window after an in-place simulcast layer switch within which a
+/// `freshness_skip` is considered correlated with the switch (issue #1460).
+/// A switch collides two disjoint per-layer sequence spaces in one
+/// layer-agnostic jitter buffer; the resulting freshness_skip freezes surface
+/// within a few seconds of the transition, so a 3s window captures them without
+/// spuriously attributing unrelated skips.
+#[cfg(any(target_arch = "wasm32", test))]
+const POST_SWITCH_WINDOW_MS: u64 = 3000;
+
+/// True iff a freshness_skip at `now_ms` falls within [`POST_SWITCH_WINDOW_MS`]
+/// of the peer's last layer switch at `last_switch_ms`. `last_switch_ms == 0` is
+/// the never-switched sentinel and always returns false. `saturating_sub`
+/// tolerates clock skew (`now_ms < last_switch_ms`) by treating the delta as 0
+/// (still within the window).
+///
+/// Pure (no I/O, no global state) so it is directly unit-testable on the host
+/// target and mutation-sensitive at the `<` boundary (issue #1460).
+#[cfg(any(target_arch = "wasm32", test))]
+fn freshness_skip_within_switch_window(now_ms: u64, last_switch_ms: u64) -> bool {
+    if last_switch_ms == 0 {
+        return false;
+    }
+    now_ms.saturating_sub(last_switch_ms) < POST_SWITCH_WINDOW_MS
+}
+
+/// Spawn the issue #1460 observability subscriber on the diagnostics bus.
+///
+/// Mirrors `HealthReporter::start_diagnostics_subscription`: a `spawn_local`
+/// loop over `subscribe().recv()` holding a `Weak<RefCell<Inner>>` (NOT a strong
+/// `Rc`, to avoid a reference cycle keeping `Inner` alive forever). On each
+/// `subsystem == "video"` `freshness_skip` event it parses the receiving session
+/// id (`to_peer`, the `connected_peers` key — see below) and `head_age_ms`,
+/// looks up the peer, and if the skip lands within [`POST_SWITCH_WINDOW_MS`] of
+/// that peer's last VIDEO layer switch (Marker 1 stamp), emits a single WARN.
+///
+/// Identity note (load-bearing): the worker's freshness_skip carries
+/// `from_peer` = the LOCAL reporting user id (passed as `userid` into
+/// `PeerDecodeManager::decode`) and `to_peer` = the REMOTE source peer's
+/// `session_id` string (`Peer::sid_str`, set via `set_stream_context`).
+/// `connected_peers` is keyed by that remote source `session_id`, so `to_peer`
+/// is the correct lookup key — NOT `from_peer`.
+///
+/// Clock note: the delta uses the event's own `ts_ms` (the skip's timestamp,
+/// stamped by the worker via `videocall_diagnostics::now_ms()`), which on wasm
+/// is `js_sys::Date::now()` — the SAME wall clock the Marker 1 stamps use (the
+/// manager tick / seed paths thread in `js_sys::Date::now()` as `now_ms`). Using
+/// the skip's own timestamp is the cleanest correlation point.
+#[cfg(target_arch = "wasm32")]
+fn spawn_layer_switch_freshness_observer(inner: &Rc<RefCell<Inner>>) {
+    let inner_weak = Rc::downgrade(inner);
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut receiver = subscribe_global_diagnostics();
+        while let Ok(event) = receiver.recv().await {
+            if event.subsystem != "video" {
+                continue;
+            }
+            // Mirror freshness_inject.rs: confirm this is a freshness_skip event
+            // (the "video" subsystem also carries decoder stats / worker logs).
+            let is_skip = event.metrics.iter().any(|m| {
+                m.name == "event"
+                    && matches!(&m.value, MetricValue::Text(v) if v == "freshness_skip")
+            });
+            if !is_skip {
+                continue;
+            }
+
+            let mut to_peer: Option<String> = None;
+            let mut head_age_ms: Option<f64> = None;
+            for m in &event.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(v)) => to_peer = Some(v.clone()),
+                    ("head_age_ms", MetricValue::F64(v)) => head_age_ms = Some(*v),
+                    _ => {}
+                }
+            }
+
+            // `to_peer` is the remote source peer's session_id string = the
+            // `connected_peers` key.
+            let Some(sid) = to_peer.as_deref().and_then(|s| s.parse::<u64>().ok()) else {
+                continue;
+            };
+            let age = head_age_ms.unwrap_or_default();
+
+            let Some(inner_rc) = Weak::upgrade(&inner_weak) else {
+                // Client torn down — stop the loop so it doesn't spin forever.
+                break;
+            };
+            // try_borrow (not borrow_mut) so we never panic if another path
+            // holds Inner; this is a read-only correlation.
+            let Ok(inner) = inner_rc.try_borrow() else {
+                continue;
+            };
+            let Some(peer) = inner.peer_decode_manager.get(&sid) else {
+                continue;
+            };
+            let last = peer.last_video_switch();
+            // Sentinel guard: skip peers that have never switched.
+            if !freshness_skip_within_switch_window(event.ts_ms, last.ms) {
+                continue;
+            }
+            let d = event.ts_ms.saturating_sub(last.ms);
+            warn!(
+                "LAYER_SWITCH_FRESHNESS_SKIP session_id={} kind=video ms_since_switch={} head_age_ms={:.0} from_layer={} to_layer={}",
+                sid, d, age, last.from, last.to
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod layer_switch_freshness_window_tests {
+    use super::{freshness_skip_within_switch_window, POST_SWITCH_WINDOW_MS};
+
+    // Guard: the cases below are derived assuming a 3000ms window. If the const
+    // changes, the just_inside/just_outside boundary cases must be revisited.
+    #[test]
+    fn window_const_is_three_seconds() {
+        assert_eq!(POST_SWITCH_WINDOW_MS, 3000);
+    }
+
+    #[test]
+    fn just_inside_window_is_correlated() {
+        // d = 2999 < 3000 → true. Fails if the window shrinks below 3000.
+        let last = 1000;
+        let now = last + 2999;
+        assert!(freshness_skip_within_switch_window(now, last));
+    }
+
+    #[test]
+    fn just_outside_window_is_not_correlated() {
+        // d = 3000, which is NOT < 3000 → false. This case is the mutation
+        // sentinel: flipping `<` to `<=` would make this return true.
+        let last = 1000;
+        let now = last + POST_SWITCH_WINDOW_MS; // d == 3000
+        assert!(!freshness_skip_within_switch_window(now, last));
+    }
+
+    #[test]
+    fn never_switched_sentinel_is_not_correlated() {
+        // last == 0 → always false, regardless of `now`. Fails if the sentinel
+        // guard is removed (0 + huge `now` would otherwise be far outside the
+        // window → false anyway, so use a `now` that WOULD be inside if the
+        // guard treated 0 as a real timestamp).
+        assert!(!freshness_skip_within_switch_window(2999, 0));
+        assert!(!freshness_skip_within_switch_window(u64::MAX, 0));
+    }
+
+    #[test]
+    fn clock_skew_now_before_last_saturates_to_zero() {
+        // now < last (clock skew): saturating_sub → 0, 0 < 3000 → true.
+        // Documents the skew-tolerance: a skip stamped slightly before the
+        // switch is still attributed to it. last != 0 so the sentinel does not
+        // short-circuit.
+        let last = 1000;
+        let now = 500;
+        assert!(freshness_skip_within_switch_window(now, last));
+    }
+}
+
 fn handle_connected_reconnect_resets(
     inner: &Weak<RefCell<Inner>>,
     early_seed_timer: &Rc<RefCell<Option<Interval>>>,
@@ -1157,6 +1320,12 @@ impl VideoCallClient {
                 debug!("Health reporting started with real diagnostics subscription");
             }
         }
+
+        // Issue #1460 observability: subscribe to the diagnostics bus to correlate
+        // worker freshness_skip events with this peer's recent layer switches.
+        // Pure telemetry; holds only a Weak handle to `Inner` (no cycle).
+        #[cfg(target_arch = "wasm32")]
+        spawn_layer_switch_freshness_observer(&client.inner);
 
         client
     }
@@ -2738,16 +2907,35 @@ impl Inner {
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0).
         // Also skip creating peers when media decoding is disabled (observer mode): there
         // is no point spinning up decoder workers for packets that will be dropped anyway.
-        let peer_status = if response.user_id == SYSTEM_USER_ID.as_bytes()
-            || response.session_id == 0
-            || !self.options.decode_media
-        {
-            PeerStatus::NoChange
-        } else {
-            let peer_user_id = String::from_utf8_lossy(&response.user_id);
-            self.peer_decode_manager
-                .ensure_peer(response.session_id, &peer_user_id)
-        };
+        // Never spin up a peer for our OWN session. SESSION_ASSIGNED is a control
+        // packet carrying our own session_id (and the synthetic one emitted at
+        // election completion bypasses the connection-layer self-filter), so it
+        // must not create a peer. This is suppressed purely on packet type — we
+        // do NOT compare session_id against our own id here, because at election
+        // completion the SESSION_ASSIGNED packet is precisely what tells us our
+        // id, so a comparison would race with learning it.
+        // Without this the client renders ITSELF as a ghost peer tile (the
+        // losing election candidate shows the user_id/email fallback because it
+        // never gets a PARTICIPANT_JOINED). See connection_manager's
+        // `own_session_ids` self-filter for the transport-layer half.
+        // CONGESTION and LAYER_HINT are relay-authored control packets stamped
+        // with the RECIPIENT's own session_id (the throttled / layer-capped
+        // publisher). The connection-layer self-filter deliberately whitelists
+        // them so AQ can act on them, so they reach here even though they are
+        // "self" — but they must NEVER spawn a peer tile. During an election the
+        // relay can emit a LAYER_HINT addressed to the LOSING candidate's
+        // session_id, which the local client does not yet recognise as its own,
+        // so without this guard the client renders that losing session as a
+        // ghost peer (shown with the user_id/email fallback because that session
+        // never gets a PARTICIPANT_JOINED).
+        let peer_status =
+            if suppresses_peer_creation_for_packet(&response, self.options.decode_media) {
+                PeerStatus::NoChange
+            } else {
+                let peer_user_id = String::from_utf8_lossy(&response.user_id);
+                self.peer_decode_manager
+                    .ensure_peer(response.session_id, &peer_user_id)
+            };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 // Observer/lobby clients must not receive encryption keys (defense-in-depth).
@@ -3535,6 +3723,79 @@ impl Inner {
                 // simulcast layers and never forwards it to peers. Like
                 // VIEWPORT, a client should never receive one; ignore it
                 // defensively if it ever appears.
+            }
+            Ok(PacketType::DOWNLINK_CONGESTION) => {
+                // DOWNLINK_CONGESTION is a relay -> receiver ONLY control packet
+                // (#1219 Half 2): the relay emits it when THIS receiver's downlink
+                // is congested (its bounded outbound channel overflowed, as
+                // observed by the relay's windowed CongestionTracker).
+                // The relay's emergency frame-shedding is transient; to make it
+                // DURABLE we step every connected peer's RECEIVER-side LayerChooser
+                // down one rung and publish a LAYER_PREFERENCE asking the relay for
+                // lower layers — so it forwards less to us until we recover.
+                //
+                // RECEIVER-ONLY SCOPE: this touches ONLY `peer_decode_manager`
+                // (the layers WE request from the relay for the streams we receive)
+                // plus the layer-preference publish path. It deliberately does NOT
+                // touch the LOCAL publisher's encoder (no congestion_step_down_flag,
+                // CameraEncoder, EncoderBitrateController, audio ceiling, etc.).
+                // Cutting our own encoder here would re-collapse our OUTBOUND stream
+                // for the WHOLE ROOM — the exact bug #1219 Half 1 fixed. This is
+                // about what I REQUEST for myself, never what I SEND to others.
+                //
+                // We are already inside `&mut self` (Inner) here, so we use direct
+                // field access — NOT the Weak<Inner> + try_borrow_mut dance the
+                // standalone early-seed timer uses (that would double-borrow panic).
+                // This mirrors the in-Inner publish in `set_receive_layer_bounds`.
+                //
+                // Field observability: the relay logs the EMIT; the client logs
+                // RECEIPT. Not WT-gated — the relay already decided, on whichever
+                // transport this client elected (WS or WT alike).
+                //
+                // Self-target check (defense-in-depth, mirroring CONGESTION and
+                // LAYER_HINT): the relay stamps THIS receiver's session_id and
+                // publishes to our own NATS subject, but the wildcard `room.{room}.*`
+                // fan-out means every session sees every packet, so we must confirm
+                // the embedded session_id is OURS before acting. A cross-session
+                // DOWNLINK_CONGESTION is noise — acting on it would step down our
+                // receive preferences in response to a PEER's congestion.
+                let is_self_targeted = self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id);
+
+                if !is_self_targeted {
+                    debug!(
+                        "Ignoring cross-session DOWNLINK_CONGESTION signal for session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
+                    );
+                } else {
+                    warn!(
+                        "Received DOWNLINK_CONGESTION signal from relay — downlink saturated; \
+                         stepping down receive layer preferences (#1219 Half 2)"
+                    );
+                    let now_ms = js_sys::Date::now() as u64;
+                    // Copy snapshot of the user's receive bounds to avoid aliasing the
+                    // `&mut peer_decode_manager` borrow below.
+                    let bounds = self.receive_layer_bounds;
+                    // Synthetic forced-congestion step-down: feeds a synthetic congested
+                    // sample into each peer's chooser, independent of the real (zero on
+                    // lossless transports) `last_video_downlink`. The early-seed primitive
+                    // would no-op here because the real sample is not congested.
+                    self.peer_decode_manager
+                        .seed_downlink_congestion_for_connected_peers(now_ms, &bounds);
+                    // Publish the resulting (possibly held) preference via the existing
+                    // change-detected sender, exactly as `set_receive_layer_bounds` does.
+                    let desired = self
+                        .peer_decode_manager
+                        .current_desired_preferences(now_ms, &bounds);
+                    if let Some(entries) = self
+                        .layer_preference_sender
+                        .take_if_changed(&desired, now_ms)
+                    {
+                        let user_id = self.options.user_id.clone();
+                        let cc = self.connection_controller.clone();
+                        send_layer_preference_via(&cc, &user_id, entries);
+                    }
+                }
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
@@ -4441,6 +4702,204 @@ mod cooldown_reset_hardening_tests {
                 .load(Ordering::Relaxed),
             u32::MAX,
             "reconnect must reset the audio congestion ceiling to fail-open"
+        );
+    }
+}
+
+/// A peer must NOT be created for: system messages, the unstamped `session_id
+/// == 0` sentinel, observer/no-decode mode, `SESSION_ASSIGNED` control packets
+/// (these carry OUR OWN session_id; the synthetic one emitted at election
+/// completion bypasses the connection-layer self-filter and would otherwise
+/// render us as our own peer), or relay-authored self-addressed control packets
+/// (`CONGESTION` / `LAYER_HINT`). The last group is whitelisted by the
+/// connection-layer self-filter so AQ can act on it, so it reaches the decode
+/// path even though it is "self" — and the relay can stamp a `LAYER_HINT` with a
+/// LOSING election candidate's session_id (not yet recognised as ours), which
+/// without this guard the client renders as a ghost peer tile (shown with the
+/// user_id/email fallback because that session never gets a PARTICIPANT_JOINED).
+fn suppresses_peer_creation(
+    is_system_user: bool,
+    session_id: u64,
+    decode_media: bool,
+    is_session_assigned: bool,
+    is_self_addressed_control: bool,
+) -> bool {
+    is_system_user
+        || session_id == 0
+        || !decode_media
+        || is_session_assigned
+        || is_self_addressed_control
+}
+
+/// Call-site wiring for [`suppresses_peer_creation`]: derive its five boolean
+/// inputs from a real inbound [`PacketWrapper`] + the receiver's `decode_media`
+/// mode. This is the thin seam the `on_inbound_media` hot path goes through, so a
+/// test driving a real `PacketWrapper` through here pins the `packet_type → bool`
+/// derivation (issue #1496) — a wrong `PacketType` constant or a swapped/omitted
+/// flag would compile and pass the pure-predicate tests but break HERE.
+///
+/// `CONGESTION` and `LAYER_HINT` are relay-authored control packets stamped with
+/// the RECIPIENT's own session_id; the connection-layer self-filter
+/// (`connection_manager.rs::should_filter_self_packet`) whitelists exactly these
+/// two so AQ can act on them, so they reach this path even though they are
+/// "self" — but they must never spawn a peer tile. `SESSION_ASSIGNED` carries our
+/// own session_id and is likewise suppressed purely on packet type (see the
+/// detailed rationale on [`suppresses_peer_creation`] and at the call site).
+///
+/// `DOWNLINK_CONGESTION` is intentionally NOT in this set even though the relay
+/// classifies it as a self-addressed control packet too: the transport self-filter
+/// does NOT whitelist it, so a self-addressed `DOWNLINK_CONGESTION` is dropped one
+/// layer up (in `should_filter_self_packet`) and never reaches here once our own
+/// session_id is known. The pre-`SESSION_ASSIGNED` window where it could slip
+/// through unfiltered is the subject of the open #1481 investigation; do not add it
+/// to this set without first reconciling it with the transport-filter whitelist
+/// (the two gates must agree), which is exactly what #1481 tracks.
+fn suppresses_peer_creation_for_packet(response: &PacketWrapper, decode_media: bool) -> bool {
+    let is_self_addressed_control = response.packet_type == PacketType::CONGESTION.into()
+        || response.packet_type == PacketType::LAYER_HINT.into();
+    suppresses_peer_creation(
+        response.user_id == SYSTEM_USER_ID.as_bytes(),
+        response.session_id,
+        decode_media,
+        response.packet_type == PacketType::SESSION_ASSIGNED.into(),
+        is_self_addressed_control,
+    )
+}
+
+#[cfg(test)]
+mod self_peer_suppression_tests {
+    use super::{suppresses_peer_creation, suppresses_peer_creation_for_packet};
+    use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+    use videocall_types::SYSTEM_USER_ID;
+
+    /// Build a minimal inbound `PacketWrapper` with the given type/session/user.
+    fn packet(packet_type: PacketType, session_id: u64, user_id: &[u8]) -> PacketWrapper {
+        PacketWrapper {
+            packet_type: packet_type.into(),
+            session_id,
+            user_id: user_id.to_vec(),
+            data: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn foreign_media_creates_a_peer() {
+        // A normal media packet from another participant: none of the suppress
+        // conditions hold, so a peer IS created.
+        assert!(!suppresses_peer_creation(false, 42, true, false, false));
+    }
+
+    #[test]
+    fn session_assigned_never_creates_a_peer() {
+        // Regression guard: the synthetic SESSION_ASSIGNED emitted at election
+        // completion carries our own elected session_id and previously spawned a
+        // self peer tile (logged as "New user joined: <own session>"). It must
+        // be suppressed purely on packet type.
+        assert!(suppresses_peer_creation(false, 42, true, true, false));
+    }
+
+    #[test]
+    fn self_addressed_control_never_creates_a_peer() {
+        // Regression guard for the losing-candidate ghost: the relay emits
+        // CONGESTION / LAYER_HINT stamped with a session_id (e.g. a LOSING
+        // election candidate the client does not recognise as its own). The
+        // connection-layer self-filter whitelists these so AQ can act on them —
+        // so they reach the decode path — but they must NOT spawn a peer tile.
+        // If this guard is removed, the relay's LAYER_HINT to the loser session
+        // renders a ghost peer.
+        assert!(suppresses_peer_creation(false, 42, true, false, true));
+    }
+
+    #[test]
+    fn observer_and_zero_session_are_suppressed() {
+        assert!(suppresses_peer_creation(false, 0, true, false, false));
+        assert!(suppresses_peer_creation(false, 42, false, false, false));
+        assert!(suppresses_peer_creation(true, 42, true, false, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1496: call-site WIRING tests. These drive a real `PacketWrapper`
+    // through `suppresses_peer_creation_for_packet` (the seam `on_inbound_media`
+    // uses) to pin the `packet_type -> bool` derivation. The pure-predicate tests
+    // above cannot see this wiring: a wrong `PacketType` constant, a swapped bool
+    // argument, or an omitted flag would compile and keep them green while
+    // silently reintroducing the ghost tile (or suppressing a real peer).
+    // -----------------------------------------------------------------------
+
+    /// A normal MEDIA packet from a foreign nonzero session MUST create a peer
+    /// (none of the suppress conditions hold). If the call site mis-wired
+    /// `decode_media` or compared MEDIA against a suppress constant, this flips.
+    #[test]
+    fn wiring_foreign_media_packet_is_not_suppressed() {
+        let p = packet(PacketType::MEDIA, 42, b"alice@example.com");
+        assert!(
+            !suppresses_peer_creation_for_packet(&p, true),
+            "a foreign nonzero-session MEDIA packet must create a peer"
+        );
+    }
+
+    /// CONGESTION is a relay-authored self-addressed control packet — it reaches
+    /// the decode path (self-filter whitelists it for AQ) but must NOT spawn a
+    /// peer. Mutating the call site's `CONGESTION` constant makes this fail.
+    #[test]
+    fn wiring_congestion_packet_is_suppressed() {
+        // Nonzero session, foreign-looking user_id, decode on: ONLY the
+        // packet_type derivation can suppress this — so it pins that wiring.
+        let p = packet(PacketType::CONGESTION, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "CONGESTION must be suppressed purely on packet type (self-addressed control)"
+        );
+    }
+
+    /// LAYER_HINT is the other relay-authored self-addressed control packet
+    /// (the losing-election-candidate ghost vector). Same wiring lock.
+    #[test]
+    fn wiring_layer_hint_packet_is_suppressed() {
+        let p = packet(PacketType::LAYER_HINT, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "LAYER_HINT must be suppressed purely on packet type (self-addressed control)"
+        );
+    }
+
+    /// SESSION_ASSIGNED carries OUR OWN session_id; dropping the
+    /// `is_session_assigned` argument at the call site would render us as our
+    /// own ghost peer at election completion.
+    #[test]
+    fn wiring_session_assigned_packet_is_suppressed() {
+        let p = packet(PacketType::SESSION_ASSIGNED, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "SESSION_ASSIGNED must be suppressed purely on packet type (our own session)"
+        );
+    }
+
+    /// Observer mode (`decode_media == false`) suppresses even a normal MEDIA
+    /// packet — pins that the call site threads `decode_media` through.
+    #[test]
+    fn wiring_observer_mode_suppresses_media() {
+        let p = packet(PacketType::MEDIA, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, false),
+            "observer/no-decode mode must suppress peer creation for any packet"
+        );
+    }
+
+    /// The `session_id == 0` sentinel and the system user_id are derived from the
+    /// packet fields (not the type) — pin both so a refactor can't drop them.
+    #[test]
+    fn wiring_zero_session_and_system_user_are_suppressed() {
+        let zero_session = packet(PacketType::MEDIA, 0, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&zero_session, true),
+            "session_id == 0 sentinel must be suppressed"
+        );
+        let system = packet(PacketType::MEDIA, 42, SYSTEM_USER_ID.as_bytes());
+        assert!(
+            suppresses_peer_creation_for_packet(&system, true),
+            "system-user packets must be suppressed"
         );
     }
 }

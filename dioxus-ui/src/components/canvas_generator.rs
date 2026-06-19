@@ -226,6 +226,69 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
     )
 }
 
+/// Issue #1483: which transport a peer's media is flowing over, for the
+/// per-tile "WT"/"WS" badge. `Unknown` covers the raw `"unknown"` string, an
+/// empty string, `None`, and any unrecognised value — the badge is NEVER
+/// rendered for `Unknown` (see `transport_badge` below), so an unclassified
+/// transport produces no badge rather than a misleading one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportBadge {
+    /// WebTransport (the primary production transport).
+    Wt,
+    /// WebSocket (fallback transport).
+    Ws,
+    /// Unknown / unreported — no badge rendered.
+    Unknown,
+}
+
+/// Pure map from the raw per-peer transport string (as carried on the
+/// `peer_status` diagnostics `peer_transport` metric) to a [`TransportBadge`].
+///
+/// `"webtransport"` → `Wt`, `"websocket"` → `Ws`; everything else — including
+/// `"unknown"`, the empty string, and any junk value — maps to `Unknown`. Kept
+/// pure (no `app_config()` / DOM / signal access) so it is host-unit-testable.
+pub fn transport_badge_from_str(raw: &str) -> TransportBadge {
+    match raw {
+        "webtransport" => TransportBadge::Wt,
+        "websocket" => TransportBadge::Ws,
+        _ => TransportBadge::Unknown,
+    }
+}
+
+/// Render the per-tile transport badge (issue #1483) next to the
+/// `.signal-indicator` button. Factored out so the markup is shared by all
+/// three `.tile-top-icons` arms (split screen-share, split peer-video, and the
+/// normal grid tile) instead of being triplicated.
+///
+/// The caller passes `Some(TransportBadge::Wt | Ws)` ONLY when BOTH the
+/// server-side `transportBadgeEnabled` flag is on AND the transport is known —
+/// that gating happens once per tile render in `peer_tile.rs` (so the JSON
+/// re-parse in `transport_badge_enabled()` is paid once, not per render arm).
+/// This helper therefore renders nothing for `None` or `Some(Unknown)`, which
+/// keeps the "flag OFF → nothing" and "Unknown → nothing" contract in one place.
+fn transport_badge(badge: Option<TransportBadge>) -> Element {
+    match badge {
+        Some(TransportBadge::Wt) => rsx! {
+            span {
+                class: "transport-badge transport-badge--wt",
+                "aria-label": "Transport reported by peer: WebTransport",
+                title: "Transport reported by peer: WebTransport",
+                "WT"
+            }
+        },
+        Some(TransportBadge::Ws) => rsx! {
+            span {
+                class: "transport-badge transport-badge--ws",
+                "aria-label": "Transport reported by peer: WebSocket",
+                title: "Transport reported by peer: WebSocket",
+                "WS"
+            }
+        },
+        // `None` (flag off / no transport yet) or `Some(Unknown)`: render nothing.
+        _ => rsx! {},
+    }
+}
+
 /// Controls what a `PeerTile` renders in the split screen-share layout.
 #[derive(Debug, PartialEq, Clone, Default)]
 pub enum TileMode {
@@ -482,6 +545,13 @@ pub fn generate_for_peer(
     pinned_peer_id: Option<&str>,
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
+    // Issue #1466: fired when the user clicks the per-tile PLAY button on a
+    // decode-budget-PAUSED tile (only rendered when `paused_by_device`). It
+    // carries the tile's `session_id` (`key`) up to `attendants.rs`, which
+    // toggles it into `UserRequestedDecodeCtx` so the peer is force-decoded.
+    // `PeerTile` supplies a no-op default for call sites that never reach the
+    // paused arm, so threading it everywhere is unnecessary.
+    on_request_decode: EventHandler<String>,
     // Issue #987, task 1a.4: when `true`, this tile is "off-budget" — the
     // adaptive decode-budget controller has excluded the peer from video decode
     // to save CPU. The tile renders the avatar/initials placeholder instead of a
@@ -508,6 +578,12 @@ pub fn generate_for_peer(
     // `peer_tile` by `session_id == peer_id`). Cloned per popup call site
     // below so the popup's Layers section matches the perf dialog.
     let signal_receive_diag = signal_info.receive_diag;
+    // Issue #1483: per-tile "WT"/"WS" transport badge. `Copy`, so it can be
+    // passed to `transport_badge(...)` in each `.tile-top-icons` arm without
+    // cloning. Already gated upstream: `Some(Wt | Ws)` only when the
+    // `transportBadgeEnabled` flag is on AND the transport is known; `None`
+    // otherwise. `transport_badge` renders nothing for `None`/`Unknown`.
+    let badge_transport = signal_info.badge_transport;
     // Bundled popup handlers (lifted out of per-tile state for bugs #8 + #9).
     let SignalPopupHandlers {
         show: show_signal_popup,
@@ -650,6 +726,10 @@ pub fn generate_for_peer(
                             onclick: move |_| on_toggle_signal_popup.call(()),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
+                        // Issue #1483: transport badge adjacent to the signal
+                        // meter. Renders nothing unless the flag is on AND the
+                        // transport is known (gated upstream → `badge_transport`).
+                        {transport_badge(badge_transport)}
                         button {
                             onclick: move |_| {
                                 toggle_pinned_div(&ss_div_pin);
@@ -757,21 +837,70 @@ pub fn generate_for_peer(
                     } else if force_avatar && is_video_enabled_for_peer {
                         // Device-paused avatar: peer's camera is on but our
                         // decode budget excluded this tile. Mirror the grid
-                        // path's paused placeholder (pause badge + tooltip).
+                        // path's paused placeholder, with a real PLAY button
+                        // (issue #1466) so the user can opt this one peer back
+                        // into decode. Camera-OFF tiles never reach this arm
+                        // (`is_video_enabled_for_peer` is false for them) — they
+                        // fall into the plain `else` below — so the PLAY button
+                        // only ever appears on a recoverable "paused" tile.
                         div {
+                            // Issue #1466 (B1/B2): the paused placeholder no longer
+                            // carries `role="img"` + `aria-label`. A `role="img"`
+                            // wrapper collapses its whole subtree into one graphic and
+                            // can drop the descendant PLAY <button> from the
+                            // accessibility tree. The "paused by your device" reason
+                            // now lives on the BUTTON itself (`title` + per-button
+                            // `aria-label`), keeping the interactive control fully
+                            // exposed to AT while still explaining WHY the tile paused.
                             class: "placeholder-content placeholder-content--paused",
-                            title: "Paused by your device to keep the call smooth. Audio is still on.",
-                            "aria-label": "Paused by your device to keep the call smooth. Audio is still on.",
-                            role: "img",
-                            span { class: "decode-paused-badge", aria_hidden: "true",
-                                svg {
-                                    width: "14",
-                                    height: "14",
-                                    view_box: "0 0 24 24",
-                                    fill: "currentColor",
-                                    stroke: "none",
-                                    rect { x: "6", y: "5", width: "4", height: "14", rx: "1" }
-                                    rect { x: "14", y: "5", width: "4", height: "14", rx: "1" }
+                            // Issue #1466 (B1): PLAY control is now a CENTERED overlay
+                            // over the PeerIcon, not a corner badge. The old corner
+                            // badge (top/right -6px, 44px via negative margin) grew UP
+                            // and RIGHT into the tile corner where
+                            // `.canvas-container { overflow: hidden }` CLIPPED it, and
+                            // its right edge ran under `.tile-top-icons` (z-index:3,
+                            // holds the interactive signal button) — so the real tap
+                            // area was well under 44px and ambiguous taps hit the
+                            // signal button. A button centered on the placeholder
+                            // (which is itself centered in the tile via the flex
+                            // `.canvas-container`) gives a full, unclipped ≥44px target
+                            // that is far from the corner-pinned `.tile-top-icons`.
+                            // `stop_propagation()` runs FIRST so a tap does NOT also
+                            // hit the parent `.canvas-container` mobile-pin handler
+                            // (mirrors the host-menu button pattern), then request
+                            // force-decode for THIS peer's session_id (`key`).
+                            {
+                                // Owned session_id clone for the `move` onclick:
+                                // event handlers must be `'static`, so we cannot
+                                // capture the borrowed `key: &String` directly.
+                                let request_decode_key = key.clone();
+                                rsx! {
+                                    button {
+                                        r#type: "button",
+                                        class: "decode-play-overlay",
+                                        // #1466: stable E2E hook for the per-tile
+                                        // un-pause (PLAY) control on a
+                                        // decode-budget-paused tile.
+                                        "data-testid": "decode-play-btn",
+                                        "aria-label": format!("Play {peer_display_name}'s video"),
+                                        // #1466 (B2): explanatory reason moved off the
+                                        // role=img wrapper onto the interactive control
+                                        // so it stays accessible without hiding the
+                                        // button from AT.
+                                        title: "Paused by your device to keep the call smooth. Audio is still on.",
+                                        onclick: move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            on_request_decode.call(request_decode_key.clone());
+                                        },
+                                        svg {
+                                            width: "20",
+                                            height: "20",
+                                            view_box: "0 0 24 24",
+                                            fill: "currentColor",
+                                            stroke: "none",
+                                            polygon { points: "8 5 19 12 8 19 8 5" }
+                                        }
+                                    }
                                 }
                             }
                             PeerIcon {}
@@ -813,6 +942,9 @@ pub fn generate_for_peer(
                             onclick: move |_| on_toggle_signal_popup.call(()),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
+                        // Issue #1483: transport badge adjacent to the signal
+                        // meter (renders nothing unless flag on + transport known).
+                        {transport_badge(badge_transport)}
                         // Crop (visible on hover only, hidden when video disabled)
                         if is_video_enabled_for_peer {
                             {
@@ -921,196 +1053,6 @@ pub fn generate_for_peer(
         };
     }
 
-    // Full-bleed single peer (no screen share)
-    if full_bleed && !is_screen_share_enabled_for_peer {
-        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
-        let div_id_mobile = (*peer_video_div_id).clone();
-        let div_id_pin = (*peer_video_div_id).clone();
-        let canvas_id_crop = key.clone();
-        let key_clone = key.clone();
-        let peer_display_name_fb = peer_display_name.clone();
-        let peer_user_id_for_pin = peer_user_id.clone();
-        let title = if is_host {
-            format!("Host: {peer_user_id}")
-        } else {
-            peer_user_id.clone()
-        };
-        let full_bleed_class = if is_video_enabled_for_peer {
-            "canvas-container video-on"
-        } else {
-            "canvas-container"
-        };
-        let full_bleed_grid_class = if show_signal_popup {
-            "grid-item full-bleed signal-popup-open"
-        } else {
-            "grid-item full-bleed"
-        };
-        // HCL follow-up 957 (@token-exempt): anchor the popup on the
-        // tile's signal-quality button (id below) so the popup overlays
-        // the button's top-left corner on first open. `fb_name_id` is
-        // kept so the fallback walker still has a tile-relative
-        // `.floating-name` to land on if the button lookup misses.
-        let fb_name_id = format!("{}-name", &*peer_video_div_id);
-        let fb_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
-        let fb_anchor_id = fb_signal_btn_id.clone();
-        return rsx! {
-            div {
-                class: "{full_bleed_grid_class}{speaking_class}",
-                id: "{peer_video_div_id}",
-                "data-tile-root": "true",
-                style: "{tile_style}",
-                div {
-                    class: "{full_bleed_class}",
-                    onclick: move |_| {
-                        if is_mobile_viewport() {
-                            toggle_pinned_div(&div_id_mobile);
-                        }
-                    },
-                    if is_video_enabled_for_peer {
-                        UserVideo { id: key_clone.clone(), hidden: false }
-                    } else {
-                        div {
-                            class: "",
-                            div {
-                                class: "placeholder-content",
-                                PeerIcon {}
-                                span { class: "placeholder-text", "Camera Off" }
-                            }
-                        }
-                    }
-                    h4 {
-                        id: "{fb_name_id}",
-                        class: "floating-name",
-                        title: "{title}",
-                        dir: "auto",
-                        "{peer_display_name_fb}"
-                        if is_host {
-                            CrownIcon {}
-                        }
-                        if is_guest {
-                            span { class: "guest-badge", "Guest" }
-                        }
-                    }
-                    div {
-                        class: "tile-top-icons",
-                        // Mic icon (rightmost via row-reverse, always visible)
-                        div {
-                            class: "{audio_speaking_class}",
-                            style: "{mic_inline_style}",
-                            MicIcon { muted: !is_audio_enabled_for_peer }
-                        }
-                        // Signal icon (always visible, clickable)
-                        button {
-                            id: "{fb_signal_btn_id}",
-                            class: "signal-indicator",
-                            "aria-label": "Show signal quality",
-                            onclick: move |_| on_toggle_signal_popup.call(()),
-                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
-                        }
-                        // Crop (visible on hover only)
-                        if is_video_enabled_for_peer {
-                            {
-                                let crop_class = canvas_id_crop.clone();
-                                rsx! {
-                                    button {
-                                        onclick: move |_| toggle_canvas_crop(&canvas_id_crop, cropped_tiles),
-                                        class: if is_canvas_letterboxed(&crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
-                                        CropIcon {}
-                                    }
-                                }
-                            }
-                        }
-                        // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some()
-                            || on_disable_video.is_some()
-                            || on_kick.is_some()
-                            || on_transfer_host.is_some()
-                        {
-                            {
-                                rsx! {
-                                    div { class: "tile-mute-menu-wrapper",
-                                        button {
-                                            class: "tile-mute-btn",
-                                            title: "Host actions",
-                                            "aria-label": "Host actions",
-                                            onclick: move |e: MouseEvent| {
-                                                e.stop_propagation();
-                                                show_tile_menu.set(!show_tile_menu());
-                                            },
-                                            svg {
-                                                xmlns: "http://www.w3.org/2000/svg",
-                                                width: "16",
-                                                height: "16",
-                                                view_box: "0 0 24 24",
-                                                fill: "none",
-                                                stroke: "currentColor",
-                                                stroke_width: "2",
-                                                stroke_linecap: "round",
-                                                stroke_linejoin: "round",
-                                                circle { cx: "12", cy: "12", r: "1" }
-                                                circle { cx: "12", cy: "5", r: "1" }
-                                                circle { cx: "12", cy: "19", r: "1" }
-                                            }
-                                        }
-                                        if show_tile_menu() {
-                                            div {
-                                                style: "position: fixed; inset: 0; z-index: 99;",
-                                                onclick: move |_| show_tile_menu.set(false),
-                                            }
-                                            div { class: "tile-context-menu",
-                                                {mute_menu_item(on_mute, show_tile_menu)}
-                                                {disable_video_menu_item(on_disable_video, show_tile_menu)}
-                                                {kick_menu_item(on_kick, show_tile_menu)}
-                                                {host_promotion_menu_items(on_transfer_host, show_tile_menu)}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Pin (leftmost via row-reverse, visible on hover / when speaking)
-                        button {
-                            onclick: move |_| {
-                                toggle_pinned_div(&div_id_pin);
-                                on_toggle_pin.call(peer_user_id_for_pin.clone());
-                            },
-                            class: "pin-icon",
-                            PushPinIcon {}
-                        }
-                    }
-                }
-                // Popup hoisted out of `.canvas-container` so PR #923's // @token-exempt: PR ref, not a color
-                // border-radius `overflow: hidden` clip cannot crop it.
-                if show_signal_popup {
-                    {
-                        let h = signal_history.clone();
-                        let popup_peer_id = key.clone();
-                        let popup_peer_name = peer_display_name.clone();
-                        let popup_transport = signal_transport.clone();
-                        let popup_receive_diag = signal_receive_diag.clone();
-                        let popup_anchor = fb_anchor_id.clone();
-                        rsx! {
-                            SignalQualityPopup {
-                                peer_id: popup_peer_id,
-                                peer_name: popup_peer_name,
-                                history: h,
-                                meeting_start_ms,
-                                transport: popup_transport,
-                                anchor_id: popup_anchor,
-                                meter_mode: signal_meter_mode,
-                                receive_diag: popup_receive_diag,
-                                free_position: signal_free_position,
-                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
-                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
-                                on_close: move |_| on_close_signal_popup.call(()),
-                            }
-                        }
-                    }
-                }
-            }
-        };
-    }
-
     // Regular grid tile, optionally with screen share tile
     let screen_share_css = if client.is_awaiting_peer_screen_frame(key) {
         "grid-item hidden"
@@ -1197,16 +1139,24 @@ pub fn generate_for_peer(
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
             let grid_speaking = speaking_class;
-            // Issue #987, task 1a.4: tag off-budget tiles with `off-budget-tile`
-            // so CSS can style them and E2E can query them
-            // (`.grid-item.off-budget-tile`). Empty string in the no-cap path,
-            // so the rendered class list is unchanged when no budget is active.
-            let off_budget_class = if force_avatar { " off-budget-tile" } else { "" };
-            let grid_item_class = if show_signal_popup {
-                "grid-item signal-popup-open"
-            } else {
-                "grid-item"
-            };
+            // issue 508: the surviving single peer (full_bleed) is now rendered
+            // from THIS one grid template with `full-bleed` as a plain CLASS
+            // toggle, instead of a separate full-bleed rsx! branch. Dioxus 0.7
+            // diffs by template-pointer identity, so the old branch swap tore
+            // down the `<canvas>` and rebuilt the renderer (last_width:0 → resize
+            // → FPS collapse) on every 2<->1 transition. Keeping one template
+            // lets Dioxus diff the tile in place and REUSE the same `<canvas>`
+            // node. The className is built to be byte-identical to the previous
+            // behaviour: "grid-item" in the normal grid, "grid-item full-bleed"
+            // for the single surviving peer, each gaining " signal-popup-open"
+            // when the signal popup is open.
+            let mut grid_item_class = String::from("grid-item");
+            if full_bleed {
+                grid_item_class.push_str(" full-bleed");
+            }
+            if show_signal_popup {
+                grid_item_class.push_str(" signal-popup-open");
+            }
             // HCL follow-up 957 (@token-exempt): anchor the popup on
             // the tile's signal-quality button (id below) so the popup
             // overlays the button's top-left corner on first open.
@@ -1227,10 +1177,43 @@ pub fn generate_for_peer(
             // not to decode their live video. That case gets a distinct pause
             // glyph + tooltip; a genuine camera-off tile keeps the plain wording.
             let paused_by_device = force_avatar && is_video_enabled_for_peer;
+            // Issue #1465: only DASH a tile (`.off-budget-tile`) when it is a
+            // budget-SHED tile that actually has video to decode — i.e. the
+            // local decode budget chose not to decode a live stream. A genuine
+            // camera-off real peer (force_avatar but camera off) must render a
+            // PLAIN avatar with no dash: there is nothing being shed, so the
+            // "paused/sheddable" outline is misleading (the field complaint).
+            //   real camera-OFF  → is_video_enabled_for_peer false, is_mock false
+            //                      → no dash (the #1465 fix)
+            //   real camera-ON, budget-shed → is_video_enabled_for_peer true → dash
+            //   mock, budget-shed → is_video_enabled_for_peer is FALSE for mocks
+            //                      (non-numeric key), so the `is_mock` OR is what
+            //                      keeps the mock's dash for local layout testing.
+            // Tag with `off-budget-tile` so CSS can style it and E2E can query
+            // `.grid-item.off-budget-tile`. Empty string in the no-cap path
+            // (force_avatar false), so the class list is unchanged with no budget.
+            let is_mock = key.starts_with("mock-");
+            let off_budget_class = if force_avatar && (is_mock || is_video_enabled_for_peer) {
+                " off-budget-tile"
+            } else {
+                ""
+            };
             let placeholder_label = if paused_by_device {
                 "Video paused"
             } else {
                 "Video Disabled"
+            };
+            // issue 508: the full-bleed single peer used to read "Camera Off"
+            // in its now-deleted separate template. Preserve that exact visible
+            // text here, WITHIN this one template, for the plain camera-off arm
+            // only. A full-bleed tile has force_avatar == false, so
+            // paused_by_device is always false for it and it always lands in the
+            // plain `else` arm below — the paused arm keeps using
+            // `placeholder_label` and is unreachable for full-bleed tiles.
+            let camera_off_label = if full_bleed {
+                "Camera Off"
+            } else {
+                placeholder_label
             };
             // Tooltip / screen-reader text for the device-paused case. Empty for a
             // normal camera-off tile so nothing extra is announced there.
@@ -1257,25 +1240,67 @@ pub fn generate_for_peer(
                         if show_canvas {
                             UserVideo { id: key_clone.clone(), hidden: false }
                         } else if paused_by_device {
-                            // Device-paused avatar: PeerIcon + a small pause-glyph
-                            // badge so it reads as "paused by us", not "camera off".
-                            // `title` + `aria-label` explain WHY and reassure that
-                            // audio is unaffected (the mic indicator below stays
-                            // live regardless).
+                            // Device-paused avatar: PeerIcon + a PLAY button so it
+                            // reads as "paused by us, click to resume", not "camera
+                            // off". `title` + `aria-label` on the placeholder
+                            // explain WHY and reassure that audio is unaffected (the
+                            // mic indicator below stays live regardless).
+                            // `paused_by_device` is ONLY true when the peer's camera
+                            // is on but our budget excluded the tile — a genuine
+                            // camera-off tile lands in the plain `else` arm below and
+                            // never gets this PLAY affordance (issue #1466).
                             div {
+                                // Issue #1466 (B2): dropped `role="img"` +
+                                // `aria-label` from this paused placeholder. The
+                                // role=img wrapper collapses the subtree into a single
+                                // graphic and can hide the descendant PLAY <button>
+                                // from AT. The `{paused_help}` reason now rides on the
+                                // BUTTON (`title` + per-button `aria-label`), so it
+                                // stays accessible without masking the control.
                                 class: "placeholder-content placeholder-content--paused",
-                                title: "{paused_help}",
-                                "aria-label": "{paused_help}",
-                                role: "img",
-                                span { class: "decode-paused-badge", aria_hidden: "true",
-                                    svg {
-                                        width: "14",
-                                        height: "14",
-                                        view_box: "0 0 24 24",
-                                        fill: "currentColor",
-                                        stroke: "none",
-                                        rect { x: "6", y: "5", width: "4", height: "14", rx: "1" }
-                                        rect { x: "14", y: "5", width: "4", height: "14", rx: "1" }
+                                // Issue #1466 (B1): PLAY control is a CENTERED overlay
+                                // over the PeerIcon, not a corner badge. The old corner
+                                // badge was clipped by `.canvas-container { overflow:
+                                // hidden }` and overlapped the corner-pinned
+                                // `.tile-top-icons` (interactive signal button), so its
+                                // real tap area was sub-44px and ambiguous. Centering
+                                // over the placeholder (itself centered in the tile)
+                                // yields a full, unclipped ≥44px target clear of the
+                                // corner icons. `stop_propagation` runs FIRST so a
+                                // mobile tap does not also fire the parent
+                                // `.canvas-container` pin handler, then force-decode
+                                // THIS peer via its session_id (`key`).
+                                {
+                                    // Owned session_id clone for the `move`
+                                    // onclick (handlers must be `'static`; the
+                                    // borrowed `key: &String` cannot be captured).
+                                    let request_decode_key = key.clone();
+                                    rsx! {
+                                        button {
+                                            r#type: "button",
+                                            class: "decode-play-overlay",
+                                            // #1466: stable E2E hook for the
+                                            // per-tile un-pause (PLAY) control on a
+                                            // decode-budget-paused tile.
+                                            "data-testid": "decode-play-btn",
+                                            "aria-label": format!("Play {peer_display_name}'s video"),
+                                            // #1466 (B2): explanatory reason moved off
+                                            // the role=img wrapper onto the interactive
+                                            // control so it stays accessible.
+                                            title: "{paused_help}",
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                on_request_decode.call(request_decode_key.clone());
+                                            },
+                                            svg {
+                                                width: "20",
+                                                height: "20",
+                                                view_box: "0 0 24 24",
+                                                fill: "currentColor",
+                                                stroke: "none",
+                                                polygon { points: "8 5 19 12 8 19 8 5" }
+                                            }
+                                        }
                                     }
                                 }
                                 PeerIcon {}
@@ -1284,7 +1309,7 @@ pub fn generate_for_peer(
                         } else {
                             div { class: "placeholder-content",
                                 PeerIcon {}
-                                span { class: "placeholder-text", "{placeholder_label}" }
+                                span { class: "placeholder-text", "{camera_off_label}" }
                             }
                         }
                         h4 {
@@ -1316,6 +1341,9 @@ pub fn generate_for_peer(
                                 onclick: move |_| on_toggle_signal_popup.call(()),
                                 SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                             }
+                            // Issue #1483: transport badge adjacent to the signal
+                            // meter (renders nothing unless flag on + transport known).
+                            {transport_badge(badge_transport)}
                             // Crop (visible on hover only). Gated on `show_canvas`
                             // so off-budget avatar tiles — which have no canvas —
                             // don't show a no-op crop button (task 1a.4).
@@ -1722,5 +1750,58 @@ mod tests {
         let ct: Option<&HashMap<String, bool>> = None;
         let result = ct.and_then(|m| m.get("any-id").copied()).unwrap_or(false);
         assert!(!result);
+    }
+
+    // -- Issue #1483: transport badge string → enum mapping -------------------
+    //
+    // `transport_badge_from_str` is a pure host-testable map (no app_config /
+    // DOM / signals), so these run on the host like the split-layout tests
+    // above. The assertions are mutation-sensitive: each known input is pinned
+    // to its enum AND asserted NOT to equal the other transport, so swapping
+    // the `"webtransport" => Wt` / `"websocket" => Ws` arms would fail here.
+
+    #[test]
+    fn transport_badge_webtransport_maps_to_wt() {
+        assert_eq!(transport_badge_from_str("webtransport"), TransportBadge::Wt);
+        // Mutation guard: if the WT arm were swapped to Ws this fails.
+        assert_ne!(transport_badge_from_str("webtransport"), TransportBadge::Ws);
+    }
+
+    #[test]
+    fn transport_badge_websocket_maps_to_ws() {
+        assert_eq!(transport_badge_from_str("websocket"), TransportBadge::Ws);
+        // Mutation guard: if the WS arm were swapped to Wt this fails.
+        assert_ne!(transport_badge_from_str("websocket"), TransportBadge::Wt);
+    }
+
+    #[test]
+    fn transport_badge_unknown_literal_maps_to_unknown() {
+        assert_eq!(transport_badge_from_str("unknown"), TransportBadge::Unknown);
+    }
+
+    #[test]
+    fn transport_badge_empty_maps_to_unknown() {
+        assert_eq!(transport_badge_from_str(""), TransportBadge::Unknown);
+    }
+
+    #[test]
+    fn transport_badge_junk_maps_to_unknown() {
+        assert_eq!(
+            transport_badge_from_str("quic-but-not-really"),
+            TransportBadge::Unknown
+        );
+        // Case sensitivity: the diagnostics metric emits lowercase, so a
+        // mixed-case value is NOT a known transport.
+        assert_eq!(
+            transport_badge_from_str("WebTransport"),
+            TransportBadge::Unknown
+        );
+    }
+
+    #[test]
+    fn transport_badge_wt_and_ws_are_distinct() {
+        // The two transports must render distinctly; a single-variant collapse
+        // (both → same) would defeat the whole feature.
+        assert_ne!(TransportBadge::Wt, TransportBadge::Ws);
     }
 }
