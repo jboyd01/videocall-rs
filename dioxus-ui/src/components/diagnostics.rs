@@ -1744,23 +1744,24 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
     let send_screen_snap = (reader.send_screen)();
     let per_peer_receive = (reader.per_peer_receive)();
 
-    // #1482: resolve the per-peer device blocks here (live, each tick) while the
-    // reader is in scope. ONE entry per unique session_id (a peer can appear in
-    // several kind blocks), preserving first-seen order; a peer whose info is
-    // `None` (nothing reported / unknown) or whose formatted lines are empty
-    // contributes no block — never an empty-labeled row.
+    // issue 1482: resolve the per-peer device blocks here (live, each tick)
+    // while the reader is in scope. Iterate the ALL-PEERS device reader (NOT the
+    // media-receive list) so a peer that reports device metrics via HEALTH but
+    // whose media isn't currently flowing (e.g. camera off) still renders. The
+    // label comes from the reader tuple, which mirrors the receive-list label
+    // (display name → user id → session id), so a receiving peer's label is
+    // unchanged. A peer whose formatted lines are empty contributes no block —
+    // never an empty-labeled row; an empty list → no `.diag-device` container.
     let device_blocks: Vec<DeviceBlock> = {
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut blocks: Vec<DeviceBlock> = Vec::new();
-        for p in per_peer_receive.iter() {
-            if !seen.insert(p.session_id) {
+        for (session_id, label, info) in (reader.per_peer_device_all)().into_iter() {
+            if !seen.insert(session_id) {
                 continue;
             }
-            if let Some(info) = (reader.per_peer_device_info)(p.session_id) {
-                let lines = format_peer_device_lines(&info);
-                if !lines.is_empty() {
-                    blocks.push((p.session_id, p.label.clone(), lines));
-                }
+            let lines = format_peer_device_lines(&info);
+            if !lines.is_empty() {
+                blocks.push((session_id, label, lines));
             }
         }
         blocks

@@ -3781,6 +3781,67 @@ impl PeerDecodeManager {
         self.device_info_cache.get(&session_id).cloned()
     }
 
+    /// issue 1482: every known peer's self-reported device info, for the
+    /// diagnostics "Device (per peer)" section which must render independent of
+    /// whether media is currently flowing (a camera-off peer still reports device
+    /// metrics via HEALTH). Returns `(session_id, label, info)` for each peer that
+    /// has at least one populated device field. The label mirrors
+    /// `per_peer_received_snapshots` (display name → user id → session id) so a
+    /// receiving peer's label does not regress; a cache-only peer (info arrived
+    /// before its `Peer` entry) falls back to the display-name cache then the sid
+    /// string. The peer set is the UNION of live peers and the device-info cache,
+    /// each resolved through the same live-then-cache rule as `peer_device_info`,
+    /// deduplicated by session_id. Read-only; does not mutate or trigger a render.
+    pub fn all_peer_device_info(&self) -> Vec<(u64, String, PeerDeviceInfo)> {
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut out: Vec<(u64, String, PeerDeviceInfo)> = Vec::new();
+        // Live peers first, in their stable ordered-key order, so a receiving
+        // peer keeps the same label/order it had under the old receive-list path.
+        for &sid in self.connected_peers.ordered_keys() {
+            if !seen.insert(sid) {
+                continue;
+            }
+            if let Some(info) = self.peer_device_info(sid) {
+                if info == PeerDeviceInfo::default() {
+                    continue;
+                }
+                let label = self
+                    .connected_peers
+                    .get(&sid)
+                    .map(|peer| {
+                        peer.display_name.clone().unwrap_or_else(|| {
+                            if peer.user_id.is_empty() {
+                                sid.to_string()
+                            } else {
+                                peer.user_id.clone()
+                            }
+                        })
+                    })
+                    .or_else(|| self.display_name_cache.get(&sid).cloned())
+                    .unwrap_or_else(|| sid.to_string());
+                out.push((sid, label, info));
+            }
+        }
+        // Cache-only peers (device info arrived before the `Peer` entry exists).
+        for sid in self.device_info_cache.keys().copied() {
+            if !seen.insert(sid) {
+                continue;
+            }
+            if let Some(info) = self.peer_device_info(sid) {
+                if info == PeerDeviceInfo::default() {
+                    continue;
+                }
+                let label = self
+                    .display_name_cache
+                    .get(&sid)
+                    .cloned()
+                    .unwrap_or_else(|| sid.to_string());
+                out.push((sid, label, info));
+            }
+        }
+        out
+    }
+
     /// Get the server-vouched guest status for a peer by session_id string.
     pub fn get_peer_is_guest(&self, session_id_str: &str) -> Option<bool> {
         let sid: u64 = session_id_str.parse().ok()?;

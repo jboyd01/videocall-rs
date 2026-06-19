@@ -46,11 +46,21 @@ import { waitForServices } from "../helpers/wait-for-services";
  *         span.diag-device-row-label   {label, e.g. "Cores"}
  *         span.diag-device-row-value   {value, e.g. "8"}
  *
- * This sub-block lives under "Simulcast layers" → "Receiving (per peer)" in the
- * right-side Diagnostics drawer (`#diagnostics-sidebar`). It iterates the
- * per-peer RECEIVE list, so the peer must have media FLOWING (camera on) to
- * appear — which the 2-peer camera-on harness satisfies.
- * (`diagnostics.rs::SimulcastLayersSection` / `SimulcastReceiveBreakdown`.)
+ * This sub-block lives under "Simulcast layers" in the right-side Diagnostics
+ * drawer (`#diagnostics-sidebar`), rendered alongside the per-peer RECEIVE list
+ * by `SimulcastReceiveBreakdown`. As of the #1482 follow-up it iterates the
+ * ALL-PEERS device reader (`reader.per_peer_device_all` → wired to
+ * `client.all_peer_device_info()` in `host.rs`) — NOT the receive list — so it
+ * renders one block for every known peer that has self-reported device info via
+ * its HealthPacket, INDEPENDENT of whether media is currently flowing. A peer
+ * that reports device metrics but has its camera OFF (no media on the receive
+ * list, no canvas tile) therefore STILL appears here, because
+ * `all_peer_device_info` walks the UNION of live peers and the device-info cache
+ * (`peer_decode_manager.rs::all_peer_device_info`, fed by `set_peer_device_info`
+ * on every HEALTH packet), skipping only peers whose device info is entirely
+ * default. The per-peer label still mirrors the receive-list label (display
+ * name → user id → session id), so a receiving peer's label is unchanged.
+ * (`diagnostics.rs` `device_blocks` / `SimulcastReceiveBreakdown`.)
  *
  * ## Harness lineage
  *
@@ -75,26 +85,34 @@ interface MeetingMember {
 }
 
 /**
- * Drive a context from the home form into the meeting URL, seeding the camera-ON
- * pre-join preference BEFORE navigation so the publisher actually emits video
- * (real browser peers default camera-OFF; without this seed no media flows and
- * the diagnostics receive list — hence its Device sub-block — stays empty). Does
- * NOT click Start/Join yet (that is handled by `clickJoinAndEnterGrid` so the
+ * Drive a context from the home form into the meeting URL, optionally seeding the
+ * camera-ON pre-join preference BEFORE navigation so the publisher actually emits
+ * video (real browser peers default camera-OFF; with the seed media flows and the
+ * publisher's tile decodes a canvas on the host). When `cameraOn` is false the
+ * seed is left at its default (camera OFF): no media flows, so the host renders no
+ * canvas tile for this peer and the diagnostics RECEIVE list stays empty for it —
+ * but its HealthPackets still carry device fields on the ~5 s timer, so the
+ * diagnostics "Device (per peer)" sub-block (which iterates ALL known peers via
+ * `all_peer_device_info`, not the receive list) STILL renders a block for it.
+ * Does NOT click Start/Join yet (that is handled by `clickJoinAndEnterGrid` so the
  * waiting-room admit flow can be interleaved).
  */
 async function joinMeetingAs(
   context: BrowserContext,
   meetingId: string,
   username: string,
+  cameraOn = true,
 ): Promise<Page> {
   const page = await context.newPage();
-  await page.addInitScript(() => {
-    try {
-      window.localStorage.setItem("vc_prejoin_camera_on", "true");
-    } catch {
-      /* storage may be unavailable before origin navigation */
-    }
-  });
+  if (cameraOn) {
+    await page.addInitScript(() => {
+      try {
+        window.localStorage.setItem("vc_prejoin_camera_on", "true");
+      } catch {
+        /* storage may be unavailable before origin navigation */
+      }
+    });
+  }
 
   await page.goto("/");
   await page.waitForTimeout(1500);
@@ -159,10 +177,12 @@ async function ensurePrejoinCameraOn(page: Page): Promise<void> {
 
 /**
  * Race the pre-join Start/Join button against the grid (some joins auto-advance);
- * when the button appears, turn the camera on and click it. Mirrors
- * `signal-quality-peer-transport.spec.ts::clickJoinAndEnterGrid`.
+ * when the button appears, optionally turn the camera on and click it. Mirrors
+ * `signal-quality-peer-transport.spec.ts::clickJoinAndEnterGrid`. When `cameraOn`
+ * is false the pre-join camera is left OFF (default), so this peer publishes no
+ * media — the camera-OFF case exercised by the third test.
  */
-async function clickJoinAndEnterGrid(page: Page): Promise<void> {
+async function clickJoinAndEnterGrid(page: Page, cameraOn = true): Promise<void> {
   const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const grid = page.locator("#grid-container");
 
@@ -172,7 +192,9 @@ async function clickJoinAndEnterGrid(page: Page): Promise<void> {
   ]);
 
   if (result === "join") {
-    await ensurePrejoinCameraOn(page);
+    if (cameraOn) {
+      await ensurePrejoinCameraOn(page);
+    }
     await page.waitForTimeout(1000);
     await joinButton.click();
     await page.waitForTimeout(3000);
@@ -252,6 +274,87 @@ async function standUpTwoPeerCall(
 }
 
 /**
+ * Bring a host (camera ON) + one CAMERA-OFF guest into the same meeting grid,
+ * handling the waiting-room admit flow. This is the #1482-follow-up case: the
+ * guest publishes NO media, so the host decodes NO `<canvas>` for it (its tile is
+ * an avatar — `.canvas-container` without `video-on`, no `<canvas>` child) and the
+ * diagnostics RECEIVE list never lists it — but the guest still emits HealthPackets
+ * with device fields on the ~5 s timer, so the host registers it via
+ * `set_peer_device_info` and `all_peer_device_info` returns it. Presence is gated
+ * on the guest's grid TILE (located by display name), which exists for a
+ * camera-off peer (an avatar tile, no `<canvas>`) — NOT on a canvas/decode count,
+ * which a camera-off peer would never satisfy.
+ */
+async function standUpHostAndCameraOffGuest(
+  browsers: Browser[],
+  uiURL: string,
+  meetingId: string,
+): Promise<MeetingMember[]> {
+  const profiles = [
+    { email: "host-dev@videocall.rs", name: "DevHost" },
+    { email: "guest-dev@videocall.rs", name: "DevGuestOff" },
+  ];
+
+  const members: MeetingMember[] = [];
+  for (let i = 0; i < 2; i++) {
+    const ctx = await createAuthenticatedContext(
+      browsers[i],
+      profiles[i].email,
+      profiles[i].name,
+      uiURL,
+    );
+    members.push({
+      page: null as unknown as Page,
+      context: ctx,
+      email: profiles[i].email,
+      name: profiles[i].name,
+    });
+  }
+
+  // Host joins first (camera ON) so the meeting is "active" before the guest.
+  members[0].page = await joinMeetingAs(members[0].context, meetingId, profiles[0].name, true);
+  await clickJoinAndEnterGrid(members[0].page, true);
+
+  // Guest joins CAMERA OFF (no vc_prejoin_camera_on seed → default OFF).
+  members[1].page = await joinMeetingAs(members[1].context, meetingId, profiles[1].name, false);
+
+  const joinButton = members[1].page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+  const waitingRoom = members[1].page.getByText("Waiting to be admitted");
+  const guestGrid = members[1].page.locator("#grid-container");
+
+  const result = await Promise.race([
+    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
+    waitingRoom.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
+    guestGrid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
+  ]);
+
+  if (result === "waiting") {
+    const admitButton = members[0].page.getByTitle("Admit").first();
+    await expect(admitButton).toBeVisible({ timeout: 20_000 });
+    await members[0].page.waitForTimeout(1000);
+    await admitButton.dispatchEvent("click");
+    await members[0].page.waitForTimeout(3000);
+  }
+
+  if (result !== "auto-joined") {
+    await clickJoinAndEnterGrid(members[1].page, false);
+  } else {
+    await expect(guestGrid).toBeVisible({ timeout: 15_000 });
+  }
+
+  // Presence gate that works for a camera-OFF peer: the host's grid tile for the
+  // guest (located by its display name in `h4.floating-name`). A camera-off peer
+  // renders this tile as an avatar with NO canvas, so a canvas-count gate cannot
+  // be used here.
+  const guestTileOnHost = members[0].page.locator("#grid-container .grid-item", {
+    has: members[0].page.locator(`h4.floating-name:has-text("${profiles[1].name}")`),
+  });
+  await expect(guestTileOnHost).toBeVisible({ timeout: 45_000 });
+
+  return members;
+}
+
+/**
  * Open the in-meeting Diagnostics drawer via the "Open Diagnostics" tooltip
  * button (it carries no data-testid). Mirrors
  * `simulcast-per-receiver.spec.ts::openPerformancePanel` /
@@ -277,9 +380,17 @@ const ALWAYS_AVAILABLE_DEVICE_LABELS = ["OS", "Device", "Cores", "Architecture",
 
 test.describe("Per-peer device / hardware metrics (#1482)", () => {
   // Heavy: two camera-on WebCodecs renderers + a full ~5 s health-interval wait
-  // before device fields populate. Serial caps the peak heavy-renderer count on
-  // the CI runner (mirrors simulcast-per-receiver.spec.ts).
-  test.describe.configure({ mode: "serial", timeout: 180_000 });
+  // before device fields populate. The three tests below are fully independent —
+  // each launches its own two browsers, stands up its own 2-peer call, and tears
+  // them down in its own `finally` (no shared state). The project config already
+  // sets `fullyParallel: false` + `workers: 2`, so the tests in THIS file run
+  // sequentially on a single worker regardless of mode — serial mode added no
+  // resource benefit here, and its skip-on-first-failure semantics risked silently
+  // skipping the device tests (2 & 3) whenever the unrelated popup test (1) flaked,
+  // turning a real validation gap into a false green. Default mode keeps the same
+  // within-file sequential execution but lets each test fail and retry independently
+  // (`retries: CI ? 2 : 0`). The extended timeout is retained for the heavy setup.
+  test.describe.configure({ timeout: 180_000 });
 
   test.beforeAll(async () => {
     await waitForServices();
@@ -356,16 +467,18 @@ test.describe("Per-peer device / hardware metrics (#1482)", () => {
 
       const drawer = await openDiagnosticsDrawer(hostPage);
 
-      // The "Simulcast layers" section must mount (its per-peer RECEIVE list is
-      // what the Device sub-block iterates).
+      // The "Simulcast layers" section must mount (the Device sub-block renders
+      // inside it, alongside the per-peer RECEIVE list).
       const simulcastSection = drawer.locator(".diagnostics-section", {
         has: hostPage.getByRole("heading", { name: "Simulcast layers" }),
       });
       await expect(simulcastSection).toBeVisible({ timeout: 30_000 });
 
       // The Device (per peer) block appears once the peer's HealthPacket device
-      // fields have been parsed AND the peer is in the receive list (media
-      // flowing). Poll through at least one ~5 s health interval.
+      // fields have been parsed. It iterates the ALL-PEERS device reader
+      // (`all_peer_device_info`), NOT the receive list, so it does not require
+      // media flowing — but a camera-on peer trivially satisfies it too. Poll
+      // through at least one ~5 s health interval.
       const deviceContainer = drawer.locator(".diag-device");
       await expect(deviceContainer).toBeVisible({ timeout: 45_000 });
       await expect(deviceContainer.locator(".diag-device-title")).toHaveText("Device (per peer)");
@@ -405,6 +518,127 @@ test.describe("Per-peer device / hardware metrics (#1482)", () => {
       // always-available labels (OS / Device / Architecture / Memory) are a
       // superset we don't gate on individually to avoid runner-specific flake,
       // but every rendered label must be one of the known device-row labels.
+      expect(labels).toContain("Cores");
+      const knownLabels = [...ALWAYS_AVAILABLE_DEVICE_LABELS, "Main-thread load"];
+      for (const label of labels) {
+        expect(knownLabels, `unexpected device-row label "${label}"`).toContain(label);
+      }
+    } finally {
+      for (const m of members) {
+        if (m.page) {
+          await m.page.close().catch(() => undefined);
+        }
+        await m.context.close().catch(() => undefined);
+      }
+      await Promise.all(browsers.map((b) => b.close().catch(() => undefined)));
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // #1482 FOLLOW-UP — the actual fix: a CAMERA-OFF peer's Device block.
+  //
+  // BEHAVIOR UNDER TEST: the "Device (per peer)" sub-block used to iterate the
+  // per-peer RECEIVE list, so a peer appeared there ONLY while media was flowing
+  // (camera on). The fix re-points it at `reader.per_peer_device_all` →
+  // `client.all_peer_device_info()` (peer_decode_manager.rs::all_peer_device_info),
+  // which walks the UNION of live peers + the device-info cache and returns every
+  // peer that self-reported non-default device fields via its HealthPacket —
+  // INDEPENDENT of media flow.
+  //
+  // WHY IT WAS BROKEN BEFORE / FIXED NOW: a camera-OFF guest publishes NO media,
+  // so on the OLD code it was absent from the receive list → no `.diag-device`
+  // block → this test would time out on `.diag-device`. The guest STILL emits
+  // HealthPackets with device fields on the ~5 s timer regardless of camera state
+  // (health_reporter.rs `start_health_reporting` is gated only on the shutdown
+  // flag; device fields come from `read_client_metadata()`, not the camera), so
+  // the host's HEALTH arm (video_call_client.rs) parses them and calls
+  // `set_peer_device_info`, which inserts into `device_info_cache` UNCONDITIONALLY.
+  // On the NEW code `all_peer_device_info` therefore returns the camera-off guest
+  // and its block renders — the assertion below passes.
+  //
+  // PRESENCE GATE: a camera-off peer decodes NO `<canvas>` on the host (its tile
+  // renders a `.canvas-container` WITHOUT the `video-on` modifier and with no
+  // `<canvas>` child), so `standUpHostAndCameraOffGuest` gates presence on the
+  // host's grid TILE for the guest (by display name), not a canvas/decode count.
+  // ──────────────────────────────────────────────────────────────────────────
+  test("diagnostics drawer shows the Device sub-block for a CAMERA-OFF peer", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_devmetrics_diag_camoff_${Date.now()}`;
+
+    const browsers = await Promise.all([
+      chromium.launch({ args: BROWSER_ARGS }),
+      chromium.launch({ args: BROWSER_ARGS }),
+    ]);
+    const members: MeetingMember[] = [];
+
+    try {
+      members.push(...(await standUpHostAndCameraOffGuest(browsers, uiURL, meetingId)));
+      const hostPage = members[0].page;
+
+      // Sanity: the camera-off guest decodes NO video on the host — nailing the
+      // precondition that makes this test prove the fix (the peer is NOT in the
+      // receive list, so under the OLD receive-list iteration there would be no
+      // Device block at all). A camera-OFF tile still renders a `.canvas-container`
+      // element, but WITHOUT the `video-on` modifier and with NO `<canvas>` child
+      // (canvas_generator.rs: `show_canvas = is_video_enabled_for_peer &&
+      // !force_avatar` gates both the `video-on` class and the `<canvas>`), so we
+      // assert on those two decoded-video signals, NOT a bare `.canvas-container`
+      // count (which a camera-off peer would still satisfy).
+      await expect(hostPage.locator("#grid-container .canvas-container.video-on")).toHaveCount(0, {
+        timeout: 15_000,
+      });
+      await expect(hostPage.locator("#grid-container canvas")).toHaveCount(0, {
+        timeout: 15_000,
+      });
+
+      const drawer = await openDiagnosticsDrawer(hostPage);
+
+      const simulcastSection = drawer.locator(".diagnostics-section", {
+        has: hostPage.getByRole("heading", { name: "Simulcast layers" }),
+      });
+      await expect(simulcastSection).toBeVisible({ timeout: 30_000 });
+
+      // The crux: even though the guest is camera-OFF (no media, no canvas, not in
+      // the receive list), its Device block STILL appears once its HealthPacket
+      // device fields have been parsed (~5 s health interval). On the OLD code this
+      // container never renders for a camera-off peer — this is the assertion that
+      // fails before the fix and passes after it.
+      const deviceContainer = drawer.locator(".diag-device");
+      await expect(deviceContainer).toBeVisible({ timeout: 45_000 });
+      await expect(deviceContainer.locator(".diag-device-title")).toHaveText("Device (per peer)");
+
+      // Exactly one remote peer (the camera-off guest) → exactly one per-peer
+      // block, keyed by session_id.
+      const peerBlock = deviceContainer.locator('[data-testid^="diag-device-peer-"]');
+      await expect(peerBlock).toHaveCount(1, { timeout: 30_000 });
+      await expect(peerBlock).toHaveClass(/\bdiag-device-peer\b/);
+
+      // The peer label sub-element is present and non-empty (the guest's name).
+      const peerLabel = peerBlock.locator(".diag-device-peer-label");
+      await expect(peerLabel).toBeVisible();
+      await expect(peerLabel).toHaveText(/\S/);
+
+      // At least one label:value row, each exposing both spans (the row contract).
+      const rows = peerBlock.locator(".diag-device-row");
+      await expect(rows.first()).toBeVisible({ timeout: 30_000 });
+      const rowCount = await rows.count();
+      expect(rowCount).toBeGreaterThan(0);
+
+      const labels: string[] = [];
+      for (let i = 0; i < rowCount; i++) {
+        const row = rows.nth(i);
+        const label = (await row.locator(".diag-device-row-label").textContent())?.trim() ?? "";
+        const value = (await row.locator(".diag-device-row-value").textContent())?.trim() ?? "";
+        expect(label.length, `row ${i} label non-empty`).toBeGreaterThan(0);
+        expect(value.length, `row ${i} value non-empty`).toBeGreaterThan(0);
+        labels.push(label);
+      }
+
+      // "Cores" comes from navigator.hardwareConcurrency — published in the
+      // HealthPacket independently of the camera — so it is present even for a
+      // camera-off peer. Assert it, and that every rendered label is a known one.
       expect(labels).toContain("Cores");
       const knownLabels = [...ALWAYS_AVAILABLE_DEVICE_LABELS, "Main-thread load"];
       for (const label of labels) {
