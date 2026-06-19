@@ -123,7 +123,8 @@ const _: () = assert!(
 /// interval elapsed), so the retry fires at the base cadence. If a future re-tune inverted
 /// this, the retry would fire with a stale high exponent (up to 8s delay on top of the 15s
 /// wait — 23s total freeze, far worse than the pre-fix storm).
-const _: () = assert!(PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS > PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS);
+const _: () =
+    assert!(PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS > PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS);
 /// A multiplier applied to the jitter estimate to provide a safety margin.
 /// A value of 3.0 means we buffer enough to handle jitter up to 3x the running average.
 const JITTER_MULTIPLIER: f64 = 3.0;
