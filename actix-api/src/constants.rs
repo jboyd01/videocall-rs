@@ -145,6 +145,77 @@ pub(crate) fn resolve_wt_outbound_channel_capacity(raw: Option<&str>) -> usize {
     }
 }
 
+/// Pure resolver for [`viewport_filter_enabled`]: maps the raw optional
+/// environment string to the concrete #1436 kill-switch boolean, applying
+/// the same recognised-boolean parsing and warn-on-unknown rules without
+/// touching any process-global state.
+///
+/// Default is `true`: the #988 per-subscriber viewport VIDEO filter is
+/// already LIVE in production, so the kill switch defaults to the status
+/// quo (filter ON). An empty string trims to `""`, matches no arm, and
+/// therefore takes the warn-and-default-`true` path — it is NOT special-cased.
+/// No input panics.
+///
+/// Extracted as a free function so unit tests can exercise the resolution
+/// logic without racing against the `OnceLock` cache or mutating the real
+/// process environment.
+pub(crate) fn resolve_viewport_filter_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "false" | "0" | "off" | "no" => false,
+            "true" | "1" | "on" | "yes" => true,
+            _ => {
+                tracing::warn!(
+                    "VIEWPORT_FILTER_ENABLED={:?} is not a recognised boolean; falling back to default true",
+                    value
+                );
+                true
+            }
+        },
+    }
+}
+
+/// Memoized accessor for the #1436 viewport-filter kill switch.
+///
+/// Reads `VIEWPORT_FILTER_ENABLED` exactly once on the first call and caches
+/// the resolved boolean in a process-global `OnceLock`. Consequently, flipping
+/// the environment variable requires a relay **process restart** to take
+/// effect — there is NO hot-reload. This is acceptable and intended for an ops
+/// kill switch: the #1436 requirement is to be able to revert the #988 filter
+/// WITHOUT a client redeploy, and a relay restart satisfies that requirement.
+///
+/// Cheap on the hot path after the first call (a single atomic load), which is
+/// why it can be invoked per VIDEO packet on the relay forward path.
+pub fn viewport_filter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        resolve_viewport_filter_enabled(std::env::var("VIEWPORT_FILTER_ENABLED").ok().as_deref())
+    })
+}
+
+/// Pure #988 viewport drop decision. Returns true iff the off-screen VIDEO
+/// packet must be dropped. `enabled` is the #1436 kill-switch state.
+///
+/// Fail-open semantics: `!enabled` -> `false` (the #1436 kill switch is OFF, so
+/// forward-all is restored); `None` source -> `false` (unparseable sender,
+/// fail open); empty viewport set -> `false` (no viewport signal yet, fail
+/// open); otherwise drop iff the source session is NOT present in the set.
+pub(crate) fn viewport_should_drop(
+    enabled: bool,
+    viewport_ids: &std::collections::HashSet<u64>,
+    source: Option<u64>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match source {
+        None => false,
+        Some(src) => !viewport_ids.is_empty() && !viewport_ids.contains(&src),
+    }
+}
+
 /// Bounded channel capacity for WebSocket outbound relay queue.
 ///
 /// Half the WebTransport capacity because WS frames are larger
@@ -839,5 +910,82 @@ mod tests {
             resolve_wt_outbound_channel_capacity(Some("")),
             WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
         );
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_unset_defaults_to_true() {
+        // #988 filter is already LIVE in prod; the #1436 kill switch must
+        // default to the status quo (filter ON) when unset.
+        assert!(resolve_viewport_filter_enabled(None));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_recognised_false_values_disable() {
+        assert!(!resolve_viewport_filter_enabled(Some("false")));
+        assert!(!resolve_viewport_filter_enabled(Some("0")));
+        assert!(!resolve_viewport_filter_enabled(Some("off")));
+        assert!(!resolve_viewport_filter_enabled(Some("no")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_recognised_true_values_enable() {
+        assert!(resolve_viewport_filter_enabled(Some("true")));
+        assert!(resolve_viewport_filter_enabled(Some("1")));
+        assert!(resolve_viewport_filter_enabled(Some("on")));
+        assert!(resolve_viewport_filter_enabled(Some("yes")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_is_case_insensitive() {
+        assert!(!resolve_viewport_filter_enabled(Some("FALSE")));
+        assert!(resolve_viewport_filter_enabled(Some("True")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_garbage_falls_back_to_default_true() {
+        // Unrecognised tokens warn and fall back to the default (ON).
+        assert!(resolve_viewport_filter_enabled(Some("GARBAGE")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_empty_falls_back_to_default_true() {
+        // "" trims to "", matches no arm, warns, and defaults to true.
+        // It is NOT special-cased.
+        assert!(resolve_viewport_filter_enabled(Some("")));
+    }
+
+    #[test]
+    fn viewport_should_drop_kill_switch_off_forwards_all() {
+        // enabled=false: forward-all restored regardless of set membership.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(!viewport_should_drop(false, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_drops_source_not_in_set() {
+        // enabled=true, non-empty set EXCLUDING the source -> drop.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_keeps_source_in_set() {
+        // enabled=true, source present in the set -> forward.
+        let ids: std::collections::HashSet<u64> = [1, 2, 99].into_iter().collect();
+        assert!(!viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_empty_set_fails_open() {
+        // enabled=true, empty set (no viewport signal yet) -> fail open.
+        let ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        assert!(!viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_none_source_fails_open() {
+        // enabled=true, unparseable source (None) -> fail open.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(!viewport_should_drop(true, &ids, None));
     }
 }
