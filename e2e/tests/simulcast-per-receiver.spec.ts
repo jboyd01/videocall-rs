@@ -864,6 +864,171 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
+  // 3b. Per-peer RECEIVE reason chip renders the "Your setting" DISPLAY text
+  //     (issue #1553 — `reason_chip_text` display path).
+  //
+  // #1553 fixed a receiver-side mis-attribution in the per-peer "reason" chip:
+  // the chip's DISPLAY text is produced by `reason_chip_text(DegradeReason)`
+  // (performance_settings.rs): Network → "Your network", Setting → "Your
+  // setting", Sender → "Sender". The pure attribution LOGIC
+  // (`layer_chooser.rs degrade_reason`) — including the #1553 regression case
+  // (a constrained receiver with a collapsed `avail_top` is "Network", not
+  // "Sender") — is locked by HOST unit tests in BOTH crates
+  // (`degrade_reason_*` in layer_chooser.rs and the `reason_chip_text(...)`
+  // string asserts in performance_settings.rs). This E2E covers the part those
+  // host tests CANNOT: that the DISPLAY string actually reaches the DOM through
+  // the per-peer disclosure render (`PeerRow` → `…-peer-{sid}-reason`).
+  //
+  // DRIVABILITY BOUNDARY (why "Your setting" and not "Your network"):
+  //   * "Your setting" (DegradeReason::Setting) is fully drivable from the DOM
+  //     with NO network impairment: this receiver drags its OWN video receive
+  //     max-layer thumb below the full-ladder top, so the snapshot producer
+  //     (`per_peer_received_snapshots`) feeds `user_max = bounds.video.max` and
+  //     `sel == user_max < full_ladder_top` → Setting. Deterministic.
+  //   * "Sender" needs a genuine single-layer/non-simulcast peer (`avail_top <
+  //     full_top && sel == avail_top && !constrained`) — state-dependent on the
+  //     runner's clamped ladder, not deterministically forced here.
+  //   * "Your network" (DegradeReason::Network — the literal #1553 bug state)
+  //     needs `constrained == true`, which only the per-receiver downlink
+  //     congestion infra (the `@impair` netsim/toxiproxy path, grep-inverted out
+  //     of the default suite) can force. It is NOT drivable in this plain
+  //     `make e2e-up` harness, so it stays covered by the host unit tests; this
+  //     E2E asserts the drivable "Your setting" branch of the SAME render path.
+  //
+  // This is the INTENDED reason assertion sketched in the §1b FIXME block below
+  // ("cap the receiver via perf-recv-video-range-max → 0, then assert the
+  // degraded peer's row shows a perf-reason-chip--setting chip"), made real on
+  // the 2-context harness for the ONE publisher the receiver sees.
+  //
+  // UN-FIXME rationale matches test #3: the serial-describe + launch-flag
+  // renderer mitigation lets the 2-context join survive on CI, and
+  // `capabilityMaxLayersOverride: 3` forces a >1-layer ladder so there is
+  // headroom for a manual cap to sit strictly below the full top (a single-layer
+  // ladder has full_top == 0, so no reason chip can ever render).
+  // -------------------------------------------------------------------------
+  test('per-peer receive reason chip shows "Your setting" when the receiver caps below the full ladder (#1553)', async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_reason_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub3b@videocall.rs",
+        "SimPublisher3b",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx3b@videocall.rs",
+        "SimReceiver3b",
+        uiURL,
+      );
+      // Force the full ladder on both ends so the receiver's cap can sit STRICTLY
+      // below the full top (the reason chip only renders below the full-ladder
+      // top; a single-layer runner would never show one).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "SimPublisher3b");
+      await joinMeeting(rxPage, meetingId, "SimReceiver3b");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
+      // take effect; a clamped single-layer ladder has no full top to sit below,
+      // so the chip could never appear and the test would prove nothing.
+      await assertCapabilityOverrideActive(pubConsole);
+
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      const panel = await openPerformancePanel(rxPage);
+
+      // Wait until the receiver is decoding video so the ladder is known and the
+      // per-peer snapshot for the publisher has populated.
+      const before = await (async () => {
+        await expect
+          .poll(async () => (await readVideoLayer(rxPage)) !== null, {
+            timeout: 45_000,
+            intervals: [500, 1000, 2000],
+          })
+          .toBe(true);
+        return readVideoLayer(rxPage);
+      })();
+      const layerCount = before!.layerCount;
+      // Defence-in-depth (the override proof above should already guarantee >1):
+      // a single-layer ladder has full_top == 0, so a manual cap can never sit
+      // BELOW the top and no reason chip can render — skip rather than assert a
+      // false negative.
+      test.skip(
+        layerCount <= 1,
+        `single-layer ladder (count=${layerCount}); the reason chip cannot render ` +
+          "without a full top to sit below on this runner (capability ceiling).",
+      );
+
+      // DRIVE the "Setting" attribution: cap THIS receiver's video receive max to
+      // the base rung (index 0). `per_peer_received_snapshots` threads this bound
+      // as `user_max`; with `sel == user_max == 0 < full_top` the per-peer row's
+      // reason resolves to DegradeReason::Setting.
+      await pinReceiverToBaseLayer(rxPage, "video");
+
+      // The per-peer RECEIVE disclosure (issue #1131) is a native <details>,
+      // collapsed by default (rows are built lazily on expand). Open it.
+      const peersDetails = panel.locator('[data-testid="perf-recv-video-peers"]');
+      await expect(peersDetails).toBeVisible({ timeout: 15_000 });
+      const peersSummary = panel.locator('[data-testid="perf-recv-video-peers-summary"]');
+      await expect(peersSummary).toBeVisible({ timeout: 10_000 });
+      // Expand if not already open (the summary toggles the <details>).
+      if (!(await peersDetails.evaluate((el) => (el as HTMLDetailsElement).open))) {
+        await peersSummary.click();
+      }
+      await expect
+        .poll(async () => peersDetails.evaluate((el) => (el as HTMLDetailsElement).open), {
+          timeout: 10_000,
+          intervals: [250, 500],
+        })
+        .toBe(true);
+
+      // Exactly one publisher → exactly one per-peer video row. Its reason chip
+      // testid is `perf-recv-video-peer-{sessionId}-reason`; match by suffix so we
+      // don't need to know the session id.
+      const reasonChip = panel.locator(
+        '[data-testid$="-reason"][data-testid^="perf-recv-video-peer-"]',
+      );
+
+      // The chip appears once the chooser has clamped the decoded layer to the
+      // capped bound and the snapshot recomputes its reason. Poll for it.
+      await expect(reasonChip).toBeVisible({ timeout: 30_000 });
+
+      // #1553 ASSERTION: the chip renders the exact DISPLAY string from
+      // `reason_chip_text(DegradeReason::Setting)`. This is the part the host
+      // tests cannot prove — that the mapped string reaches the DOM. A regression
+      // that mislabels Setting (or swaps the Network/Sender strings the same
+      // mapping owns) fails here.
+      await expect(reasonChip).toHaveText("Your setting");
+
+      // …and the chip carries the MATCHING modifier class, so the text and the
+      // class can never silently diverge (`reason_chip_modifier(Setting)` ==
+      // "setting"). Pinning both pins the whole `DegradeReason → (text, class)`
+      // contract for the Setting branch at the DOM.
+      const chipClass = (await reasonChip.getAttribute("class")) || "";
+      expect(chipClass).toMatch(/\bperf-reason-chip--setting\b/);
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // 4. Default Auto — with no threshold set the panel shows Auto (full range)
   //    and the needle is free to reflect auto-selection across the full ladder.
   //
