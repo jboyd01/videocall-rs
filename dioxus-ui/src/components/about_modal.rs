@@ -109,9 +109,10 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
     let client_sha = crate::constants::short_sha(env!("GIT_SHA"));
     let client_branch = env!("GIT_BRANCH");
     let client_ts = env!("BUILD_TIMESTAMP");
-    // Issue #1480: render the compact `YYYY-MM-DD HH:MM` Built value (matches the
-    // diagnostics build-info table); fall back to the raw ts only if compaction
-    // returns None (sentinel/empty).
+    // Issue #1480: render the full `YYYY-MM-DD HH:MM:SSZ` Built value (matches the
+    // diagnostics build-info table — date + full time incl. seconds and trailing
+    // zone); fall back to the raw ts only if `build_datetime` returns None
+    // (sentinel/empty).
     let client_built =
         crate::constants::build_datetime(client_ts).unwrap_or_else(|| client_ts.to_string());
 
