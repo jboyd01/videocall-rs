@@ -374,8 +374,8 @@ test.describe("Screen-share split-layout", () => {
       });
       const aspectBefore = dimsBefore.w / dimsBefore.h;
       // Aspect ratio should be ~3:2 = 1.5
-      expect(aspectBefore).toBeGreaterThan(1.5 * 0.90);
-      expect(aspectBefore).toBeLessThan(1.5 * 1.10);
+      expect(aspectBefore).toBeGreaterThan(1.5 * 0.9);
+      expect(aspectBefore).toBeLessThan(1.5 * 1.1);
 
       // Drag the resize handle ~100px to the right so the panel narrows.
       const handle = hostPage.locator(".screen-share-resize-handle");
@@ -400,8 +400,8 @@ test.describe("Screen-share split-layout", () => {
         return { w: r.width, h: r.height };
       });
       const aspectAfter = dimsAfter.w / dimsAfter.h;
-      expect(aspectAfter).toBeGreaterThan(1.5 * 0.90);
-      expect(aspectAfter).toBeLessThan(1.5 * 1.10);
+      expect(aspectAfter).toBeGreaterThan(1.5 * 0.9);
+      expect(aspectAfter).toBeLessThan(1.5 * 1.1);
     } finally {
       await browser1.close();
       await browser2.close();
