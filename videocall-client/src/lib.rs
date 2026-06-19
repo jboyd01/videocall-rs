@@ -255,8 +255,8 @@ pub use connection::{ConnectionLostReason, ConnectionState};
 pub use connection::install_netsim_window_hook;
 pub use decode::{
     create_audio_peer_decoder, max_layers_for_kind, quality_state, AudioPeerDecoderTrait,
-    DegradeReason, KindLayerBounds, PeerDecodeManager, PeerReceiveDiag, PrefMediaKind,
-    QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot, VideoPeerDecoder,
+    DegradeReason, KindLayerBounds, PeerDecodeManager, PeerDeviceInfo, PeerReceiveDiag,
+    PrefMediaKind, QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot, VideoPeerDecoder,
 };
 pub use encode::{
     create_microphone_encoder, CameraEncoder, LiveQualitySnapshot, MicrophoneEncoderTrait,

@@ -22,9 +22,10 @@ use crate::components::neteq_chart::{
     UnifiedTimelineChart, NETEQ_SAMPLE_CAP,
 };
 use crate::components::performance_settings::{
-    format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
-    format_send_layer_short, format_send_total_kbps, format_simulcast_summary, layer_quality_label,
-    peers_for_kind, DiagnosticsReader, HelpPopover, PerfControlsHandle, PerformanceSettingsPanel,
+    format_kbps_compact, format_mbps, format_peer_device_lines, format_peer_kind_line,
+    format_send_header, format_send_layer, format_send_layer_short, format_send_total_kbps,
+    format_simulcast_summary, layer_quality_label, peers_for_kind, DiagnosticsReader, HelpPopover,
+    PerfControlsHandle, PerformanceSettingsPanel,
 };
 use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use dioxus::prelude::*;
@@ -35,6 +36,14 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 use videocall_client::{PrefMediaKind, VideoCallClient};
 use videocall_diagnostics::{subscribe, MetricValue};
+
+/// #1482: one resolved per-peer device block for the diagnostics "Device (per
+/// peer)" section: `(session_id, peer_label, [(row_label, value)])`. The rows
+/// come from `format_peer_device_lines`; only present (`Some`) metric fields
+/// appear, so an empty rows Vec means the peer reported nothing. Aliased to
+/// keep the `SimulcastReceiveBreakdown` prop / local types readable (clippy
+/// `type_complexity`).
+type DeviceBlock = (u64, String, Vec<(String, String)>);
 
 /// Merged per-(peer, media-kind) reception stats backing the Raw stats →
 /// Reception dump (#1222). TWO producers emit subsystem `"video"` events with
@@ -1709,6 +1718,28 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
     let send_screen_snap = (reader.send_screen)();
     let per_peer_receive = (reader.per_peer_receive)();
 
+    // #1482: resolve the per-peer device blocks here (live, each tick) while the
+    // reader is in scope. ONE entry per unique session_id (a peer can appear in
+    // several kind blocks), preserving first-seen order; a peer whose info is
+    // `None` (nothing reported / unknown) or whose formatted lines are empty
+    // contributes no block — never an empty-labeled row.
+    let device_blocks: Vec<DeviceBlock> = {
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut blocks: Vec<DeviceBlock> = Vec::new();
+        for p in per_peer_receive.iter() {
+            if !seen.insert(p.session_id) {
+                continue;
+            }
+            if let Some(info) = (reader.per_peer_device_info)(p.session_id) {
+                let lines = format_peer_device_lines(&info);
+                if !lines.is_empty() {
+                    blocks.push((p.session_id, p.label.clone(), lines));
+                }
+            }
+        }
+        blocks
+    };
+
     rsx! {
         div { class: "diagnostics-section",
             h3 { "Simulcast layers" }
@@ -1728,7 +1759,10 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
                 not_sharing_text: "Screen — not sharing",
                 snap: send_screen_snap,
             }
-            SimulcastReceiveBreakdown { peers: per_peer_receive }
+            SimulcastReceiveBreakdown {
+                peers: per_peer_receive,
+                device_blocks,
+            }
         }
     }
 }
@@ -1842,7 +1876,16 @@ fn SimulcastSendLadder(
 /// the top-3 peers (highest layer first) + a "+N more" tail. Fed by the live
 /// per-peer snapshot list.
 #[component]
-fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> Element {
+fn SimulcastReceiveBreakdown(
+    peers: Vec<videocall_client::PeerReceiveDiag>,
+    /// #1482: pre-resolved per-peer device blocks, one entry per peer that
+    /// reported something: `(session_id, peer_label, [(row_label, value)])`.
+    /// Resolved in the parent (`SimulcastLayersSection`) where the live reader
+    /// is in scope, so this component takes a plain `PartialEq` value prop
+    /// rather than an `Rc<dyn Fn>` (which the `#[component]` macro can't derive
+    /// `PartialEq` for). Empty → the Device section renders nothing.
+    device_blocks: Vec<DeviceBlock>,
+) -> Element {
     rsx! {
         div { class: "simulcast-recv",
             span { class: "simulcast-recv-title", "Receiving (per peer)" }
@@ -1921,6 +1964,26 @@ fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> E
                                         "data-testid": "diag-simulcast-recv-more-{kind_label}",
                                         "+{extra} more peer(s) on {tail_label}"
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // #1482: per-peer device / hardware block. Rendered only when at
+            // least one peer reported something ("if available"); each block
+            // lists the present `label: value` rows from `format_peer_device_lines`.
+            if !device_blocks.is_empty() {
+                div { class: "diag-device",
+                    span { class: "diag-device-title", "Device (per peer)" }
+                    for (session_id , peer_label , lines) in device_blocks.into_iter() {
+                        div { class: "diag-device-peer",
+                            "data-testid": "diag-device-peer-{session_id}",
+                            span { class: "diag-device-peer-label", "{peer_label}" }
+                            for (label , value) in lines.into_iter() {
+                                div { class: "diag-device-row",
+                                    span { class: "diag-device-row-label", "{label}" }
+                                    span { class: "diag-device-row-value", "{value}" }
                                 }
                             }
                         }

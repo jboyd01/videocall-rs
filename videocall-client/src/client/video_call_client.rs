@@ -2132,6 +2132,22 @@ impl VideoCallClient {
             .unwrap_or_default()
     }
 
+    /// #1482: returns a remote peer's self-reported device/hardware metrics by
+    /// relay `session_id`, or `None` when the peer is unknown / has reported no
+    /// metric (all fields default). The UI polls this each render via the
+    /// diagnostics-reader closure and the signal-quality popup, so it must read
+    /// LIVE state every call — it does (it locks the inner and reads through to
+    /// [`PeerDecodeManager::peer_device_info`] on every invocation; no value is
+    /// captured or cached at the call site). Read-only on the manager, so it
+    /// borrows the inner immutably; returns `None` on a transient borrow clash
+    /// rather than blocking the render.
+    pub fn peer_device_info(&self, session_id: u64) -> Option<crate::decode::PeerDeviceInfo> {
+        self.inner
+            .try_borrow()
+            .ok()
+            .and_then(|inner| inner.peer_decode_manager.peer_device_info(session_id))
+    }
+
     /// Returns a shared reference to the camera force-keyframe flag.
     ///
     /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
@@ -3102,11 +3118,20 @@ impl Inner {
                             // bound peer-controlled core count to a sane range so a
                             // hostile peer can't report an absurd value; out-of-range
                             // -> None (no fabricated default), matching the float
-                            // and string guards below.
+                            // and string guards below. #1482: cores come from the
+                            // TELEM-7 client-metadata field 56 (client_cores), which
+                            // the sender populates from navigator.hardwareConcurrency.
+                            // Absent senders omit it (proto3 None); a hostile/absent 0
+                            // is dropped by the `>= 1` bound (never a fabricated 0).
                             client_cores: hp.client_cores.filter(|c| *c >= 1 && *c <= 1024),
                             // clamp peer-controlled labels (DoS/bloat guard): a
                             // hostile peer could otherwise push multi-MB strings
                             // that stick via the merge's `incoming.or(existing)`.
+                            // #1482: architecture comes from the TELEM-7 client-metadata
+                            // field 57 (client_architecture), populated from the
+                            // userAgentData high-entropy "architecture". Honest absence:
+                            // the sender only sets field 57 when non-empty, so an honest
+                            // sender yields None here (proto3 absent), never Some("").
                             client_architecture: clamp_label(hp.client_architecture),
                             client_os: clamp_label(hp.client_os),
                             client_device_type: clamp_label(hp.client_device_type),

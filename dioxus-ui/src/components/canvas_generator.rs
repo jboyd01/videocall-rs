@@ -578,6 +578,10 @@ pub fn generate_for_peer(
     // `peer_tile` by `session_id == peer_id`). Cloned per popup call site
     // below so the popup's Layers section matches the perf dialog.
     let signal_receive_diag = signal_info.receive_diag;
+    // #1482: this peer's device/hardware info for the popup's compact "Device"
+    // line. Resolved upstream in `peer_tile` (same `session_id == peer_id`
+    // lookup), cloned per popup call site below.
+    let signal_device_info = signal_info.device_info;
     // Issue #1483: per-tile "WT"/"WS" transport badge. `Copy`, so it can be
     // passed to `transport_badge(...)` in each `.tile-top-icons` arm without
     // cloning. Already gated upstream: `Some(Wt | Ws)` only when the
@@ -757,6 +761,7 @@ pub fn generate_for_peer(
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_receive_diag = signal_receive_diag.clone();
+                        let popup_device_info = signal_device_info.clone();
                         let popup_anchor = ss_anchor_id.clone();
                         rsx! {
                             SignalQualityPopup {
@@ -768,6 +773,7 @@ pub fn generate_for_peer(
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
                                 receive_diag: popup_receive_diag,
+                                device_info: popup_device_info,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -1030,6 +1036,7 @@ pub fn generate_for_peer(
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_receive_diag = signal_receive_diag.clone();
+                        let popup_device_info = signal_device_info.clone();
                         let popup_anchor = split_anchor_id.clone();
                         rsx! {
                             SignalQualityPopup {
@@ -1041,6 +1048,7 @@ pub fn generate_for_peer(
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
                                 receive_diag: popup_receive_diag,
+                                device_info: popup_device_info,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -1427,6 +1435,7 @@ pub fn generate_for_peer(
                             let popup_peer_name = peer_display_name.clone();
                             let popup_transport = signal_transport.clone();
                             let popup_receive_diag = signal_receive_diag.clone();
+                            let popup_device_info = signal_device_info.clone();
                             let popup_anchor = grid_anchor_id.clone();
                             rsx! {
                                 SignalQualityPopup {
@@ -1438,6 +1447,7 @@ pub fn generate_for_peer(
                                     anchor_id: popup_anchor,
                                     meter_mode: signal_meter_mode,
                                     receive_diag: popup_receive_diag,
+                                    device_info: popup_device_info,
                                     free_position: signal_free_position,
                                     on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                     on_reanchor: move |_| on_reanchor_signal_popup.call(()),
