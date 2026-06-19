@@ -503,6 +503,22 @@ pub struct PeerReceiveDiag {
     pub audio: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
 }
 
+/// Last in-place simulcast layer switch for this peer, stamped by Marker 1
+/// (issue #1460 observability). `ms == 0` is the never-switched sentinel.
+///
+/// `ms` is the manager-tick wall-clock timestamp at which the switch was
+/// applied (the same `now_ms` threaded into the chooser tick / seed paths,
+/// which on wasm is `js_sys::Date::now()` — identical to the clock the worker
+/// stamps on its `freshness_skip` DiagEvent `ts_ms`), so the subscriber's
+/// `ts_ms - ms` delta is directly comparable. `pub` so the diagnostics-bus
+/// subscriber in `video_call_client` can read a copy via the accessors below.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LastLayerSwitch {
+    pub ms: u64,
+    pub from: u32,
+    pub to: u32,
+}
+
 pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
@@ -613,6 +629,14 @@ pub struct Peer {
     last_video_frame_ms: u64,
     /// HCL bug #1: same idea for the audio stream.
     last_audio_frame_ms: u64,
+    /// Issue #1460 observability: timestamp + from/to of this peer's most recent
+    /// in-place VIDEO simulcast layer switch (stamped by Marker 1 at the 6 switch
+    /// sites). Read by the diagnostics-bus subscriber to correlate a
+    /// `freshness_skip` with a recent layer transition. Never read by adaptation
+    /// logic — pure telemetry.
+    last_video_switch: LastLayerSwitch,
+    /// Issue #1460 observability: SCREEN-kind sibling of `last_video_switch`.
+    last_screen_switch: LastLayerSwitch,
 }
 
 /// HCL bug #1: window during which a recent media frame suppresses a stale
@@ -676,6 +700,31 @@ const MEDIA_FRESH_WINDOW_MS: u64 = 5000;
 /// This replaces the previous ~5s lag, which came from reusing the
 /// screen-sized window for these continuous streams.
 pub(crate) const LIVE_STREAM_FRESH_WINDOW_MS: u64 = 500;
+
+/// #1399: coalescing window (ms) for the per-`delete_peer` #508 decode
+/// snapshot.
+///
+/// The #508 instrumentation snapshots the *full remaining-peer set* (one
+/// `log::info!` line per remaining peer) on each single-peer removal. In a
+/// mass-leave / reconnection wave where N peers each leave one-by-one through
+/// `delete_peer` (the `PARTICIPANT_LEFT` path), an ungated snapshot is
+/// O(N^2) info-level lines (~N^2/2) landing on the main thread at exactly the
+/// moment the UI is already churning teardown + re-render — i.e. it risks
+/// perturbing the very #510 re-render storm this instrumentation is meant to
+/// diagnose.
+///
+/// Coalescing to at most one full snapshot per this window bounds an
+/// individual-leave cascade from O(N^2) to at most one snapshot per window
+/// (the whole snapshot — header AND remaining-set body — is gated, so
+/// intermediate cascade removals emit nothing), while a single *isolated*
+/// peer-leave — more than one window after the previous one — still produces
+/// its full remaining-set snapshot for the analyst. 250ms is short enough that
+/// a genuinely-spaced leave (human-paced, seconds apart) is never coalesced,
+/// yet long enough that a tight teardown cascade collapses to a single
+/// snapshot. The per-leave breadcrumb is not lost: `delete_peer` still fires
+/// `on_peers_removed_batch` with the departed id on EVERY removal — only the
+/// diagnostic decode-state snapshot of the *remaining* peers is coalesced.
+const DELETE_PEER_SNAPSHOT_COALESCE_MS: u64 = 250;
 
 /// HCL bug #1: decide what `*_enabled` value to apply when a heartbeat
 /// arrives, given:
@@ -885,6 +934,9 @@ impl Peer {
             last_screen_frame_ms: 0,
             last_video_frame_ms: 0,
             last_audio_frame_ms: 0,
+            // Issue #1460 observability: never-switched sentinel.
+            last_video_switch: LastLayerSwitch::default(),
+            last_screen_switch: LastLayerSwitch::default(),
         })
     }
 
@@ -1010,7 +1062,25 @@ impl Peer {
         // Re-anchor on an actual layer change (#1079 H1) — see
         // `set_selected_video_layer` for the rationale. No-op when unchanged.
         if desired != self.selected_video_layer {
+            let old = self.selected_video_layer;
             self.video_seq_tracker.reanchor_for_layer_switch();
+            // Issue #1460 observability (Marker 1): record EVERY actual switch,
+            // including the unconstrained `highest_available` flap (the only path
+            // that emits no LAYER_PREFERENCE). NOT gated on `constrained` — that
+            // unconstrained path is precisely the suspected freshness_skip cause.
+            log::info!(
+                "LAYER_SWITCH session_id={} kind=video from={} to={} site=tick constrained={} highest_available={}",
+                self.session_id,
+                old,
+                desired,
+                self.video_layer_chooser.is_constrained(),
+                highest
+            );
+            self.last_video_switch = LastLayerSwitch {
+                ms: now_ms,
+                from: old,
+                to: desired,
+            };
         }
         self.selected_video_layer = desired;
         desired
@@ -1032,7 +1102,22 @@ impl Peer {
         // Re-anchor on an actual layer change (#1079 H1) — see
         // `set_selected_video_layer` for the rationale. No-op when unchanged.
         if desired != self.selected_screen_layer {
+            let old = self.selected_screen_layer;
             self.screen_seq_tracker.reanchor_for_layer_switch();
+            // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+            log::info!(
+                "LAYER_SWITCH session_id={} kind=screen from={} to={} site=tick constrained={} highest_available={}",
+                self.session_id,
+                old,
+                desired,
+                self.screen_layer_chooser.is_constrained(),
+                highest
+            );
+            self.last_screen_switch = LastLayerSwitch {
+                ms: now_ms,
+                from: old,
+                to: desired,
+            };
         }
         self.selected_screen_layer = desired;
         desired
@@ -1042,6 +1127,20 @@ impl Peer {
     /// screen stream.
     pub fn selected_screen_layer(&self) -> u32 {
         self.selected_screen_layer
+    }
+
+    /// Issue #1460 observability: a copy of this peer's most recent in-place
+    /// VIDEO simulcast layer switch (timestamp + from/to). `ms == 0` means no
+    /// switch has happened yet. Read by the diagnostics-bus subscriber to
+    /// correlate a `freshness_skip` with a recent layer transition. Pure
+    /// telemetry — never consulted by adaptation logic.
+    pub fn last_video_switch(&self) -> LastLayerSwitch {
+        self.last_video_switch
+    }
+
+    /// Issue #1460 observability: SCREEN-kind sibling of [`Self::last_video_switch`].
+    pub fn last_screen_switch(&self) -> LastLayerSwitch {
+        self.last_screen_switch
     }
 
     /// Run the AUDIO layer chooser one tick (issue #989, Phase 3) and apply the
@@ -1128,7 +1227,22 @@ impl Peer {
                 .for_kind(PrefMediaKind::Video)
                 .clamp(self.video_layer_chooser.current());
             if layer != self.selected_video_layer {
+                let old = self.selected_video_layer;
                 self.video_seq_tracker.reanchor_for_layer_switch();
+                // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+                log::info!(
+                    "LAYER_SWITCH session_id={} kind=video from={} to={} site=early_seed constrained={} highest_available={}",
+                    self.session_id,
+                    old,
+                    layer,
+                    self.video_layer_chooser.is_constrained(),
+                    vh
+                );
+                self.last_video_switch = LastLayerSwitch {
+                    ms: now_ms,
+                    from: old,
+                    to: layer,
+                };
             }
             self.selected_video_layer = layer;
             seeded = true;
@@ -1144,13 +1258,33 @@ impl Peer {
                 .for_kind(PrefMediaKind::Screen)
                 .clamp(self.screen_layer_chooser.current());
             if layer != self.selected_screen_layer {
+                let old = self.selected_screen_layer;
                 self.screen_seq_tracker.reanchor_for_layer_switch();
+                // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+                log::info!(
+                    "LAYER_SWITCH session_id={} kind=screen from={} to={} site=early_seed constrained={} highest_available={}",
+                    self.session_id,
+                    old,
+                    layer,
+                    self.screen_layer_chooser.is_constrained(),
+                    sh
+                );
+                self.last_screen_switch = LastLayerSwitch {
+                    ms: now_ms,
+                    from: old,
+                    to: layer,
+                };
             }
             self.selected_screen_layer = layer;
             seeded = true;
         }
 
         // AUDIO — proxied by the VIDEO downlink, same as `tick_audio_layer_chooser`.
+        // NOTE (#1219 Half 2): the sibling `seed_downlink_congestion` deliberately
+        // does NOT seed audio (audio is priority-protected on the relay-asserted
+        // congestion path). That divergence is intentional — do NOT "re-align" the
+        // two methods by deleting the audio branch here; this #1179 early-seed path
+        // legitimately proxies audio off the real video downlink sample.
         let ah = self.audio_layer_availability.highest_available(now_ms);
         if self
             .audio_layer_chooser
@@ -1161,6 +1295,153 @@ impl Peer {
                 .clamp(self.audio_layer_chooser.current());
             seeded = true;
         }
+
+        seeded
+    }
+
+    /// Step this peer's RECEIVER-side choosers down ONE rung in response to a
+    /// relay-authored `DOWNLINK_CONGESTION` control packet (issue #1219 Half 2).
+    ///
+    /// This is the SYNTHETIC-sample sibling of [`Self::seed_early_congestion`].
+    /// For VIDEO and SCREEN the two differ ONLY in the `DownlinkSample` fed into
+    /// each `observe_early_congestion` call (see below); for AUDIO they diverge
+    /// further — this method does NOT seed audio at all (see the AUDIO note). The
+    /// `DownlinkSample` difference:
+    ///
+    ///   * `seed_early_congestion` feeds the peer's REAL most-recent windowed
+    ///     downlink sample (`last_video_downlink` / `last_screen_downlink`). On
+    ///     WebSocket (TCP) and WebTransport video (reliable QUIC unistreams) there
+    ///     is NO packet loss, so that real sample is `{loss: 0, kf: 0}` and
+    ///     [`DownlinkSample::is_congested`] is `false` → the early seed is a no-op.
+    ///     That zero-loss blindness is exactly the #1219 condition the relay sees
+    ///     (it drops frames at its bounded per-receiver outbound channel) but the
+    ///     per-peer receive telemetry cannot.
+    ///   * This method instead feeds a SYNTHETIC congested sample
+    ///     (`{loss_per_sec: LOSS_STEP_DOWN_PER_SEC, kf_per_sec: 0.0}`, which makes
+    ///     `is_congested()` true) so the chooser steps down even though the real
+    ///     telemetry shows zero loss. DOWNLINK_CONGESTION is the relay ASSERTING
+    ///     congestion the per-peer loss sample cannot observe; the client honors
+    ///     that assertion by treating this window as congested for the chooser's
+    ///     purposes ONLY.
+    ///
+    /// The VIDEO and SCREEN handling is identical to `seed_early_congestion`: the
+    /// clamp to the user's per-kind receive bounds, the `selected_*_layer`
+    /// decode-guard write, and the sequence-tracker reanchor on an actual layer
+    /// switch. The real `last_video_downlink` / `last_screen_downlink` telemetry is
+    /// deliberately LEFT UNTOUCHED — the synthetic value is local to this call and
+    /// never written back, so the next real-sample tick (`choose`) and the
+    /// early-seed path keep observing genuine link health.
+    ///
+    /// AUDIO is the ONE intentional divergence from `seed_early_congestion`: it is
+    /// NOT stepped down here. Audio is priority-protected (the relay's emergency
+    /// downlink-shed exempts it too), its base-layer bitrate is small, and keeping
+    /// voice clear while video degrades is the DESIRED behavior under downlink
+    /// congestion. See the AUDIO note in the body.
+    ///
+    /// Because it reuses `observe_early_congestion`, a chooser already constrained
+    /// (by a prior real step-down or a prior DOWNLINK_CONGESTION) returns `false`
+    /// and is NOT re-stepped — that is correct and idempotent: the held layer is
+    /// still re-advertised to the relay via
+    /// [`PeerDecodeManager::current_desired_preferences`] on the caller's publish.
+    ///
+    /// RECEIVER-ONLY: this mutates only this peer's own LayerChoosers (the layers
+    /// THIS client REQUESTS from the relay for THIS peer's stream). It does not
+    /// touch — and must never touch — the local publisher's encoder; collapsing
+    /// the publisher would re-collapse this client's outbound stream for the whole
+    /// room, the exact bug #1219 Half 1 fixed.
+    ///
+    /// Returns `true` if ANY kind was stepped down (so the caller can log it); the
+    /// caller still emits the resulting preference via the normal sender path.
+    pub fn seed_downlink_congestion(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> bool {
+        use crate::decode::layer_chooser::{PrefMediaKind, LOSS_STEP_DOWN_PER_SEC};
+        let mut seeded = false;
+
+        // Relay-authored congestion: synthesize a congested window so the chooser
+        // steps down even on lossless transports where the real sample reads
+        // `{0, 0}` (#1219 Half 2). `loss_per_sec == LOSS_STEP_DOWN_PER_SEC` makes
+        // `DownlinkSample::is_congested()` true (`>=` threshold).
+        let synthetic = DownlinkSample {
+            loss_per_sec: LOSS_STEP_DOWN_PER_SEC,
+            kf_per_sec: 0.0,
+        };
+
+        // VIDEO — same inputs/clamp as `seed_early_congestion`, synthetic sample.
+        let vh = self.video_layer_availability.highest_available(now_ms);
+        if self
+            .video_layer_chooser
+            .observe_early_congestion(synthetic, vh, now_ms)
+        {
+            let layer = bounds
+                .for_kind(PrefMediaKind::Video)
+                .clamp(self.video_layer_chooser.current());
+            if layer != self.selected_video_layer {
+                let old = self.selected_video_layer;
+                self.video_seq_tracker.reanchor_for_layer_switch();
+                // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+                log::info!(
+                    "LAYER_SWITCH session_id={} kind=video from={} to={} site=downlink_seed constrained={} highest_available={}",
+                    self.session_id,
+                    old,
+                    layer,
+                    self.video_layer_chooser.is_constrained(),
+                    vh
+                );
+                self.last_video_switch = LastLayerSwitch {
+                    ms: now_ms,
+                    from: old,
+                    to: layer,
+                };
+            }
+            self.selected_video_layer = layer;
+            seeded = true;
+        }
+
+        // SCREEN — same inputs/clamp as `seed_early_congestion`, synthetic sample.
+        let sh = self.screen_layer_availability.highest_available(now_ms);
+        if self
+            .screen_layer_chooser
+            .observe_early_congestion(synthetic, sh, now_ms)
+        {
+            let layer = bounds
+                .for_kind(PrefMediaKind::Screen)
+                .clamp(self.screen_layer_chooser.current());
+            if layer != self.selected_screen_layer {
+                let old = self.selected_screen_layer;
+                self.screen_seq_tracker.reanchor_for_layer_switch();
+                // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+                log::info!(
+                    "LAYER_SWITCH session_id={} kind=screen from={} to={} site=downlink_seed constrained={} highest_available={}",
+                    self.session_id,
+                    old,
+                    layer,
+                    self.screen_layer_chooser.is_constrained(),
+                    sh
+                );
+                self.last_screen_switch = LastLayerSwitch {
+                    ms: now_ms,
+                    from: old,
+                    to: layer,
+                };
+            }
+            self.selected_screen_layer = layer;
+            seeded = true;
+        }
+
+        // AUDIO — deliberately NOT stepped down (#1219 Half 2). This is the one
+        // intentional divergence from `seed_early_congestion` (which DOES proxy
+        // audio off the video downlink). The relay's emergency downlink-shed
+        // (chat_server.rs `is_shed_candidate`) exempts AUDIO for the same reason:
+        // audio is priority-protected, and "video froze but voice stayed clear"
+        // is the DESIRED degradation under downlink congestion, not a bug. Audio's
+        // base-layer bitrate is small relative to video, so holding it costs
+        // little bandwidth while preserving the call's usability. Stepping audio
+        // down here would fight the very goal of #1219 (don't make the experience
+        // worse than it has to be). The audio chooser still adapts on its own via
+        // the normal `tick_audio_layer_chooser` path if real loss appears.
 
         seeded
     }
@@ -2056,6 +2337,20 @@ pub struct PeerDecodeManager {
     /// retries, keyed by publisher user_id. Set to `false` when the peer
     /// stops screen-sharing or is removed, causing pending retries to no-op.
     screen_decode_retry_tokens: HashMap<String, Rc<std::cell::Cell<bool>>>,
+    /// #1399: timestamp (ms) of the last per-`delete_peer` #508 decode
+    /// snapshot. Used to coalesce the full-set snapshot during an
+    /// individual-leave cascade so an N-peer one-by-one teardown emits O(N)
+    /// snapshot lines instead of O(N^2). See `delete_peer_snapshot_due` and
+    /// `DELETE_PEER_SNAPSHOT_COALESCE_MS`. Only the per-`delete_peer` path is
+    /// gated; the `clear_all_peers` (remaining=0 marker) and `run_peer_monitor`
+    /// (one snapshot per removal batch) paths stay unconditional.
+    last_delete_peer_snapshot_ms: u64,
+    /// Test-only count of how many times `log_peer_leave_decode_snapshot`
+    /// actually emitted, so #1399 coalescing can be asserted directly
+    /// (O(N) -> constant under a within-window cascade). `Cell` because the
+    /// emitter takes `&self`. Compiled out of production builds.
+    #[cfg(test)]
+    snapshot_emits: std::cell::Cell<u32>,
 }
 
 impl Default for PeerDecodeManager {
@@ -2081,6 +2376,9 @@ impl PeerDecodeManager {
             local_user_id: String::new(),
             cached_sorted_string_keys: RefCell::new(None),
             screen_decode_retry_tokens: HashMap::new(),
+            last_delete_peer_snapshot_ms: 0,
+            #[cfg(test)]
+            snapshot_emits: std::cell::Cell::new(0),
         }
     }
 
@@ -2100,6 +2398,9 @@ impl PeerDecodeManager {
             local_user_id: String::new(),
             cached_sorted_string_keys: RefCell::new(None),
             screen_decode_retry_tokens: HashMap::new(),
+            last_delete_peer_snapshot_ms: 0,
+            #[cfg(test)]
+            snapshot_emits: std::cell::Cell::new(0),
         }
     }
 
@@ -2427,6 +2728,48 @@ impl PeerDecodeManager {
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
                 if peer.seed_early_congestion(now_ms, bounds) {
+                    seeded = true;
+                }
+            }
+        }
+        seeded
+    }
+
+    /// Step EVERY connected peer's RECEIVER-side choosers down one rung in
+    /// response to a relay-authored `DOWNLINK_CONGESTION` control packet (issue
+    /// #1219 Half 2). The synthetic-sample twin of
+    /// [`Self::seed_early_congestion_for_connected_peers`].
+    ///
+    /// Like the early-seed method, there is NO transport gate here: the early-seed
+    /// timer's WT gate exists to bound a SPECULATIVE cold-start optimization to the
+    /// transport where #1179's join spike occurs. DOWNLINK_CONGESTION is not
+    /// speculative — the relay has ALREADY measured this receiver's downlink and
+    /// decided it is saturated, on whatever transport this client elected (WS or
+    /// WT alike). The gate (if any) lives at the relay, which only emits the
+    /// packet when this receiver's outbound channel overflowed (windowed
+    /// CongestionTracker crossing via on_outbound_drop). So this method
+    /// unconditionally steps down every connected peer whose chooser is not already
+    /// constrained.
+    ///
+    /// Returns `true` if any peer was actually stepped down. The caller still
+    /// emits the resulting preference through the normal [`LayerPreferenceSender`]
+    /// path via [`Self::current_desired_preferences`] — including for peers whose
+    /// already-constrained choosers returned `false` here, so the held layer is
+    /// re-advertised to the relay.
+    ///
+    /// `bounds` is the user's GLOBAL receive-layer bounds, threaded through to
+    /// [`Peer::seed_downlink_congestion`] so the stepped-down decode layer is
+    /// clamped to the user's per-kind `max`/`min`. Open (default) bounds are an
+    /// identity clamp.
+    pub fn seed_downlink_congestion_for_connected_peers(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> bool {
+        let mut seeded = false;
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                if peer.seed_downlink_congestion(now_ms, bounds) {
                     seeded = true;
                 }
             }
@@ -2999,6 +3342,8 @@ impl PeerDecodeManager {
     /// `PEER_LEAVE_DECODE_SNAPSHOT` is unique (verified not keyed on by
     /// `scripts/parse_meeting_console_logs.sh`).
     fn log_peer_leave_decode_snapshot(&self, departed_session_id: u64, trigger: &str) {
+        #[cfg(test)]
+        self.snapshot_emits.set(self.snapshot_emits.get() + 1);
         let now = now_ms();
         let remaining = self.connected_peers.ordered_keys().len();
         log::info!(
@@ -3036,6 +3381,13 @@ impl PeerDecodeManager {
     }
 
     pub fn delete_peer(&mut self, session_id: u64) {
+        self.delete_peer_at(session_id, now_ms());
+    }
+
+    /// `delete_peer` with the clock threaded in so the #1399 snapshot-coalesce
+    /// decision is deterministically testable. The public `delete_peer` reads
+    /// `now_ms()` once and delegates here.
+    fn delete_peer_at(&mut self, session_id: u64, now_ms: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
             if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
                 token.set(false);
@@ -3058,8 +3410,34 @@ impl PeerDecodeManager {
             // decode state right after this single-peer removal. Pure read of
             // `self.connected_peers`; emits no events and alters no teardown
             // ordering — the departed peer is already removed above.
-            self.log_peer_leave_decode_snapshot(session_id, "delete_peer");
+            //
+            // #1399: coalesce so an individual-leave cascade (N peers leaving
+            // one-by-one through this path) emits O(N) lines, not O(N^2). The
+            // first leave in a burst — and any isolated leave more than
+            // `DELETE_PEER_SNAPSHOT_COALESCE_MS` after the previous one — emits
+            // the full remaining-set snapshot; intermediate cascade removals
+            // are suppressed (the per-removal `on_peers_removed_batch` above
+            // already carries the departed id, so no peer-leave event is lost).
+            if self.delete_peer_snapshot_due(now_ms) {
+                self.last_delete_peer_snapshot_ms = now_ms;
+                self.log_peer_leave_decode_snapshot(session_id, "delete_peer");
+            }
         }
+    }
+
+    /// #1399: returns `true` when the per-`delete_peer` #508 snapshot should be
+    /// emitted, i.e. when no snapshot has fired within the trailing
+    /// `DELETE_PEER_SNAPSHOT_COALESCE_MS` window.
+    ///
+    /// `last_delete_peer_snapshot_ms == 0` is the never-fired sentinel and
+    /// always emits. The `saturating_sub` guards a non-monotonic clock
+    /// (`now_ms < last`, possible across a `Date.now()` step on wasm): a
+    /// backwards clock yields `0 < window` and so *emits* rather than wedging
+    /// the snapshot off — fail-open, matching the diagnostic intent.
+    fn delete_peer_snapshot_due(&self, now_ms: u64) -> bool {
+        self.last_delete_peer_snapshot_ms == 0
+            || now_ms.saturating_sub(self.last_delete_peer_snapshot_ms)
+                >= DELETE_PEER_SNAPSHOT_COALESCE_MS
     }
 
     /// Remove all peers and terminate their decoder workers immediately.
@@ -3541,6 +3919,8 @@ mod tests {
             last_screen_frame_ms: 0,
             last_video_frame_ms: 0,
             last_audio_frame_ms: 0,
+            last_video_switch: LastLayerSwitch::default(),
+            last_screen_switch: LastLayerSwitch::default(),
         };
         (peer, muted_handle)
     }
@@ -5974,6 +6354,277 @@ mod tests {
         );
     }
 
+    /// Build a connected peer with a learned 3-layer ladder (highest_available
+    /// == 2) and a ZERO-LOSS real downlink sample (`{0.0, 0.0}`) — the WebSocket /
+    /// reliable-WT case where the per-peer telemetry can never see congestion.
+    /// This is the #1219 Half 2 precondition: unlike `make_congested_top_peer`,
+    /// the real sample is NOT congested, so the early-seed path is a no-op here and
+    /// only the synthetic DOWNLINK_CONGESTION seed can step the chooser down.
+    fn make_zero_loss_top_peer(session_id: u64) -> Peer {
+        let (mut peer, _muted) = make_test_peer(session_id);
+        // Learn layers 0,1,2 so highest_available == 2 (room to drop to 1).
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, 1000);
+            peer.screen_layer_availability.observe(layer, 1000);
+            peer.audio_layer_availability.observe(layer, 1000);
+        }
+        // Zero-loss real telemetry — the lossless-transport blindness (#1219).
+        peer.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        };
+        peer.last_screen_downlink = crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        };
+        peer
+    }
+
+    /// CORE REGRESSION (#1219 Half 2): a relay-authored DOWNLINK_CONGESTION must
+    /// step a peer's RECEIVER-side chooser down EVEN WHEN the per-peer real
+    /// downlink sample shows ZERO loss (the WebSocket / reliable-WT case). This is
+    /// the exact blindness the early-seed path cannot cover, because
+    /// `DownlinkSample::is_congested()` is false on `{0, 0}`.
+    ///
+    /// HOST `#[test]` (NOT `#[wasm_bindgen_test]`): the wasm harness on this box
+    /// silently no-ops, so the regression is pinned with a native test that
+    /// actually executes under `cargo test -p videocall-client --lib`.
+    ///
+    /// MUTATION CHECK: if the DOWNLINK_CONGESTION arm's seed call is removed, or
+    /// reverts to `seed_early_congestion_for_connected_peers` (which reads the
+    /// zero-loss REAL sample → `is_congested()` false → no-op), then
+    /// `seed_downlink_congestion_for_connected_peers` returns false and
+    /// `current_desired_preferences` yields an EMPTY map — this test fails.
+    /// Confirmed by hand-swapping the synthetic seed for the early seed: the peer
+    /// stays at layer 2 and advertises nothing.
+    #[test]
+    fn downlink_congestion_steps_down_with_zero_loss() {
+        use crate::decode::layer_chooser::{DownlinkSample, PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(700, make_zero_loss_top_peer(700));
+
+        let open = ReceiveLayerBounds::default();
+
+        // Precondition (assert explicitly): the real sample is ZERO-loss, so the
+        // existing early-seed path could NOT step this peer down.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .last_video_downlink,
+            DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0
+            },
+            "precondition: real downlink sample is zero-loss (lossless transport)"
+        );
+
+        // Bring the unconstrained chooser to the TOP (current == 2) via one CLEAN
+        // unconstrained tick — exactly as `early_seed_respects_user_receive_max`
+        // does — so the synthetic seed steps DOWN from 2 to 1.
+        assert_eq!(
+            manager
+                .tick_layer_choosers(1500, &open)
+                .get(&(700, PrefMediaKind::Video)),
+            None,
+            "clean unconstrained tick tracks the top and advertises nothing"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "chooser climbed to the top before the DOWNLINK_CONGESTION seed"
+        );
+
+        // Sanity: the EARLY seed (real zero-loss sample) is a no-op here — this is
+        // precisely why a synthetic-sample primitive was needed.
+        assert!(
+            !manager.seed_early_congestion_for_connected_peers(1800, &open),
+            "early-seed must NO-OP on the zero-loss sample (the #1219 blindness)"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "early-seed left the peer at the top (no real congestion to react to)"
+        );
+
+        // The relay-authored signal: synthetic congestion steps the chooser down.
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open);
+        assert!(
+            seeded,
+            "DOWNLINK_CONGESTION must step the chooser down despite zero real loss"
+        );
+
+        // Decode guard stepped down 2 -> 1.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "synthetic seed steps the decode guard down from the top (2) to 1"
+        );
+
+        // The published preference map is NON-EMPTY with video at layer 1.
+        let desired = manager.current_desired_preferences(2000, &open);
+        assert_eq!(
+            desired.get(&(700, PrefMediaKind::Video)).copied(),
+            Some(1),
+            "DOWNLINK_CONGESTION must advertise video stepped down to layer 1"
+        );
+
+        // AUDIO PROTECTION (#1219 Half 2): audio is priority-protected and must
+        // NOT be stepped down by the DOWNLINK_CONGESTION seed — only video/screen
+        // are. The initial clean `tick_layer_choosers(1500)` brought the audio
+        // chooser to the top (2) too; the seed must have LEFT it there, and the
+        // published map must carry NO audio entry.
+        //
+        // MUTATION CHECK: re-add an audio `observe_early_congestion` branch to
+        // `Peer::seed_downlink_congestion` and this fails — audio drops to 1 and an
+        // audio entry appears in `desired`.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "audio must stay at the top — DOWNLINK_CONGESTION does not shed audio"
+        );
+        assert_eq!(
+            desired.get(&(700, PrefMediaKind::Audio)).copied(),
+            None,
+            "DOWNLINK_CONGESTION must advertise NO audio preference (audio protected)"
+        );
+    }
+
+    /// BOUNDS CLAMP (#1219 Half 2): the synthetic DOWNLINK_CONGESTION seed must
+    /// still respect the user's RECEIVE bounds — it shares
+    /// `seed_early_congestion`'s clamp-to-bounds post-process, so a user `max`
+    /// below `highest-1` clamps the stepped-down layer down to the cap.
+    ///
+    /// Mirrors `early_seed_respects_user_receive_max` but with a zero-loss real
+    /// sample (proving the clamp holds on the synthetic path too).
+    ///
+    /// MUTATION CHECK: delete the `bounds.for_kind(...).clamp(...)` in
+    /// `Peer::seed_downlink_congestion` (VIDEO decode guard) and this test fails —
+    /// `selected_video_layer` becomes 1 (> max 0).
+    #[test]
+    fn downlink_congestion_seed_does_not_constrain_below_user_max() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(701, make_zero_loss_top_peer(701));
+
+        let open = ReceiveLayerBounds::default();
+        // Climb to the top first (current == 2).
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&701)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "chooser climbed to the top before the DOWNLINK_CONGESTION seed"
+        );
+
+        // User caps received VIDEO at layer 0 — BELOW highest-1 (==1).
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Video, None, Some(0));
+
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &bounds);
+        assert!(
+            seeded,
+            "the synthetic congested sample must still step a constrain (clamp is a \
+             pure post-process, it does not gate the seed)"
+        );
+
+        // Decode guard must NOT exceed the user's max (0). Unclamped this is 1.
+        let selected = manager
+            .connected_peers
+            .get(&701)
+            .unwrap()
+            .selected_video_layer();
+        assert_eq!(
+            selected, 0,
+            "DOWNLINK_CONGESTION decode guard must be clamped to user video max 0 \
+             (unclamped it would be highest-1 == 1)"
+        );
+
+        // Advertised preference must NOT exceed the user's max (0).
+        let desired = manager.current_desired_preferences(2000, &bounds);
+        assert_eq!(
+            desired.get(&(701, PrefMediaKind::Video)).copied(),
+            Some(0),
+            "DOWNLINK_CONGESTION must advertise the clamped layer 0 (≤ user max)"
+        );
+    }
+
+    /// ENCODER-SCOPE GUARD (#1219 Half 2): the synthetic DOWNLINK_CONGESTION seed
+    /// is RECEIVER-ONLY. The publisher encoder (`congestion_step_down_flag`,
+    /// `CameraEncoder`, `EncoderBitrateController`, `audio_congestion_layer_ceiling`,
+    /// `apply_self_congestion_cut`) lives OUTSIDE `PeerDecodeManager` entirely, so a
+    /// `PeerDecodeManager`-level test cannot even name those symbols. This test
+    /// documents that structural separation and asserts the only state the seed
+    /// mutates is the per-peer receiver-side chooser / decode guard.
+    ///
+    /// The wiring-site scope (the DOWNLINK_CONGESTION arm references ONLY
+    /// `peer_decode_manager`, `layer_preference_sender`, and
+    /// `connection_controller`) is additionally verified by the grep recorded in
+    /// the PR description — none of the encoder symbols appear in that arm or in
+    /// the two new seed primitives.
+    #[test]
+    fn downlink_congestion_seed_is_receiver_only() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(702, make_zero_loss_top_peer(702));
+        let open = ReceiveLayerBounds::default();
+        let _ = manager.tick_layer_choosers(1500, &open);
+
+        // Capture the only peer-observable receiver-side state the seed may change.
+        let before = manager
+            .connected_peers
+            .get(&702)
+            .unwrap()
+            .selected_video_layer();
+        assert_eq!(before, 2, "peer at top before seed");
+
+        // Seed steps the RECEIVER chooser down. There is no publisher-encoder field
+        // reachable from here to inspect — the manager owns only receive-side state.
+        assert!(manager.seed_downlink_congestion_for_connected_peers(2000, &open));
+        let after = manager
+            .connected_peers
+            .get(&702)
+            .unwrap()
+            .selected_video_layer();
+        assert_eq!(
+            after, 1,
+            "seed mutated ONLY the receiver-side decode guard (2 -> 1)"
+        );
+
+        // And it advertises a receive-layer request, never an encoder action.
+        let desired = manager.current_desired_preferences(2000, &open);
+        assert_eq!(desired.get(&(702, PrefMediaKind::Video)).copied(), Some(1));
+    }
+
     /// NIT 1 (PR #1192 review): a source whose ONLY learned layer is the base
     /// (`highest_available == 0`) must advertise NOTHING from the early-seed path,
     /// matching the tick's `clamped < highest_available` gate — never `Some(0)`.
@@ -6908,6 +7559,8 @@ mod tests {
                 last_screen_frame_ms: 0,
                 last_video_frame_ms: 0,
                 last_audio_frame_ms: 0,
+                last_video_switch: LastLayerSwitch::default(),
+                last_screen_switch: LastLayerSwitch::default(),
             };
             manager.connected_peers.insert(sid, peer);
         }
@@ -7013,6 +7666,8 @@ mod tests {
             last_screen_frame_ms: 0,
             last_video_frame_ms: 0,
             last_audio_frame_ms: 0,
+            last_video_switch: LastLayerSwitch::default(),
+            last_screen_switch: LastLayerSwitch::default(),
         };
         manager.connected_peers.insert(510, peer);
 
@@ -7089,6 +7744,8 @@ mod tests {
             last_screen_frame_ms: 0,
             last_video_frame_ms: 0,
             last_audio_frame_ms: 0,
+            last_video_switch: LastLayerSwitch::default(),
+            last_screen_switch: LastLayerSwitch::default(),
         };
         manager.connected_peers.insert(520, peer);
 
@@ -7393,6 +8050,144 @@ mod tests {
             batch_sink.borrow().len(),
             0,
             "batch callback must not fire when no peers were removed"
+        );
+    }
+
+    // -- #1399: coalesce the per-delete_peer #508 decode snapshot ---------
+
+    /// Decision-helper truth table: a never-fired snapshot always emits; a
+    /// snapshot within `DELETE_PEER_SNAPSHOT_COALESCE_MS` of the previous one
+    /// is suppressed; one at/after the window boundary emits again.
+    #[wasm_bindgen_test]
+    fn delete_peer_snapshot_due_truth_table() {
+        let mut manager = PeerDecodeManager::new();
+
+        // Never fired (sentinel 0) -> always due, regardless of `now`.
+        assert!(
+            manager.delete_peer_snapshot_due(0),
+            "never-fired snapshot must be due"
+        );
+        assert!(
+            manager.delete_peer_snapshot_due(10_000),
+            "never-fired snapshot must be due even at a large now"
+        );
+
+        // Record a fire at t=10_000.
+        manager.last_delete_peer_snapshot_ms = 10_000;
+
+        // Strictly inside the window -> suppressed.
+        assert!(
+            !manager.delete_peer_snapshot_due(10_000),
+            "same-instant re-fire must be coalesced"
+        );
+        assert!(
+            !manager.delete_peer_snapshot_due(10_000 + DELETE_PEER_SNAPSHOT_COALESCE_MS - 1),
+            "a snapshot one ms inside the window must be coalesced"
+        );
+
+        // Exactly at the boundary and beyond -> due again.
+        assert!(
+            manager.delete_peer_snapshot_due(10_000 + DELETE_PEER_SNAPSHOT_COALESCE_MS),
+            "a snapshot at the window boundary must be due"
+        );
+        assert!(
+            manager.delete_peer_snapshot_due(10_000 + DELETE_PEER_SNAPSHOT_COALESCE_MS + 5),
+            "a snapshot past the window must be due"
+        );
+
+        // Backwards clock (now < last) -> fail-open, emit.
+        assert!(
+            manager.delete_peer_snapshot_due(9_000),
+            "a backwards clock must fail open (emit), not wedge the snapshot off"
+        );
+    }
+
+    /// An N-peer individual-leave cascade within a single coalesce window must
+    /// emit O(1) full snapshots, not O(N). Without #1399 this fires the
+    /// remaining-set snapshot on every one of the N `delete_peer` calls
+    /// (O(N) emits, O(N^2) lines); with coalescing only the first call in the
+    /// window emits.
+    #[wasm_bindgen_test]
+    fn delete_peer_cascade_within_window_coalesces_snapshot() {
+        let mut manager = PeerDecodeManager::new();
+        let session_ids: [u64; 6] = [901, 902, 903, 904, 905, 906];
+        for sid in &session_ids {
+            let (peer, _muted) = make_test_peer(*sid);
+            manager.connected_peers.insert(*sid, peer);
+        }
+        assert_eq!(manager.snapshot_emits.get(), 0);
+
+        // All six leave one-by-one at the SAME instant (a tight teardown
+        // cascade). Use the clock-threaded entry point so the window math is
+        // deterministic and not subject to wall-clock drift between calls.
+        let t = 50_000;
+        for sid in &session_ids {
+            manager.delete_peer_at(*sid, t);
+        }
+
+        assert_eq!(
+            manager.connected_peers.ordered_keys().len(),
+            0,
+            "all peers should be removed by the cascade"
+        );
+        assert_eq!(
+            manager.snapshot_emits.get(),
+            1,
+            "a within-window cascade must emit exactly one full snapshot (#1399), \
+             not one per removal"
+        );
+    }
+
+    /// Isolated peer-leaves spaced MORE than the coalesce window apart must
+    /// each still produce a full snapshot — coalescing must not starve the
+    /// analyst of the per-leave remaining-set view on genuinely-spaced leaves.
+    #[wasm_bindgen_test]
+    fn delete_peer_spaced_leaves_each_emit_snapshot() {
+        let mut manager = PeerDecodeManager::new();
+        let session_ids: [u64; 3] = [911, 912, 913];
+        for sid in &session_ids {
+            let (peer, _muted) = make_test_peer(*sid);
+            manager.connected_peers.insert(*sid, peer);
+        }
+
+        // Three leaves, each one full window + 1ms after the previous.
+        let step = DELETE_PEER_SNAPSHOT_COALESCE_MS + 1;
+        manager.delete_peer_at(911, 1_000);
+        manager.delete_peer_at(912, 1_000 + step);
+        manager.delete_peer_at(913, 1_000 + 2 * step);
+
+        assert_eq!(
+            manager.snapshot_emits.get(),
+            3,
+            "leaves spaced beyond the coalesce window must each emit a snapshot"
+        );
+    }
+
+    /// A `delete_peer` for an unknown session id must NOT emit a snapshot and
+    /// must NOT advance the coalesce clock — only an actual removal counts.
+    #[wasm_bindgen_test]
+    fn delete_peer_missing_id_emits_no_snapshot() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(920);
+        manager.connected_peers.insert(920, peer);
+
+        manager.delete_peer_at(999, 5_000); // no such peer
+        assert_eq!(
+            manager.snapshot_emits.get(),
+            0,
+            "removing a non-existent peer must not emit a snapshot"
+        );
+        assert_eq!(
+            manager.last_delete_peer_snapshot_ms, 0,
+            "a no-op removal must not advance the coalesce clock"
+        );
+
+        // The real removal that follows must still emit (clock was not armed).
+        manager.delete_peer_at(920, 5_010);
+        assert_eq!(
+            manager.snapshot_emits.get(),
+            1,
+            "the first real removal must emit even after a prior no-op delete"
         );
     }
 

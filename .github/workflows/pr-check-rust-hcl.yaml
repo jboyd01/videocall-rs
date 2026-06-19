@@ -27,6 +27,13 @@ on:
       # Trigger on edits to this workflow itself so a PR changing the Rust gate
       # is validated by the gate it changes (matches pr-check-backend-hcl.yaml).
       - '.github/workflows/pr-check-rust-hcl.yaml'
+      # The clippy-ci/workflow sync check (issue #1500) compares the `clippy-ci`
+      # Makefile recipe against this workflow's clippy steps. A PR editing only
+      # the Makefile or the check script must run the gate that validates it,
+      # so trigger on those too — otherwise the drift guard is silently skipped
+      # on exactly the change it exists to catch.
+      - 'Makefile'
+      - 'scripts/check-clippy-ci-sync.sh'
 
 concurrency:
   group: pr-check-rust-${{ github.event.pull_request.number }}
@@ -57,6 +64,14 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo fmt --all -- --check
+      # Guard the byte-identical contract between the `clippy-ci` Makefile target
+      # and the `cargo clippy` steps in the clippy job below (issue #1500). The
+      # contract was comment-enforced ("keep these BYTE-IDENTICAL"); this makes it
+      # self-enforcing so editing one list without the other turns the check red.
+      # Runs in the fmt job (no toolchain needed — pure text comparison).
+      - name: clippy-ci / workflow sync check
+        working-directory: rust-repo
+        run: bash scripts/check-clippy-ci-sync.sh
 
   clippy:
     name: cargo clippy
@@ -102,6 +117,15 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo clippy -p videocall-codecs --tests -- -D warnings
+      # videocall-ui (the Dioxus UI crate) also runs NATIVE libtest, so its
+      # `#[test]` code is lint-invisible to `cargo clippy --all` for the same
+      # reason as the crates above. Lint its test targets on the host (no
+      # `--target wasm32-unknown-unknown`).
+      - name: clippy (videocall-ui test targets)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo clippy -p videocall-ui --tests -- -D warnings
       - name: clippy (neteq test targets)
         working-directory: rust-repo
         env:

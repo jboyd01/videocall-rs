@@ -184,6 +184,9 @@ pub fn forget_room_metrics(room: &str) {
     let _ = RELAY_LAYER_FORWARDED_TOTAL.remove_label_values(&[room]);
     // relay_congestion_filtered_total{room} (#1220).
     let _ = RELAY_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
+    // relay_downlink_congestion_filtered_total{room} (#1219 Half 2) — same
+    // room-keyed unicast-filter sibling; swept alongside its CONGESTION cousin.
+    let _ = RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
 
     // relay_room_bytes_total{room, direction}.
     for direction in ["inbound", "outbound"] {
@@ -274,6 +277,8 @@ pub fn forget_room_metrics(room: &str) {
 /// called by `SessionLogic::on_stopping` (the runtime path) AND pinned directly
 /// by `metrics::tests::session_drop_gc_iterates_full_taxonomy_unconditionally`,
 /// so the test exercises the real GC code instead of an inline replica of it.
+/// (That test pins THIS helper's full-taxonomy sweep; it does not exercise the
+/// `on_stopping` call site itself — see #1380.)
 ///
 /// LEAK-PROOF: we iterate the entire fixed [`RELAY_DROP_KINDS`] taxonomy
 /// unconditionally rather than a per-session "kinds I emitted" tracking set.
@@ -940,6 +945,22 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create capability_score metric");
+
+    /// Client battery level (0.0–1.0) as a NUMERIC gauge (#1392). PR #1368 widened
+    /// the TELEM-7 `CLIENT_INFO` publish gate to admit a battery-only health packet,
+    /// but the battery *value* rode on no metric — `CLIENT_INFO`'s labels are
+    /// cores/architecture/gpu_family/network_effective_type/capability_score only.
+    /// This exposes the reported level as a real measurement so it can be
+    /// thresholded/averaged/quantiled in PromQL (e.g. "fraction of clients under
+    /// 20% battery"). Mirrors `CAPABILITY_SCORE`: same per-reporter label set, set
+    /// only when actually reported so an absent battery stays absent (not a
+    /// misleading 0).
+    pub static ref BATTERY_LEVEL: GaugeVec = register_gauge_vec!(
+        "videocall_client_battery_level",
+        "Client battery level as a numeric value in [0,1] (0.0 = empty, 1.0 = full); absent when the client did not report a battery level",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_battery_level metric");
 
     /// Effective simulcast layer count the publisher is configured to encode/send
     /// (#1143). p90==1 across a meeting is the inert-simulcast signal that the
@@ -1651,6 +1672,92 @@ lazy_static! {
         &["meeting_id", "session_id", "display_name"]
     )
     .expect("Failed to create videocall_client_render_fps metric");
+
+    // ===== RECEIVER DOWNLINK CONGESTION (#1219 Half 2) =====
+
+    /// Per-receiver downlink congestion shedding episodes (entered shedding mode)
+    /// (#1219 Half 2).
+    ///
+    /// Incremented once on the rising edge of each episode — when this receiver's
+    /// REAL downlink backpressure (its bounded per-session outbound channel
+    /// overflowing, observed by the windowed `CongestionTracker`) crosses into
+    /// active congestion and the relay begins shedding non-base layers. This is
+    /// the receiver-directed complement of the existing sender-directed
+    /// CONGESTION signal: it detects when the relay-to-receiver link (not the
+    /// sender-to-relay link) is saturated. (It is NOT keyed off the actor-mailbox
+    /// `Full`, which measures room-wide fan-out burst, not a single receiver's
+    /// downlink — see #1219 Half-2 B1.)
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values: `websocket`,
+    /// `webtransport`). Safe for indefinite retention.
+    pub static ref RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL: CounterVec = register_counter_vec!(
+        "relay_receiver_downlink_congestion_total",
+        "Receivers entering downlink congestion shedding mode (windowed CongestionTracker crossing) (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_receiver_downlink_congestion_total metric");
+
+    /// Per-receiver downlink congestion recovery (exited shedding mode) (#1219
+    /// Half 2).
+    ///
+    /// Incremented once on the falling edge of each episode — when the receiver's
+    /// downlink-congestion relief window (`RECEIVER_DOWNLINK_RELIEF_WINDOW`)
+    /// elapses with no fresh overflow, so the windowed signal goes inactive and
+    /// the relay resumes full-layer forwarding. Recovery is the natural decay of
+    /// the window, NOT a count of strictly-consecutive successful sends (which
+    /// could be reset forever by an occasional drop and wedge a healthy link —
+    /// #1219 Half-2 B2). The difference `congestion_total - recovered_total`
+    /// gives the current count of receivers still in shedding mode.
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
+    /// retention.
+    pub static ref RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_receiver_downlink_recovered_total",
+        "Receivers exiting downlink congestion shedding mode (relief window elapsed) (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_receiver_downlink_recovered_total metric");
+
+    /// Non-base-layer media packets shed by the downlink congestion pre-filter
+    /// (#1219 Half 2).
+    ///
+    /// Incremented each time a non-base (layer > 0) VIDEO/SCREEN packet is
+    /// discarded for a receiver in shedding mode (its windowed downlink signal is
+    /// active) BEFORE reaching `try_send`. This is the volume of proactive
+    /// shedding the congestion relief performs — distinct from the
+    /// `relay_packet_drops_total{drop_reason=mailbox_full}` counter (which counts
+    /// packets lost at the mailbox itself). Together they tell the story:
+    /// shedding removes volume before the mailbox enqueue, so it should REDUCE
+    /// the downstream mailbox/channel drops a saturated receiver would otherwise
+    /// incur.
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
+    /// retention.
+    pub static ref RELAY_DOWNLINK_SHED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_shed_total",
+        "Non-base-layer media packets shed before try_send for receivers in downlink congestion (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_downlink_shed_total metric");
+
+    /// DOWNLINK_CONGESTION control packets dropped by the relay's unicast filter
+    /// because they did not target the receiving session (#1219 Half 2).
+    ///
+    /// The relay publishes DOWNLINK_CONGESTION on the target receiver's OWN
+    /// per-session subject, but the `room.{room}.*` NATS wildcard fans every
+    /// packet out to every session; this counts the non-target copies dropped
+    /// before they reach a transport. Kept SEPARATE from
+    /// `relay_congestion_filtered_total` (the sender-keyed CONGESTION sibling) so
+    /// the two relay-authored unicast packet classes stay distinguishable on the
+    /// dashboards — they have different root causes and fan-out shapes.
+    ///
+    /// CARDINALITY: bounded — `room` only, same as the CONGESTION sibling.
+    pub static ref RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_congestion_filtered_total",
+        "DOWNLINK_CONGESTION packets dropped by the unicast filter (not targeting this session) (#1219)",
+        &["room"]
+    )
+    .expect("Failed to create relay_downlink_congestion_filtered_total metric");
 }
 
 // =============================================================================
@@ -2033,6 +2140,9 @@ mod tests {
         RELAY_CONGESTION_FILTERED_TOTAL
             .with_label_values(&[room])
             .inc();
+        RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .inc();
         RELAY_ROOM_BYTES_TOTAL
             .with_label_values(&[room, "outbound"])
             .inc();
@@ -2089,6 +2199,13 @@ mod tests {
             5.0,
             "demand-gauge seed must be observable before removal (non-vacuous)"
         );
+        assert_eq!(
+            RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            1.0,
+            "downlink-congestion-filtered seed must be observable before removal (non-vacuous)"
+        );
 
         // Drain the room.
         forget_room_metrics(room);
@@ -2120,6 +2237,14 @@ mod tests {
                 .with_label_values(&[room])
                 .get(),
             0.0
+        );
+        assert_eq!(
+            RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0,
+            "relay_downlink_congestion_filtered_total{{room}} must be swept by \
+             forget_room_metrics (#1219 Half 2)"
         );
         assert_eq!(
             RELAY_ROOM_BYTES_TOTAL
@@ -2197,15 +2322,19 @@ mod tests {
     /// incremented — i.e. the GC does not depend on a per-session "kinds I
     /// emitted" tracking set.
     ///
-    /// CRITICAL (issue #1186): this calls the REAL GC entry point
-    /// [`forget_session_drops`] — the same function `SessionLogic::on_stopping`
-    /// invokes — instead of replicating its loop inline. Mutating `on_stopping`
-    /// back to per-session-subset iteration (the exact #1090 regression) routes
-    /// the runtime through `forget_session_drops`, so this test pins the real
-    /// path. To prove the helper itself is exhaustive, we additionally seed a
-    /// SECOND kind the session never "officially" emitted and assert the sweep
-    /// removes it too: shrinking the loop in `forget_session_drops` to a subset
-    /// would leave a residual series and fail this test.
+    /// SCOPE (issue #1186 / #1380): this pins the GC HELPER
+    /// [`forget_session_drops`] — the function `SessionLogic::on_stopping`
+    /// invokes — by calling it directly and asserting it sweeps the FULL
+    /// taxonomy. It seeds a SECOND kind the session never "officially" emitted
+    /// and asserts the sweep removes it too, so shrinking the loop in
+    /// `forget_session_drops` to a subset leaves a residual series and fails
+    /// here. What this test does NOT cover (#1380): the `on_stopping` CALL SITE
+    /// wiring. `on_stopping` needs an `Addr<ChatServer>` + NATS client + tracker
+    /// to drive, so reverting it to an inline per-session-subset loop that
+    /// bypasses this helper (the exact #1090 regression shape) would still pass
+    /// CI — that wiring is guarded only by the one-line call site under the
+    /// LEAK-PROOF comment in `session_logic.rs::on_stopping`, not by this test.
+    /// Do not over-trust this as a guard against re-breaking the call site.
     #[test]
     #[serial(session_drops_gc)]
     fn session_drop_gc_iterates_full_taxonomy_unconditionally() {

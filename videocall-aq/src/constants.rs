@@ -82,7 +82,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 2500,
         min_bitrate_kbps: 1500,
         max_bitrate_kbps: 2500,
-        keyframe_interval_frames: 150, // ~5s at 30fps
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "hd_plus",
@@ -92,7 +92,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 2000,
         min_bitrate_kbps: 1200,
         max_bitrate_kbps: 2500,
-        keyframe_interval_frames: 150, // ~5s at 30fps
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "hd",
@@ -102,7 +102,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 1500,
         min_bitrate_kbps: 800,
         max_bitrate_kbps: 2000,
-        keyframe_interval_frames: 150, // ~5s at 30fps
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "standard",
@@ -112,7 +112,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 900,
         min_bitrate_kbps: 500,
         max_bitrate_kbps: 1500,
-        keyframe_interval_frames: 150, // ~5s at 30fps
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "medium",
@@ -122,7 +122,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 600,
         min_bitrate_kbps: 300,
         max_bitrate_kbps: 1000,
-        keyframe_interval_frames: 125, // ~5s at 25fps
+        keyframe_interval_frames: 125, // ~5s at 25fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "low",
@@ -132,7 +132,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 400,
         min_bitrate_kbps: 200,
         max_bitrate_kbps: 600,
-        keyframe_interval_frames: 100, // ~5s at 20fps
+        keyframe_interval_frames: 100, // ~5s at 20fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "very_low",
@@ -142,7 +142,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 250,
         min_bitrate_kbps: 100,
         max_bitrate_kbps: 400,
-        keyframe_interval_frames: 75, // ~5s at 15fps
+        keyframe_interval_frames: 75, // ~5s at 15fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "minimal",
@@ -152,7 +152,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 150,
         min_bitrate_kbps: 50,
         max_bitrate_kbps: 250,
-        keyframe_interval_frames: 50, // ~5s at 10fps
+        keyframe_interval_frames: 50, // ~5s at 10fps; wall-clock cap guarantees ≤5s
     },
 ];
 
@@ -462,7 +462,7 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 2500,
         min_bitrate_kbps: 1500,
         max_bitrate_kbps: 4000,
-        keyframe_interval_frames: 30, // ~3s at 10fps — frequent keyframes for text readability
+        keyframe_interval_frames: 30, // ~3s at 10fps (text readability); wall-clock cap ≤3s
     },
     VideoQualityTier {
         label: "medium",
@@ -472,7 +472,7 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 1200,
         min_bitrate_kbps: 700,
         max_bitrate_kbps: 2000,
-        keyframe_interval_frames: 24, // ~3s at 8fps
+        keyframe_interval_frames: 24, // ~3s at 8fps (text readability); wall-clock cap ≤3s
     },
     VideoQualityTier {
         label: "low",
@@ -482,7 +482,7 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 500,
         min_bitrate_kbps: 250,
         max_bitrate_kbps: 1000,
-        keyframe_interval_frames: 15, // ~3s at 5fps
+        keyframe_interval_frames: 15, // ~3s at 5fps (text readability); wall-clock cap ≤3s
     },
 ];
 
@@ -1007,6 +1007,18 @@ pub const CAMERA_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 /// Screen share keyframe interval (frames).
 /// Periodic keyframes ensure recovery from packet loss on screen share streams.
 pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
+
+/// Wall-clock ceiling on the camera periodic keyframe interval (milliseconds).
+/// The frame-counted `keyframe_interval_frames` only guarantees ~5s at the tier's
+/// nominal fps. Under CPU load or at low AQ tiers the actual fps drops and the
+/// frame-counted floor stretches to 10–17s. This wall-clock cap guarantees a
+/// periodic keyframe at least every 5s regardless of actual encode rate (issue #1510).
+pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 5000.0;
+
+/// Wall-clock ceiling for screen-share periodic keyframes (milliseconds).
+/// Screen tiers use a ~3s nominal GOP for text readability. The screen-specific
+/// cap preserves that 3s design intent under low-fps conditions (issue #1510).
+pub const SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 3000.0;
 
 /// Max time to wait for a keyframe before requesting one (milliseconds).
 /// After packet loss is detected, if no keyframe arrives within this window, send PLI.

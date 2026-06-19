@@ -642,6 +642,19 @@ html[data-theme="dark"] {
   --transport-badge-text: #0a84ff;
   --transport-badge-border: #38383a;
 
+  /* Issue 1483: per-tile WT/WS transport badge — OPAQUE fills with fixed text
+     colors for guaranteed AA contrast over arbitrary peer video (translucent
+     tints failed WCAG on mid-tone video). WT (primary) = solid blue + white;
+     WS (fallback) = solid amber + black — the same amber-on-video combo
+     .guest-badge already uses. Distinct hues keep the two transports CVD-safe.
+     @token-exempt: explicit fixed-contrast badge colors over arbitrary peer video (see .guest-badge precedent) */
+  --transport-badge-wt-text: #ffffff;
+  --transport-badge-wt-bg: #0062cc;
+  --transport-badge-wt-border: rgba(255, 255, 255, 0.25);
+  --transport-badge-ws-text: #000000;
+  --transport-badge-ws-bg: #ff9f0a;
+  --transport-badge-ws-border: rgba(0, 0, 0, 0.25);
+
   /* Generic context-menu inner divider */
   --context-menu-shadow: rgba(0, 0, 0, 0.5);
   --context-menu-shadow-strong: rgba(0, 0, 0, 0.4);
@@ -970,6 +983,17 @@ html[data-theme="light"] {
   --transport-badge-text: #0a84ff;
   --transport-badge-border: #e0e0e2;
 
+  /* Issue 1483: light-theme per-tile WT/WS badge — identical OPAQUE fixed
+     fills to dark theme. The badge sits over arbitrary peer VIDEO (not the UI
+     surface), so its contrast must be theme-independent.
+     @token-exempt: explicit fixed-contrast badge colors over arbitrary peer video (see .guest-badge precedent) */
+  --transport-badge-wt-text: #ffffff;
+  --transport-badge-wt-bg: #0062cc;
+  --transport-badge-wt-border: rgba(255, 255, 255, 0.25);
+  --transport-badge-ws-text: #000000;
+  --transport-badge-ws-bg: #ff9f0a;
+  --transport-badge-ws-border: rgba(0, 0, 0, 0.25);
+
   --context-menu-shadow: rgba(0, 0, 0, 0.18);
   --context-menu-shadow-strong: rgba(0, 0, 0, 0.14);
   --context-menu-shadow-deep: rgba(0, 0, 0, 0.16);
@@ -994,21 +1018,13 @@ html[data-theme="light"] {
 html:not([data-theme]),
 html[data-theme="dark"] {
   /* Modal structure — simple frosted glass */
-  --settings-modal-bg: linear-gradient(
-    180deg,
-    rgba(28, 26, 24, 0.92) 0%,
-    rgba(22, 21, 19, 0.88) 55%,
-    rgba(18, 18, 16, 0.92) 100%
-  );
-
   --settings-modal-border: rgba(255, 255, 255, 0.10);
 
-  --settings-modal-shadow:
-    0 36px 90px rgba(0, 0, 0, 0.48), 0 10px 28px rgba(0, 0, 0, 0.24);
-
-  --settings-backdrop-blur: 16px;
-  --settings-backdrop-saturation: 130%;
-  --settings-backdrop-contrast: 102%;
+  /* Removed dead tokens (issue #1444): --settings-modal-bg,
+     --settings-modal-shadow, --settings-backdrop-blur,
+     --settings-backdrop-saturation, --settings-backdrop-contrast had ZERO
+     var() consumers — the live .settings-modal values are hardcoded
+     (@token-exempt) in style.css. */
 
   /* Rim layer (::before) — very subtle glass edge */
   --settings-rim-color: linear-gradient(
@@ -1023,7 +1039,9 @@ html[data-theme="dark"] {
 
   /* Sidebar & navigation */
   --settings-sidebar-bg: rgba(255, 255, 255, 0.028);
-  --settings-panel-bg: rgba(8, 10, 12, 0.22);
+  /* (issue #1444) Removed a shadowed duplicate --settings-panel-bg here
+     (rgba(8,10,12,0.22)); the winning dark value rgba(255,255,255,0.04) is
+     defined lower in this same cascade and is the one that takes effect. */
   --settings-sidebar-border: transparent;
   --settings-nav-text: rgba(230, 238, 255, 0.7);
   --settings-nav-text-hover: rgba(230, 238, 255, 0.92);
@@ -1068,7 +1086,7 @@ html[data-theme="dark"] {
      modal background so it reads as a layered card without feeling heavy. */
   --settings-panel-bg: rgba(255, 255, 255, 0.04);
   --settings-panel-border: rgba(255, 255, 255, 0.09);
-  --settings-panel-divider: rgba(255, 255, 255, 0.07);
+  /* --settings-panel-divider removed (issue #1444): zero var() consumers. */
   --settings-panel-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 
   /* Settings shell — filled button (dark) */
@@ -1161,22 +1179,14 @@ html[data-theme="dark"] {
 /* Settings-specific tokens — light theme */
 html[data-theme="light"] {
   /* Modal structure — simple frosted glass */
-  --settings-modal-bg: linear-gradient(
-    180deg,
-    rgba(244, 246, 250, 0.95) 0%,
-    rgba(228, 232, 238, 0.92) 100%
-  );
-
   --settings-modal-border: rgba(255, 255, 255, 0.72);
 
-  --settings-modal-shadow:
-    0 44px 110px rgba(40, 50, 70, 0.18), 0 12px 32px rgba(40, 50, 70, 0.1);
-
-  /* --settings-modal-top-highlight: rgba(255, 255, 255, 0.92); */
-
-  --settings-backdrop-blur: 16px;
-  --settings-backdrop-saturation: 140%;
-  --settings-backdrop-contrast: 102%;
+  /* Removed dead tokens (issue #1444), light theme: --settings-modal-bg,
+     --settings-modal-shadow, --settings-backdrop-blur,
+     --settings-backdrop-saturation, --settings-backdrop-contrast — zero var()
+     consumers (live values are hardcoded @token-exempt in style.css). This
+     also resolves the stale dark-vs-light saturation skew (130% vs 140%) by
+     removing both. */
 
   --device-settings-overlay-bg-image: linear-gradient(
     180deg,
@@ -1242,7 +1252,7 @@ html[data-theme="light"] {
      modal background so it reads as a layered card without feeling heavy. */
   --settings-panel-bg: rgba(0, 0, 0, 0.05);
   --settings-panel-border: rgba(0, 0, 0, 0.10);
-  --settings-panel-divider: rgba(0, 0, 0, 0.08);
+  /* --settings-panel-divider removed (issue #1444): zero var() consumers. */
   --settings-panel-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
 
   /* Settings shell — filled button (light) */
@@ -1494,6 +1504,25 @@ html[data-theme="light"] #invite-overlay p {
   --speaker-value-width: 44px;
   --speaker-preview-column: 260px;
   --speaker-preview-shift-x: 25px;
+
+  /* Chat sidebar — Google-Meet-style surface. Theme-agnostic on purpose: the
+     chat panel keeps a fixed dark Meet palette regardless of the app's
+     light/dark theme, so these tokens live in :root rather than the paired
+     html[data-theme] blocks. Values mirror Google Meet's chat greys/blue. */
+  --chat-surface: #202124;
+  --chat-surface-notice: #2d2e30;
+  --chat-surface-raised: #3c4043;
+  --chat-surface-input-focus: #4a4d50;
+  --chat-text-primary: #e8eaed;
+  --chat-text-secondary: #9aa0a6;
+  --chat-text-muted: #5f6368;
+  --chat-accent: #1a73e8;
+  --chat-accent-hover: #1557b0;
+  --chat-on-accent: #fff;
+  --chat-border: #3c4043;
+  --chat-shadow: rgba(0, 0, 0, 0.4);
+  --chat-error-text: #f28b82;
+  --chat-error-bg: #3c2a2a;
 }
 
 /* Accessibility: high-contrast fallback */
@@ -2197,6 +2226,26 @@ html[data-theme="light"] #invite-overlay p {
   box-shadow:
     0 0 0 2px #1c1c1e,
     0 0 10px rgba(255, 69, 58, 0.6);
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* Unread-chat indicator dot on the OpenChatButton */
+@keyframes chat-badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--surface), 0 0 6px 2px rgba(48, 209, 88, 0.7); }
+  50%       { box-shadow: 0 0 0 2px var(--surface), 0 0 10px 4px rgba(48, 209, 88, 0.4); }
+}
+
+.video-control-button .chat-unread-badge {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #30D158;
+  box-shadow: 0 0 0 2px var(--surface), 0 0 6px 2px rgba(48, 209, 88, 0.7);
+  animation: chat-badge-pulse 1.8s ease-in-out infinite;
   z-index: 2;
   pointer-events: none;
 }
@@ -3601,4 +3650,45 @@ html[data-theme="light"] #invite-overlay p {
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
     monospace;
   font-size: 0.65rem;
+}
+
+/* Issue 1483: per-peer-tile WT/WS transport badge. A small pill that sits
+   beside the .signal-indicator meter in .tile-top-icons. Sized to match the
+   signal-popup .connection-type pill (11px/600/letter-spacing) but styled as
+   an independent rule here (server-gated, default OFF). Distinct colors via
+   the --transport-badge-wt-* / --transport-badge-ws-* theme vars so WT and WS
+   are visually separable. */
+.transport-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: clamp(9px, calc(var(--tile-h, 240px) * 0.05), 11px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+  /* Prevent the 2-letter label wrapping if the row gets cramped. */
+  white-space: nowrap;
+  user-select: none;
+}
+
+.transport-badge--wt {
+  color: var(--transport-badge-wt-text);
+  background: var(--transport-badge-wt-bg);
+  border: 1px solid var(--transport-badge-wt-border);
+}
+
+.transport-badge--ws {
+  color: var(--transport-badge-ws-text);
+  background: var(--transport-badge-ws-bg);
+  border: 1px solid var(--transport-badge-ws-border);
+}
+
+/* Issue 1483: denser badge on split-screen peer tiles, mirroring the sibling
+   .tile-top-icons icon density there (see .split-peer-tile .guest-badge). */
+.split-peer-tile .transport-badge {
+  font-size: 9px;
+  padding: 1px 4px;
 }
