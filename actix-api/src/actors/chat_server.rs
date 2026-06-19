@@ -153,6 +153,42 @@ const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
 /// races a host-leave END is harmless in either ordering.
 const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
 
+/// NATS subject for chat_server -> meeting-api notifications that a SINGLE
+/// participant's session left a room. The meeting-api consumer marks that
+/// participant `status='left', left_at=NOW()` in the `meeting_participants`
+/// table so a participant who disconnected WITHOUT calling the REST `/leave`
+/// endpoint (closed tab / network drop / crash) stops being counted as present
+/// by the meeting-settings "Activity" participant count (issue #1551).
+///
+/// Fired from the per-peer departure point inside [`ChatServer::leave_rooms`] —
+/// the same place that broadcasts the client-facing `PARTICIPANT_LEFT` packet —
+/// so it inherits that path's lifecycle guarantees:
+///   - It runs ONLY after the [`RECONNECT_GRACE_PERIOD`] (via
+///     `ExecutePendingDeparture`, which a timely reconnect cancels) or on an
+///     explicit `Leave`, so a brief disconnect+reconnect never reaches it.
+///   - It is suppressed when the departing user still has ANOTHER live session
+///     in the room (multi-tab, or a different tab that reconnected after the
+///     grace expired): we publish only when `room_members` for the room — the
+///     actor-synchronous authoritative presence map — has NO remaining session
+///     for that `user_id`. This closes the late-event race where a per-user
+///     mark-left could otherwise stomp a still-present session, because the DB
+///     row is keyed by `user_id`, not session.
+///
+/// Scale / fan-out cost. Unlike [`MEETING_BECAME_EMPTY_SUBJECT`] — which is
+/// COALESCED to fire exactly once per room-drain — this is per departing user
+/// and is NOT coalesced. A mass disconnect of N participants is therefore an
+/// O(N) fan-out: N publishes on this subject (matching the per-peer
+/// `PARTICIPANT_LEFT` client broadcast volume the relay already sustains) PLUS,
+/// on the meeting-api side, N additional DB round-trips the client broadcast
+/// does NOT incur — one `get_by_room_id` SELECT and one single-row UPDATE per
+/// event, processed serially by the single-subscriber consumer. This is bounded
+/// and acceptable at realistic room sizes (the per-event work is two indexed
+/// queries), and per-event delivery is required because each row is keyed by a
+/// distinct `user_id` — a single coalesced room event could not carry which
+/// users to mark left. It is a deliberate, defensible design choice, not a
+/// zero-incremental-cost one; batching is intentionally out of scope here.
+const PARTICIPANT_LEFT_SUBJECT: &str = "internal.participant_left";
+
 /// Payload published to NATS for cross-server stale session eviction.
 /// When a client reconnects (possibly to a different server), the new server
 /// broadcasts this so the old server can clean up silently.
@@ -203,6 +239,19 @@ struct MeetingEndedByHostPayload {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MeetingBecameEmptyPayload {
     room_id: String,
+}
+
+/// Payload for [`PARTICIPANT_LEFT_SUBJECT`].
+///
+/// Sent from chat_server to meeting-api when a single participant's session left
+/// a room and that participant has no other live session in the room. The
+/// meeting-api consumer marks `(room_id, user_id)` as `status='left',
+/// left_at=NOW()` so the DB roster reflects live presence. Carries `user_id`
+/// (which the `meeting_participants` rows are keyed by, alongside `meeting_id`).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ParticipantLeftPayload {
+    room_id: String,
+    user_id: String,
 }
 
 /// Payload for [`MEETING_HOST_CHANGE_SUBJECT`]: one per-user host-flag delta
@@ -313,6 +362,17 @@ fn apply_member_host_flag(members: &mut [RoomMemberInfo], user_id: &str, is_host
 /// [`ChatServer::leave_rooms`] for unit tests.
 fn was_last_present_host(remaining_members: &[RoomMemberInfo], was_host: bool) -> bool {
     was_host && !remaining_members.iter().any(|m| m.is_host)
+}
+
+/// Whether `user_id` still has at least one live session in the room AFTER the
+/// departing session was removed from `remaining_members`. Used to SUPPRESS the
+/// per-participant `PARTICIPANT_LEFT` DB mark-left (issue #1551) when a user has
+/// another tab/session present: the `meeting_participants` row is keyed by
+/// `user_id`, so marking it left while another session is live would wrongly
+/// drop a still-present user from the participant count. Factored out of
+/// [`ChatServer::leave_rooms`] for unit tests.
+fn user_has_remaining_session(remaining_members: &[RoomMemberInfo], user_id: &str) -> bool {
+    remaining_members.iter().any(|m| m.user_id == user_id)
 }
 
 /// Cached per-room policy flags. Populated at first JoinRoom for the room and
@@ -1104,11 +1164,26 @@ impl ChatServer {
         // single-threaded, so exactly one departure sees the host count hit zero
         // and the end-meeting broadcast fires once.
         let mut was_last_host = false;
+        // Whether the departing user STILL has another live session in this room
+        // AFTER removing the departing session. Computed from the same
+        // post-removal `room_members` slice as `was_last_host`. When true, the
+        // user is still present (another tab / multi-session) and the
+        // per-participant `PARTICIPANT_LEFT` DB mark-left (issue #1551) MUST be
+        // suppressed — the DB row is keyed by `user_id`, so marking it left
+        // would wrongly drop a still-present user from the participant count.
+        // `true` is the SAFE default (suppress) when we can't read membership;
+        // we only ever publish mark-left when we positively observe no remaining
+        // session for this user. Defaults `false` here and is set to `true` only
+        // when a remaining same-user session is found.
+        let mut user_still_present = false;
         if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
                 room_became_empty = members.is_empty();
                 was_last_host = was_last_present_host(members, is_host);
+                if let Some(departing_uid) = user_id {
+                    user_still_present = user_has_remaining_session(members, departing_uid);
+                }
             } else {
                 was_last_host = is_host;
             }
@@ -1179,6 +1254,50 @@ impl ChatServer {
             }
 
             tokio::spawn(async move {
+                // Per-participant DB mark-left backstop (issue #1551). Tell
+                // meeting-api to set this participant `status='left',
+                // left_at=NOW()` so a disconnect that did NOT go through the
+                // REST `/leave` endpoint (closed tab / network drop / crash)
+                // stops being counted as present by the meeting-settings
+                // "Activity" participant count. Fired here — at the same
+                // post-grace, active-session departure point as the
+                // client-facing PARTICIPANT_LEFT broadcast below — so it
+                // inherits the reconnect-grace debounce. SUPPRESSED when the
+                // user still has another live session in the room
+                // (`user_still_present`), because the DB row is keyed by
+                // user_id and marking it left would drop a still-present user.
+                // Fires on every real departure branch (including the
+                // host-leave-ends-meeting path, where the host must also be
+                // recorded as no longer present). Best-effort: a publish error
+                // is logged and does not block the rest of the teardown. The
+                // consumer's UPDATE is idempotent and reconnect-safe (see
+                // db::participants::mark_left_by_disconnect).
+                if !user_still_present {
+                    let payload = ParticipantLeftPayload {
+                        room_id: room_id.clone(),
+                        user_id: user_id.clone(),
+                    };
+                    match serde_json::to_vec(&payload) {
+                        Ok(json) => {
+                            if let Err(e) = nc.publish(PARTICIPANT_LEFT_SUBJECT, json.into()).await
+                            {
+                                error!(
+                                    "Failed to publish {} for room {} user {}: {}",
+                                    PARTICIPANT_LEFT_SUBJECT, room_id, user_id, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize ParticipantLeftPayload: {}", e);
+                        }
+                    }
+                } else {
+                    info!(
+                        "Suppressing {} for user {} in room {} - another live session remains",
+                        PARTICIPANT_LEFT_SUBJECT, user_id, room_id
+                    );
+                }
+
                 // If the LAST present host is leaving and end_on_host_leave is
                 // set, end the meeting for all. `was_last_host` was computed
                 // above from the post-removal roster, so multi-session hosts
@@ -15047,6 +15166,41 @@ mod tests {
         assert!(
             !was_last_present_host(&host_other_session_remains, true),
             "a host with another live session must keep the meeting alive"
+        );
+    }
+
+    #[test]
+    fn test_user_has_remaining_session_gates_participant_left_mark() {
+        // The per-participant PARTICIPANT_LEFT DB mark-left (issue #1551) is
+        // suppressed when the departing user still has another live session in
+        // the room. This pins the `user_still_present` decision in
+        // `leave_rooms`: with the departing session already removed from the
+        // slice, the predicate answers "is this user still here?".
+
+        // alice has a second tab still present after one of her sessions leaves
+        // → still present → SUPPRESS the mark-left (don't drop her from count).
+        let after_alice_tab_leaves = vec![
+            member(2, "alice@example.com", false), // alice's remaining tab
+            member(3, "bob@example.com", false),
+        ];
+        assert!(
+            user_has_remaining_session(&after_alice_tab_leaves, "alice@example.com"),
+            "a user with another live session must be treated as still present"
+        );
+
+        // alice's LAST session leaves → no alice session remains → PUBLISH the
+        // mark-left (she really is gone now).
+        let after_alice_last_leaves = vec![member(3, "bob@example.com", false)];
+        assert!(
+            !user_has_remaining_session(&after_alice_last_leaves, "alice@example.com"),
+            "a user with no remaining session must be eligible for mark-left"
+        );
+
+        // An empty room (the last member left) → nobody remains → eligible.
+        let empty: Vec<RoomMemberInfo> = vec![];
+        assert!(
+            !user_has_remaining_session(&empty, "alice@example.com"),
+            "an empty room leaves no remaining session for the departing user"
         );
     }
 
