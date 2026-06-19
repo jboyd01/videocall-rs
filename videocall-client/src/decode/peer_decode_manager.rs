@@ -503,6 +503,33 @@ pub struct PeerReceiveDiag {
     pub audio: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
 }
 
+/// Per-peer self-reported device/hardware metrics (#1482). Populated from the
+/// sender's HealthPacket (cores/arch/OS/device-type are STATIC; main-thread
+/// load + used memory change each health tick, ~0.2 Hz at the 5 s default
+/// interval). Every field is OPTIONAL and is `None` when the sending browser's
+/// API is unavailable ("if available"). This is the UI contract surfaced by
+/// [`PeerDecodeManager::peer_device_info`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PeerDeviceInfo {
+    /// navigator.hardwareConcurrency (logical CPU cores).
+    pub client_cores: Option<u32>,
+    /// CPU/chip architecture, e.g. "arm" | "x86".
+    pub client_architecture: Option<String>,
+    /// Human OS + version, e.g. "macOS 14.5" | "Windows 11".
+    pub client_os: Option<String>,
+    /// "desktop" | "mobile" | "tablet".
+    pub client_device_type: Option<String>,
+    /// 0.0-1.0 main-thread busy fraction over the last health interval
+    /// (longtask sum / interval) — a CPU proxy, not system CPU.
+    pub client_main_thread_load: Option<f64>,
+    /// JS-heap used memory: HealthPacket.memory_used_bytes (bytes) divided by
+    /// 1 MiB (1024 * 1024). The `_mb` suffix follows the codebase's existing
+    /// heap-size labels; the unit is mebibytes (MiB), not decimal megabytes.
+    pub client_memory_used_mb: Option<f64>,
+    /// navigator.deviceMemory total-RAM tier in GB (coarse, browser-capped at 8).
+    pub client_device_memory_gb: Option<f64>,
+}
+
 /// Last in-place simulcast layer switch for this peer, stamped by Marker 1
 /// (issue #1460 observability). `ms == 0` is the never-switched sentinel.
 ///
@@ -543,6 +570,9 @@ pub struct Peer {
     /// does not populate the field.
     pub transport_type: TransportType,
     pub display_name: Option<String>,
+    /// #1482: this peer's self-reported device/hardware metrics, refreshed each
+    /// time a HealthPacket arrives. Every field is optional ("if available").
+    pub device_info: PeerDeviceInfo,
     /// Server-vouched guest indicator, sourced from the authenticated JWT
     /// `is_guest` claim and broadcast on `PARTICIPANT_JOINED`.
     pub is_guest: bool,
@@ -896,6 +926,7 @@ impl Peer {
             audio_level: 0.0,
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             display_name: None,
+            device_info: PeerDeviceInfo::default(),
             is_guest,
             visible: false,
             context_initialized: false,
@@ -1533,7 +1564,7 @@ impl Peer {
                 ),
                 metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
                 metric!("audio_level", self.audio_level as f64),
-                metric!("peer_transport", transport_str.to_string()),
+                metric!("peer_transport", transport_str),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -2293,6 +2324,11 @@ pub struct PeerDecodeManager {
     /// creates a peer later (after the first media packet arrives), the display
     /// name is immediately available and does not fall back to user_id/email.
     display_name_cache: HashMap<u64, String>,
+    /// #1482: Cache of session_id -> self-reported device info, populated from
+    /// HealthPackets. Mirrors `display_name_cache` so device info arriving
+    /// before the peer entry is created (via `ensure_peer()`) is not lost and is
+    /// applied once the peer is created; also survives transient peer churn.
+    device_info_cache: HashMap<u64, PeerDeviceInfo>,
     /// Cache of session_id -> is_guest, populated from PARTICIPANT_JOINED events.
     /// Mirrors `display_name_cache` so a guest flag arriving before the peer
     /// entry is created (via `ensure_peer()`) is still applied once the first
@@ -2364,6 +2400,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            device_info_cache: HashMap::new(),
             is_guest_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
@@ -2386,6 +2423,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            device_info_cache: HashMap::new(),
             is_guest_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
@@ -3283,6 +3321,11 @@ impl PeerDecodeManager {
             );
             peer.display_name = Some(cached_name.clone());
         }
+        // #1482: apply cached device info if a HealthPacket arrived before the
+        // first media packet created this peer entry.
+        if let Some(cached) = self.device_info_cache.get(&session_id) {
+            peer.device_info = cached.clone();
+        }
         self.connected_peers.insert(session_id, peer);
         // Phase 6: invalidate the sorted-keys cache so the next
         // `sorted_string_keys()` call rebuilds with the new peer.
@@ -3396,6 +3439,7 @@ impl PeerDecodeManager {
                 diag.remove_peer(&peer.sid_str);
             }
             self.display_name_cache.remove(&session_id);
+            self.device_info_cache.remove(&session_id);
             self.is_guest_cache.remove(&session_id);
             // Phase 6: invalidate the sorted-keys cache before notifying
             // observers so any read in the callback sees a fresh list.
@@ -3461,6 +3505,7 @@ impl PeerDecodeManager {
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
+        self.device_info_cache.clear();
         self.is_guest_cache.clear();
         // Phase 6: invalidate the sorted-keys cache and emit a single
         // batched event so observers can coalesce the bulk-clear into
@@ -3542,6 +3587,40 @@ impl PeerDecodeManager {
         // Also update the existing peer entry if it exists.
         if let Some(peer) = self.connected_peers.get_mut(&session_id) {
             peer.display_name = Some(display_name);
+        }
+    }
+
+    /// Store/merge a peer's self-reported device info (#1482), keyed by session_id.
+    /// Mirrors `set_peer_display_name`: writes the cache so info arriving before
+    /// the peer entry exists is not lost, and updates the live peer if present.
+    ///
+    /// MERGE POLICY: STATIC fields (cores, architecture, os, device_type,
+    /// device_memory_gb) use `incoming.or(existing)` so a tick where the browser
+    /// momentarily omits a field does NOT erase previously-known good data.
+    /// DYNAMIC fields (main_thread_load, memory_used_mb) ALWAYS take the latest
+    /// incoming value (including None -> None) since they are live gauges.
+    pub fn set_peer_device_info(&mut self, session_id: u64, incoming: PeerDeviceInfo) {
+        let existing = self
+            .device_info_cache
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        let merged = PeerDeviceInfo {
+            client_cores: incoming.client_cores.or(existing.client_cores),
+            client_architecture: incoming
+                .client_architecture
+                .or(existing.client_architecture),
+            client_os: incoming.client_os.or(existing.client_os),
+            client_device_type: incoming.client_device_type.or(existing.client_device_type),
+            client_device_memory_gb: incoming
+                .client_device_memory_gb
+                .or(existing.client_device_memory_gb),
+            client_main_thread_load: incoming.client_main_thread_load,
+            client_memory_used_mb: incoming.client_memory_used_mb,
+        };
+        self.device_info_cache.insert(session_id, merged.clone());
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.device_info = merged;
         }
     }
 
@@ -3686,6 +3765,20 @@ impl PeerDecodeManager {
             }
         }
         self.display_name_cache.get(&sid).cloned()
+    }
+
+    /// Get a peer's self-reported device info (#1482) by relay session_id.
+    /// THE UI CONTRACT: returns the live peer's `device_info` if the peer exists
+    /// and has at least one populated field, else falls back to the cache (info
+    /// may arrive before the peer entry is created), else `None`. The returned
+    /// struct is a clone; reading it does NOT mutate state or trigger a render.
+    pub fn peer_device_info(&self, session_id: u64) -> Option<PeerDeviceInfo> {
+        if let Some(peer) = self.connected_peers.get(&session_id) {
+            if peer.device_info != PeerDeviceInfo::default() {
+                return Some(peer.device_info.clone());
+            }
+        }
+        self.device_info_cache.get(&session_id).cloned()
     }
 
     /// Get the server-vouched guest status for a peer by session_id string.
@@ -3889,6 +3982,7 @@ mod tests {
             audio_enabled: false,
             screen_enabled: false,
             display_name: None,
+            device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
             context_initialized: false,
@@ -7529,6 +7623,7 @@ mod tests {
                 audio_enabled: false,
                 screen_enabled: false,
                 display_name: None,
+                device_info: PeerDeviceInfo::default(),
                 is_guest: false,
                 visible: false,
                 context_initialized: false,
@@ -7636,6 +7731,7 @@ mod tests {
             audio_enabled: false,
             screen_enabled: false,
             display_name: None,
+            device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
             context_initialized: false,
@@ -7714,6 +7810,7 @@ mod tests {
             audio_enabled: false,
             screen_enabled: false,
             display_name: None,
+            device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
             context_initialized: false,
@@ -7837,6 +7934,232 @@ mod tests {
         let manager = PeerDecodeManager::new();
         let name = manager.get_peer_display_name("999");
         assert_eq!(name, None, "should return None for unknown session_id");
+    }
+
+    // -- #1482: peer device_info store + getter + merge tests -----------------
+    //
+    // NATIVE/HOST `#[test]`s (NOT `#[wasm_bindgen_test]`) so they actually run
+    // in CI's native test job and can be run + mutation-tested locally. They
+    // exercise the cache path only (set_peer_device_info / peer_device_info),
+    // which needs no browser APIs.
+
+    /// Round-trip: store device info via `set_peer_device_info`, read it back via
+    /// the `peer_device_info` getter (cache fallback, no peer entry). Asserts
+    /// every populated field round-trips exactly. Mutation coverage: breaking the
+    /// getter (e.g. `return None;`) makes every assert below fail.
+    #[test]
+    fn device_info_round_trips_through_cache() {
+        let mut manager = PeerDecodeManager::new();
+        let info = PeerDeviceInfo {
+            client_cores: Some(8),
+            client_architecture: Some("arm".to_string()),
+            client_os: Some("macOS 14.5".to_string()),
+            client_device_type: Some("desktop".to_string()),
+            client_main_thread_load: Some(0.42),
+            client_memory_used_mb: Some(128.0),
+            client_device_memory_gb: Some(8.0),
+        };
+        manager.set_peer_device_info(42, info);
+
+        let got = manager
+            .peer_device_info(42)
+            .expect("device info should be stored and retrievable");
+        assert_eq!(got.client_cores, Some(8));
+        assert_eq!(got.client_architecture.as_deref(), Some("arm"));
+        assert_eq!(got.client_os.as_deref(), Some("macOS 14.5"));
+        assert_eq!(got.client_device_type.as_deref(), Some("desktop"));
+        assert_eq!(got.client_main_thread_load, Some(0.42));
+        assert_eq!(got.client_memory_used_mb, Some(128.0));
+        assert_eq!(got.client_device_memory_gb, Some(8.0));
+    }
+
+    /// Merge policy: STATIC fields survive a later tick that omits them;
+    /// DYNAMIC fields always take the latest value, including `None`.
+    /// Mutation coverage: changing the static merge to `incoming.client_os`
+    /// (dropping `.or(existing)`) makes the "os survives" assert fail; changing
+    /// the dynamic field to `.or(existing)` makes the "main_thread_load -> None"
+    /// assert fail.
+    #[test]
+    fn device_info_merge_preserves_static_and_updates_dynamic() {
+        let mut manager = PeerDecodeManager::new();
+
+        // First tick: static fields present, dynamic absent.
+        manager.set_peer_device_info(
+            7,
+            PeerDeviceInfo {
+                client_os: Some("macOS 14.5".to_string()),
+                client_cores: Some(8),
+                ..Default::default()
+            },
+        );
+
+        // Second tick: static fields ABSENT, dynamic present. Static must
+        // survive; dynamic must update.
+        manager.set_peer_device_info(
+            7,
+            PeerDeviceInfo {
+                client_main_thread_load: Some(0.3),
+                ..Default::default()
+            },
+        );
+        let got = manager.peer_device_info(7).expect("entry should exist");
+        assert_eq!(
+            got.client_os.as_deref(),
+            Some("macOS 14.5"),
+            "static os must survive a tick that omits it"
+        );
+        assert_eq!(
+            got.client_cores,
+            Some(8),
+            "static cores must survive a tick that omits it"
+        );
+        assert_eq!(
+            got.client_main_thread_load,
+            Some(0.3),
+            "dynamic load must take the latest incoming value"
+        );
+
+        // Third tick: dynamic field explicitly None. It must become None
+        // (dynamic gauges take the latest, including None).
+        manager.set_peer_device_info(
+            7,
+            PeerDeviceInfo {
+                client_main_thread_load: None,
+                ..Default::default()
+            },
+        );
+        let got = manager.peer_device_info(7).expect("entry should exist");
+        assert_eq!(
+            got.client_main_thread_load, None,
+            "dynamic load must take latest None (live gauge), not retain old value"
+        );
+        assert_eq!(
+            got.client_os.as_deref(),
+            Some("macOS 14.5"),
+            "static os must still survive across the third tick"
+        );
+    }
+
+    /// Unknown session_id → getter returns None.
+    #[test]
+    fn device_info_returns_none_for_unknown_session() {
+        let manager = PeerDecodeManager::new();
+        assert_eq!(
+            manager.peer_device_info(999),
+            None,
+            "should return None for an unknown session_id"
+        );
+    }
+
+    /// LIVE-PEER getter branch: when a peer entry exists and its `device_info`
+    /// is non-default, `peer_device_info` returns the LIVE peer's struct, NOT
+    /// the cache. Uses the same construction idiom as the display_name live-peer
+    /// tests (`make_test_peer` + `connected_peers.insert`), which uses no-op
+    /// decoders and links natively.
+    ///
+    /// To make the branch choice OBSERVABLE (the setter normally writes the
+    /// cache and the live peer identically, which would make both paths return
+    /// equal values), this test deliberately DIVERGES them: the cache holds one
+    /// value, the live peer holds a different one, written directly. The getter
+    /// must return the LIVE value. Mutation coverage: changing the getter's
+    /// live-peer branch to `return None;` (or deleting it so it falls through to
+    /// the cache) makes the getter return the CACHE value (cores=99) and the
+    /// assertions below fail.
+    #[test]
+    fn device_info_live_peer_branch_is_read() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 55;
+
+        // Seed the cache with a DISTINCT value (cores=99) via the public setter.
+        manager.set_peer_device_info(
+            session_id,
+            PeerDeviceInfo {
+                client_cores: Some(99),
+                client_os: Some("cache-only".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Create a live peer entry and write a DIFFERENT device_info directly on
+        // it (bypassing the setter so the cache and the live peer diverge).
+        let (mut peer, _muted) = make_test_peer(session_id);
+        let live_info = PeerDeviceInfo {
+            client_cores: Some(12),
+            client_os: Some("Windows 11".to_string()),
+            client_main_thread_load: Some(0.17),
+            ..Default::default()
+        };
+        peer.device_info = live_info.clone();
+        manager.connected_peers.insert(session_id, peer);
+
+        // The getter MUST return the LIVE peer's value (cores=12), not the
+        // cache value (cores=99). If the live-peer branch is removed, the
+        // getter falls through to the cache and these fail.
+        let got = manager
+            .peer_device_info(session_id)
+            .expect("live peer device_info should be returned");
+        assert_eq!(
+            got.client_cores,
+            Some(12),
+            "getter must read the LIVE peer (cores=12), not the cache (cores=99)"
+        );
+        assert_eq!(got.client_os.as_deref(), Some("Windows 11"));
+        assert_eq!(got.client_main_thread_load, Some(0.17));
+        assert_eq!(
+            got, live_info,
+            "getter must return exactly the LIVE peer's device_info"
+        );
+    }
+
+    /// HYDRATE-ON-CREATION: when `set_peer_device_info` seeds the cache BEFORE
+    /// the peer entry exists, `add_peer` (the real media-packet path) must
+    /// hydrate the new peer's `device_info` from the cache.
+    ///
+    /// WASM-ONLY: this exercises the REAL hydration block inside `add_peer`,
+    /// which calls `Peer::new` -> `Self::new_decoders` (WebCodecs / canvas).
+    /// Those browser APIs cannot link/run under a native `cargo test`, so this
+    /// is a `#[wasm_bindgen_test]` like the existing `add_peer` test
+    /// (`sorted_string_keys_invalidates_on_add_peer`). It does NOT run in the
+    /// native test job. Mutation coverage: commenting out the hydration line
+    /// `peer.device_info = cached.clone();` in `add_peer` makes the final
+    /// assertion fail (the live peer would keep the default empty device_info).
+    #[wasm_bindgen_test]
+    fn device_info_hydrates_live_peer_from_cache_on_add_peer() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 56;
+
+        // Seed the cache BEFORE any peer entry exists (HealthPacket arriving
+        // before the first media packet).
+        let info = PeerDeviceInfo {
+            client_cores: Some(4),
+            client_architecture: Some("arm".to_string()),
+            client_device_type: Some("mobile".to_string()),
+            ..Default::default()
+        };
+        manager.set_peer_device_info(session_id, info.clone());
+        assert!(
+            !manager.connected_peers.contains_key(&session_id),
+            "no peer entry should exist yet (cache-only)"
+        );
+
+        // Create the peer via the real path so the hydration block runs.
+        manager
+            .add_peer("user56@test.com", session_id, None)
+            .expect("add_peer should succeed");
+
+        // The newly-created LIVE peer must have been hydrated from the cache.
+        let live = manager
+            .connected_peers
+            .get(&session_id)
+            .map(|p| p.device_info.clone())
+            .expect("peer should exist after add_peer");
+        assert_eq!(live.client_cores, Some(4));
+        assert_eq!(live.client_architecture.as_deref(), Some("arm"));
+        assert_eq!(live.client_device_type.as_deref(), Some("mobile"));
+        assert_eq!(
+            live, info,
+            "add_peer must hydrate the live peer's device_info from the cache"
+        );
     }
 
     // -- Phase 6: sorted_string_keys memoisation tests --------------------

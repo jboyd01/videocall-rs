@@ -456,6 +456,20 @@ pub fn PeerTile(
         None
     };
 
+    // #1482: this peer's self-reported device/hardware metrics for the popup's
+    // compact "Device" line. Resolved the SAME way as `sig_receive_diag`
+    // (parse the tile key as session_id, look up live via the client) and only
+    // while the popup is open. `None` (unknown / nothing reported) → the popup
+    // omits the Device line.
+    let sig_device_info = if show_signal_popup {
+        peer_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|sid| client.peer_device_info(sid))
+    } else {
+        None
+    };
+
     let appearance = use_context::<AppearanceSettingsCtx>().0();
 
     // Only show mute button when: viewer is host, peer is not self, peer is unmuted.
@@ -616,6 +630,7 @@ pub fn PeerTile(
             transport: sig_transport,
             meter_mode,
             receive_diag: sig_receive_diag,
+            device_info: sig_device_info,
             badge_transport,
         },
         SignalPopupHandlers {

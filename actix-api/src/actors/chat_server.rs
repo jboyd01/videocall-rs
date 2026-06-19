@@ -54,8 +54,8 @@ use tracing::{debug, error, info, trace, warn};
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
     RELAY_CONGESTION_FILTERED_TOTAL, RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL,
-    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
-    RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
+    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_INNER_SESSION_SELF_FILTERED_TOTAL,
+    RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
     RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
     RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
@@ -4444,14 +4444,6 @@ fn handle_msg(
     // exclusively on this receiver's single NATS subscription task.
     let relay_state: Cell<DownlinkRelayState> = Cell::new(DownlinkRelayState::new());
 
-    // TEMPORARY instrumentation (#1486) — verifies the #1481 root cause on a live
-    // high-RTT WT receiver before we code the fix. Holds the epoch-now at which we
-    // last emitted the relief-staleness line for THIS session, so the log is
-    // rate-limited to ~once/sec/session and cannot flood the relay log. `0` (==
-    // never-logged) is safe: real epoch-now values are always `>= 1`. Remove this
-    // Cell together with the log block once #1481 is settled.
-    let last_relief_log_epoch: Cell<u64> = Cell::new(0);
-
     // --- #1219 Half 2: emit-DOWNLINK_CONGESTION handoff ---
     //
     // The forwarding closure is SYNCHRONOUS and runs on the relay's hottest path
@@ -4563,6 +4555,19 @@ fn handle_msg(
             subject_self || inner_session_self
         };
         if drop_self_echo && !is_congestion && !is_layer_hint && !is_downlink_congestion {
+            // Count ONLY the #618 post-reconnect leak shape: the embedded inner
+            // session_id matched our OWN session, but the NATS subject did NOT
+            // (it pointed at a STALE/different session). A routine self-echo is
+            // EXCLUDED here because the relay stamps the inner session_id on
+            // publish (`session_id = session` at the publish path above), so an
+            // ordinary echo arrives with BOTH subject_self AND inner_session_self
+            // true — the `!subject_self` arm filters it out so the leak signal is
+            // not drowned by routine self-echo volume (#629).
+            if inner_session_self && !subject_self {
+                RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+                    .with_label_values(&[&room])
+                    .inc();
+            }
             return Ok(());
         }
 
@@ -4777,50 +4782,72 @@ fn handle_msg(
             };
 
             if is_video {
-                // ----- Viewport filter (#988): "is this SENDER wanted?" -----
+                // ----- #1436 kill switch for the #988 viewport filter -----
                 //
-                // Read the viewport set ONCE: derive both the drop decision and
-                // the current set size from a single guard so the debug log on
-                // the drop path costs no extra RwLock read (the drop path runs
-                // at near-full inbound VIDEO rate per receiver during a viewport
-                // collapse — exactly when this log matters most). A poisoned
-                // lock fails OPEN (forward); an unparseable source (`None`) also
-                // fails OPEN.
-                let (drop_video, viewport_len) = match source {
-                    Some(src) => desired_streams
-                        .read()
-                        .map(|st| (!st.ids.is_empty() && !st.ids.contains(&src), st.ids.len()))
-                        .unwrap_or((false, 0)),
-                    None => (false, 0),
-                };
-                if drop_video {
-                    // Intentional, viewport-driven drop — accounted on a
-                    // DEDICATED counter so it never pollutes the backpressure
-                    // (mailbox-full) drop metric / its dashboards & alerts.
-                    RELAY_VIEWPORT_FILTERED_TOTAL
+                // Read the kill-switch flag ONCE via the memoized OnceLock
+                // accessor (cheap atomic load on this hot path). When the
+                // filter is DISABLED, the entire viewport decision AND its
+                // accounting (the FILTERED / FORWARDED counters) are skipped —
+                // the counters intentionally do not run because the filter is
+                // off — and VIDEO falls straight through to the #989 layer
+                // filter below, dropping nothing on the viewport.
+                let viewport_enabled = crate::constants::viewport_filter_enabled();
+                if viewport_enabled {
+                    // ----- Viewport filter (#988): "is this SENDER wanted?" -----
+                    //
+                    // Read the viewport set ONCE: derive both the drop decision and
+                    // the current set size from a single guard so the debug log on
+                    // the drop path costs no extra RwLock read (the drop path runs
+                    // at near-full inbound VIDEO rate per receiver during a viewport
+                    // collapse — exactly when this log matters most). A poisoned
+                    // lock fails OPEN (forward); an unparseable source (`None`) also
+                    // fails OPEN.
+                    let (drop_video, viewport_len) = match source {
+                        // `viewport_should_drop`'s first arg is `true` ON PURPOSE: the
+                        // enclosing `if viewport_enabled` is the live #1436 kill switch,
+                        // so the filter is already known-enabled here. The helper's
+                        // `enabled` flag is exercised by its unit tests (forward-all when
+                        // false); the hot path never reaches it disabled.
+                        Some(_) => desired_streams
+                            .read()
+                            .map(|st| {
+                                (
+                                    crate::constants::viewport_should_drop(true, &st.ids, source),
+                                    st.ids.len(),
+                                )
+                            })
+                            .unwrap_or((false, 0)),
+                        None => (false, 0),
+                    };
+                    if drop_video {
+                        // Intentional, viewport-driven drop — accounted on a
+                        // DEDICATED counter so it never pollutes the backpressure
+                        // (mailbox-full) drop metric / its dashboards & alerts.
+                        RELAY_VIEWPORT_FILTERED_TOTAL
+                            .with_label_values(&[&room])
+                            .inc();
+                        // DEBUG (not trace) so a SCOPED `RUST_LOG=...chat_server=debug`
+                        // — not global trace — can reconstruct who-dropped-what-from-whom
+                        // for one room: receiver session, the SUBJECT-derived source
+                        // (#994: derived from the NATS subject, not the forgeable payload
+                        // session_id), and the current viewport set size (a collapse
+                        // toward 0/1 is the wrongly-dropping signature). Per-source
+                        // forensics live HERE, never in metric labels (cardinality).
+                        // `viewport_len` was captured from the single decision read
+                        // above — no second lock on the hot drop path.
+                        debug!(
+                            "Viewport drop: off-screen VIDEO from subject-derived source {:?} for receiver session {} in room {} (viewport set size {})",
+                            source, session, room, viewport_len
+                        );
+                        return Ok(());
+                    }
+                    // Forwarded VIDEO — the denominator complement of the filtered
+                    // counter (HCL #988). Mutually exclusive with the drop branch
+                    // above; together they cover every VIDEO packet at the filter.
+                    RELAY_VIEWPORT_FORWARDED_TOTAL
                         .with_label_values(&[&room])
                         .inc();
-                    // DEBUG (not trace) so a SCOPED `RUST_LOG=...chat_server=debug`
-                    // — not global trace — can reconstruct who-dropped-what-from-whom
-                    // for one room: receiver session, the SUBJECT-derived source
-                    // (#994: derived from the NATS subject, not the forgeable payload
-                    // session_id), and the current viewport set size (a collapse
-                    // toward 0/1 is the wrongly-dropping signature). Per-source
-                    // forensics live HERE, never in metric labels (cardinality).
-                    // `viewport_len` was captured from the single decision read
-                    // above — no second lock on the hot drop path.
-                    debug!(
-                        "Viewport drop: off-screen VIDEO from subject-derived source {:?} for receiver session {} in room {} (viewport set size {})",
-                        source, session, room, viewport_len
-                    );
-                    return Ok(());
                 }
-                // Forwarded VIDEO — the denominator complement of the filtered
-                // counter (HCL #988). Mutually exclusive with the drop branch
-                // above; together they cover every VIDEO packet at the filter.
-                RELAY_VIEWPORT_FORWARDED_TOTAL
-                    .with_label_values(&[&room])
-                    .inc();
             }
 
             // ----- Layer filter (#989): "which LAYER of a wanted sender?" -----
@@ -4939,45 +4966,6 @@ fn handle_msg(
         // at base-layer-only video indefinitely).
         let relief_epoch = downlink_congested_epoch.load(AtomicOrdering::Relaxed);
         let congested_now = downlink_epoch_is_active(relief_epoch, RECEIVER_DOWNLINK_RELIEF_WINDOW);
-
-        // --- TEMPORARY instrumentation (#1486) — REMOVE once #1481 is settled ---
-        //
-        // Confirms the #1481 root cause on a live high-RTT WT receiver: is the
-        // relief read seeing a STALE epoch (the relief-stamp window decaying
-        // between WT's clustered drop bursts → `now - epoch` routinely 2-10s while
-        // `Receiver-downlink overflow` warns still fire), or is the epoch never
-        // stamped at all (`relief_epoch == DOWNLINK_EPOCH_NEVER` despite overflows
-        // → a `stamp_downlink_epoch_if_congested` gating bug, not the freshness
-        // story)? We can't prove the runtime drop time-distribution from a static
-        // code trace, so we read it here.
-        //
-        // Only logged for receivers that have crossed congestion at least once
-        // (`relief_epoch != DOWNLINK_EPOCH_NEVER`) — a never-congested receiver
-        // would emit nothing useful and just flood the log. Rate-limited to
-        // ~once/sec/session via `last_relief_log_epoch`.
-        {
-            use crate::actors::session_logic::{
-                downlink_congested_epoch_now, DOWNLINK_EPOCH_NEVER,
-            };
-            if relief_epoch != DOWNLINK_EPOCH_NEVER {
-                let now = downlink_congested_epoch_now();
-                let last_logged = last_relief_log_epoch.get();
-                if last_logged == 0 || now.saturating_sub(last_logged) >= 1000 {
-                    last_relief_log_epoch.set(now);
-                    info!(
-                        "[#1486] downlink-relief read: session={} transport={} room={} \
-                         epoch={} now={} staleness_ms={} congested_now={}",
-                        session,
-                        transport,
-                        room,
-                        relief_epoch,
-                        now,
-                        now.saturating_sub(relief_epoch),
-                        congested_now,
-                    );
-                }
-            }
-        }
 
         // Edge-detect the episode so the metrics + the one-shot DOWNLINK_CONGESTION
         // emit each fire exactly once per congested episode. Running this on every
@@ -7407,6 +7395,223 @@ mod tests {
             1.0,
             "#1220: dropping a non-target CONGESTION must increment \
              relay_congestion_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #618 (the leak) / #629 (this metric): a DIAGNOSTICS packet that arrives on
+    /// a STALE post-reconnect subject (subject session != our current session)
+    /// but carries our OWN session_id embedded must be dropped by the
+    /// inner-`session_id` self-skip (`inner_session_self`), and that drop must
+    /// increment `relay_inner_session_self_filtered_total{room}` exactly once.
+    /// This reproduces the 2026-05-08 production leak where a stale subscription
+    /// survived a reconnect and delivered self-DIAGNOSTICS back to the reporter.
+    ///
+    /// MUTATION PROOF: removing the `inner_session_self` operand from
+    /// `drop_self_echo` (so a non-self subject no longer triggers the self-skip)
+    /// forwards the DIAGNOSTICS packet -> `count` becomes 1, failing assert (a);
+    /// removing the `.inc()` inside the `if inner_session_self` guard makes the
+    /// metric delta 0.0, failing assert (b).
+    #[actix_rt::test]
+    async fn test_handle_msg_self_diagnostics_inner_session_dropped_and_metric_incremented() {
+        let room = "self-diag-inner-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver's CURRENT session is 8888. The packet arrives on a STALE
+        // subject keyed to an old session (1234) — what a subscription that
+        // survived a reconnect would deliver — but its embedded session_id is
+        // still 8888 (our own), exactly the #618 leak shape.
+        let (handler, _emit_downlink_congestion) = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            8888,
+            false,
+            "reporter-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.1234"),
+            make_packet_bytes_with_session(PacketType::DIAGNOSTICS, 8888),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "#618: self-DIAGNOSTICS on a STALE post-reconnect subject whose \
+             embedded session_id still equals our current session (8888) must \
+             be dropped by the inner-session self-skip, NOT forwarded"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            1.0,
+            "#629: the inner-session self-skip drop must increment \
+             relay_inner_session_self_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #629: a PLAIN self-echo — a packet on the receiver's OWN subject with no
+    /// embedded session_id (inner session_id 0) — is dropped via `subject_self`,
+    /// NOT via the inner-`session_id` arm. The
+    /// `relay_inner_session_self_filtered_total` counter MUST NOT fire for it,
+    /// because #629 specifically wants to surface the post-reconnect inner-id
+    /// leak rate, not ordinary (expected, uninteresting) subject self-echoes.
+    ///
+    /// MUTATION PROOF: moving the `.inc()` OUTSIDE the `if inner_session_self`
+    /// guard (so it increments on every self-echo drop, including plain
+    /// `subject_self` echoes) makes this delta 1.0, failing assert (b).
+    #[actix_rt::test]
+    async fn test_handle_msg_inner_session_self_metric_not_incremented_for_plain_subject_echo() {
+        let room = "plain-echo-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver's session is 5555 and the packet arrives on its OWN subject
+        // (`room.{room}.5555`). The inner session_id stays 0, so
+        // `inner_session_self` is false and `subject_self` is true: the drop
+        // happens via the plain subject self-echo path, which must NOT touch the
+        // inner-session metric.
+        let (handler, _emit_downlink_congestion) = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            5555,
+            false,
+            "self-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.5555"),
+            make_packet_bytes(PacketType::MEDIA),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "a MEDIA packet on the receiver's own subject must be dropped as a \
+             plain subject_self echo"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            0.0,
+            "#629: a plain subject_self echo (inner session_id 0) must NOT \
+             increment relay_inner_session_self_filtered_total"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #629 over-count regression guard: an ORDINARY relay-stamped self-echo —
+    /// subject == our OWN subject AND inner session_id == our session — must NOT
+    /// increment `relay_inner_session_self_filtered_total`. The relay stamps
+    /// `session_id = session` on publish (the publish path stamps id when the
+    /// client sent 0), so a routine self-echo arrives with BOTH `subject_self`
+    /// and `inner_session_self` true. The increment guard's `!subject_self` arm
+    /// excludes it; only the #618 leak shape (inner-id match WITHOUT subject
+    /// match) is counted. Without this exclusion the leak signal would be
+    /// drowned by routine self-echo volume.
+    ///
+    /// MUTATION PROOF: reverting the guard from `if inner_session_self &&
+    /// !subject_self` back to `if inner_session_self` makes this stamped own-
+    /// subject echo increment the metric -> delta becomes 1.0 -> assert (b)
+    /// FAILS. That is exactly the over-count bug this guard closes.
+    #[actix_rt::test]
+    async fn test_handle_msg_inner_session_self_metric_not_incremented_for_stamped_own_subject_echo(
+    ) {
+        let room = "stamped-echo-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver session 4242. This is the RELAY-STAMPED routine echo shape:
+        // the packet arrives on the receiver's OWN subject (`room.{room}.4242`)
+        // AND carries inner session_id 4242 (non-zero, as the publish stamp
+        // sets it). subject_self TRUE and inner_session_self TRUE — the routine
+        // echo the OLD `if inner_session_self` guard wrongly counted.
+        let (handler, _emit_downlink_congestion) = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            4242,
+            false,
+            "self-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.4242"),
+            make_packet_bytes_with_session(PacketType::MEDIA, 4242),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "a relay-stamped own-subject self-echo must be dropped \
+             (subject_self || inner_session_self), NOT forwarded"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            0.0,
+            "#629: an ordinary relay-stamped own-subject echo (subject_self AND \
+             inner_session_self both true) must NOT increment \
+             relay_inner_session_self_filtered_total — the `!subject_self` arm \
+             excludes it"
         );
 
         // Leave no residual series for the #996 GC guard / other tests.

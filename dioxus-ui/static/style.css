@@ -1497,6 +1497,17 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-size: 0.85em;
 }
 
+/* issue 1480: build-info grid column count tracks whether github info
+   (Commit + Branch) is shown. --git = Component/Commit/Branch/Built (4 col);
+   --nogit = Component/Built (2 col). Cells use display:contents rows so the
+   grid column count must equal the spans rendered per row. */
+.build-info-table--git {
+  grid-template-columns: 1fr auto auto auto;
+}
+.build-info-table--nogit {
+  grid-template-columns: 1fr auto;
+}
+
 .build-info-header {
   display: contents;
 }
@@ -7758,6 +7769,29 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .signal-popup-layer-row__kind {
   text-transform: capitalize;
 }
+/* Compact per-peer device / hardware line (issue 1482). One dot-separated
+   summary at the bottom of the signal-quality popup; mirrors the Layers
+   section's header treatment and top border so it reads as a sibling block. */
+.signal-popup-device {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--signal-popup-border);
+}
+.signal-popup-device__head {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.signal-popup-device__line {
+  display: block;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  word-break: break-word;
+}
 .signal-chart-tooltip {
   position: fixed;
   background: var(--tooltip-bg);
@@ -9694,4 +9728,50 @@ details.perf-peers[open] .perf-peers__chev {
   font-style: italic;
   color: var(--text-tertiary);
   padding-left: 8px;
+}
+
+/* Per-peer device / hardware block (issue 1482). Lives at the bottom of the
+   "Receiving (per peer)" diagnostics breakdown; matches the simulcast-recv
+   typography so it reads as part of the same section. */
+.diag-device {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.diag-device-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.diag-device-peer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 8px;
+}
+
+.diag-device-peer-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+}
+
+.diag-device-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  padding-left: 8px;
+}
+
+.diag-device-row-label {
+  color: var(--text-secondary);
+}
+
+.diag-device-row-value {
+  font-variant-numeric: tabular-nums;
 }

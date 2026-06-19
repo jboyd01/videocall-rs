@@ -41,6 +41,20 @@ pub struct RuntimeConfig {
     #[serde(rename = "transportBadgeEnabled")]
     #[serde(default)]
     pub transport_badge_enabled: String,
+    /// Issue #1480: whether client/server build info may display github info
+    /// (git commit SHA + branch) in the About modal and diagnostics build-info
+    /// table. FAIL-CLOSED: absent / empty / falsey -> false (github info hidden),
+    /// so a production config.js that omits the key never leaks commit/branch.
+    /// Non-production (committed dev config.js / e2e) sets it "true". Version and
+    /// build timestamp are always shown regardless of this flag.
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): `#[serde(default)]`
+    /// so a stale bind-mounted `config.js` that predates this key still parses —
+    /// a missing key yields the empty-string default (-> `truthy` returns false ->
+    /// github info hidden), never a startup-bricking parse failure.
+    #[serde(rename = "showBuildGitInfo")]
+    #[serde(default)]
+    pub show_build_git_info: String,
     #[serde(rename = "firefoxEnabled")]
     #[serde(default)]
     pub firefox_enabled: String,
@@ -465,6 +479,32 @@ pub fn split_users(s: Option<&str>) -> Vec<String> {
     }
 }
 
+/// Issue #1480: compact a build timestamp to just its calendar date for tight
+/// UI surfaces (home footer, diagnostics build-info table). Splits an ISO
+/// `2026-06-18T14:30:00Z` on `'T'` and returns the date part `2026-06-18`.
+/// Returns `None` for the build.rs failure sentinel `"unknown"` or an empty
+/// string so callers can OMIT the date entirely (graceful degradation) rather
+/// than printing a useless token. An already-bare date is returned unchanged.
+pub(crate) fn build_date(ts: &str) -> Option<String> {
+    let trimmed = ts.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return None;
+    }
+    Some(trimmed.split('T').next().unwrap_or(trimmed).to_string())
+}
+
+/// Issue #1480: truncate a git SHA to its first 7 characters (canonical short
+/// form). Returns `"unknown"` when empty and the input unchanged when already
+/// shorter than 7 chars (or non-ASCII — `chars().take` is scalar-safe). Moved
+/// here from `about_modal.rs` so the About modal and diagnostics build-info
+/// table share one implementation (no drift).
+pub(crate) fn short_sha(sha: &str) -> String {
+    if sha.is_empty() {
+        return "unknown".to_string();
+    }
+    sha.chars().take(7).collect()
+}
+
 pub fn search_api_base_url() -> Result<Option<String>, String> {
     app_config().map(|c| c.search_api_base_url)
 }
@@ -492,6 +532,24 @@ pub fn webtransport_enabled() -> Result<bool, String> {
 /// `transport_badge_enabled().unwrap_or(false)`.
 pub fn transport_badge_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.transport_badge_enabled.as_str())))
+}
+
+/// Pure core of [`show_build_git_info`], split out so it is host-unit-testable
+/// (the accessor calls `app_config()` -> `window()`, which is wasm-only). Issue #1480.
+fn git_info_visible(flag: &str) -> bool {
+    truthy(Some(flag))
+}
+
+/// Issue #1480: whether client/server build info may display github info
+/// (git commit SHA + branch) in the About modal and diagnostics build-info
+/// table. FAIL-CLOSED: absent / empty / falsey -> false (github info hidden),
+/// so a production config.js that omits the key never leaks commit/branch.
+/// Non-production (committed dev config.js / e2e) sets it "true". Version and
+/// build timestamp are always shown regardless of this flag.
+pub fn show_build_git_info() -> bool {
+    app_config()
+        .map(|c| git_info_visible(c.show_build_git_info.as_str()))
+        .unwrap_or(false)
 }
 pub fn oauth_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.oauth_enabled.as_str())))
@@ -817,5 +875,69 @@ mod log_level_tests {
             LevelFilter::Debug,
             "absent logLevel must bump collection to Debug (historical capture)"
         );
+    }
+}
+
+#[cfg(test)]
+mod build_info_tests {
+    use super::{build_date, git_info_visible, short_sha};
+
+    /// Issue #1480: pins the FAIL-CLOSED default. Empty / falsey -> github info
+    /// hidden; only an explicit truthy ("true"/"1") shows it. The accessor
+    /// `show_build_git_info()` wraps this with `.unwrap_or(false)`, so an
+    /// unreadable config is ALSO hidden. We call `git_info_visible` directly (not
+    /// the wasm-only accessor) and never assert truthy against itself.
+    #[test]
+    fn git_info_visible_fails_closed() {
+        assert!(
+            !git_info_visible(""),
+            "empty must hide github info (fail-closed)"
+        );
+        assert!(!git_info_visible("false"), "falsey must hide github info");
+        assert!(git_info_visible("true"), "explicit true shows github info");
+        assert!(git_info_visible("1"), "1 is truthy -> shows github info");
+    }
+
+    /// Issue #1480: full ISO timestamp compacts to its date; the build.rs failure
+    /// sentinel and blank inputs return None (caller omits the token); an
+    /// already-bare date passes through unchanged.
+    #[test]
+    fn build_date_compacts_and_degrades() {
+        assert_eq!(
+            build_date("2026-06-18T14:30:00Z"),
+            Some("2026-06-18".to_string())
+        );
+        assert_eq!(build_date("unknown"), None);
+        assert_eq!(build_date(""), None);
+        assert_eq!(build_date("  "), None);
+        assert_eq!(
+            build_date("2026-06-18"),
+            Some("2026-06-18".to_string()),
+            "already-bare date returned unchanged"
+        );
+    }
+
+    /// Issue #1480: moved verbatim from about_modal.rs so the shared `short_sha`
+    /// stays pinned. Truncates to 7 chars; "unknown" on empty; short/unicode
+    /// inputs pass through (chars().take is scalar-safe).
+    #[test]
+    fn short_sha_truncates_long_sha() {
+        assert_eq!(short_sha("abcdef1234567890"), "abcdef1");
+    }
+
+    #[test]
+    fn short_sha_keeps_short_input() {
+        assert_eq!(short_sha("abc"), "abc");
+    }
+
+    #[test]
+    fn short_sha_handles_empty() {
+        assert_eq!(short_sha(""), "unknown");
+    }
+
+    #[test]
+    fn short_sha_handles_unicode_safely() {
+        let emoji = "abc\u{1F600}\u{1F601}";
+        assert_eq!(short_sha(emoji), emoji);
     }
 }

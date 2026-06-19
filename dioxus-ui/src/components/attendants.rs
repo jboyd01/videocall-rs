@@ -19,8 +19,8 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
     is_sole_real_tile, merge_pinned_decode, merge_user_requested_decode, partition_camera_tiles,
-    promote_pinned_into_decoded, promote_requested_into_decoded, BudgetSample, BudgetState,
-    BudgetStep, MIN_CAP,
+    promote_pinned_into_decoded, promote_requested_into_decoded,
+    should_clear_force_decode_on_override_change, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
@@ -92,8 +92,11 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 /// Minimum width (px) a drawer can be dragged to. Below this the panel chrome
-/// (headers, controls) stops being usable.
-const DRAWER_MIN_WIDTH: f64 = 240.0;
+/// (headers, controls) stops being usable. The floor is driven by the
+/// connection-manager section's Progress `.status-item` row (a `.progress-container`
+/// with min-width 120px plus its "Progress:" label) — see issue 1482; 300px keeps
+/// that row from overflowing inside the section/sidebar padding chrome.
+const DRAWER_MIN_WIDTH: f64 = 300.0;
 /// Absolute maximum drawer width (px). The per-side cap is the smaller of this
 /// and 50% of the viewport (see `max_for_side` in the render body).
 const DRAWER_MAX_ABS: f64 = 720.0;
@@ -3248,20 +3251,24 @@ pub fn AttendantsComponent(
             // Pressured-latch edge (true->false): leaving a Fixed override for Auto
             // clears the latch render-side so all natural tiles re-reveal at once.
             log::info!("DecodeBudget: pressured_latch=false trigger=override_resume_auto");
-            // Issue #1466: returning to Auto from ANY non-Auto state (Fixed/All)
-            // discards the per-tile force-decode requests. Auto is "let the
-            // adaptive loop decide", so stale PLAY requests must not keep peers
-            // pinned-decoded across the mode switch. This same edge fires for BOTH
-            // entry points that write `decode_budget_override` — the Settings
-            // picker AND the persistent "Back to automatic" toggle (both call
-            // `decode_budget_ctx.0.set`) — so a single clear here covers both.
-            // Guarded on non-empty so we don't trigger a needless write-driven
-            // re-render when there was nothing to clear. We do NOT clear on a
-            // transition to All or Fixed(n): those are explicit manual modes where
-            // an existing PLAY request is still meaningful.
-            if !user_requested_decode.peek().is_empty() {
-                user_requested_decode.write().clear();
-            }
+        }
+        // Issue #1466/#1471: returning to Auto from ANY non-Auto state (Fixed/All)
+        // discards the per-tile force-decode requests. Auto is "let the adaptive
+        // loop decide", so stale PLAY requests must not keep peers pinned-decoded
+        // across the mode switch. This same edge fires for BOTH entry points that
+        // write `decode_budget_override` — the Settings picker AND the persistent
+        // "Back to automatic" toggle (both call `decode_budget_ctx.0.set`) — so a
+        // single clear here covers both. The decision lives in the pure
+        // `should_clear_force_decode_on_override_change` helper so it is
+        // host-testable (an inline `.clear()` was mutation-invisible, #1471). We do
+        // NOT clear on a transition to All or Fixed(n): those are explicit manual
+        // modes where an existing PLAY request is still meaningful. Guarded on
+        // non-empty so we don't trigger a needless write-driven re-render when
+        // there was nothing to clear.
+        if should_clear_force_decode_on_override_change(previous, current)
+            && !user_requested_decode.peek().is_empty()
+        {
+            user_requested_decode.write().clear();
         }
         if previous != current {
             prev_override.set(current);

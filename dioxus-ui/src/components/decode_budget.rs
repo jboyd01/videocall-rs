@@ -589,6 +589,39 @@ pub fn effective_cap(
     }
 }
 
+/// Decide whether a decode-budget override transition should discard the
+/// per-tile force-decode (PLAY) requests (issue #1466 / #1471).
+///
+/// Returning to `Auto` from ANY non-`Auto` state (`Fixed`/`All`) means "let the
+/// adaptive loop decide again", so stale PLAY requests must NOT keep peers
+/// pinned-decoded across the switch. Every OTHER transition keeps them: `All`
+/// and `Fixed(n)` are explicit manual modes where an existing PLAY request is
+/// still meaningful, and an `Auto`→`Auto` non-transition must not clear (it
+/// would let a single spurious re-render wipe the user's requests).
+///
+/// Pure / DOM-free / signal-free so the return-to-Auto DECISION is host-testable
+/// — the `use_effect` in `attendants.rs` calls this and only clears the
+/// `user_requested_decode` signal when it returns `true`. This pins the
+/// *decision* — which transitions clear — that the inline `.clear()` could not:
+/// `should_clear_..._tests` fails if the predicate is mutated. That decision was
+/// the subtle part (#1471 named the risk of a mutation flipping which
+/// transitions clear).
+///
+/// SCOPE (honest): the unit test does NOT cover the effect→helper *wiring* — a
+/// Dioxus `use_effect` body needs a runtime — so deleting the
+/// `user_requested_decode.write().clear()` call in `attendants.rs` would still
+/// pass the unit test. That call is a single line gated directly by this
+/// helper's result; it has no host test. An end-to-end return-to-Auto assertion
+/// would need the multi-publisher budget-shed setup (see
+/// `decode-budget-play-button.spec.ts`), which is not added here.
+pub fn should_clear_force_decode_on_override_change(
+    previous: crate::context::DecodeBudgetOverride,
+    current: crate::context::DecodeBudgetOverride,
+) -> bool {
+    use crate::context::DecodeBudgetOverride::Auto;
+    previous != Auto && current == Auto
+}
+
 /// Expand the decoded-tile bucket to admit the user's explicit force-decode
 /// (PLAY) requests, while STILL honouring the device-class ceiling (issues
 /// #1466 / #1286).
@@ -1872,6 +1905,63 @@ mod tests {
         assert_eq!(
             effective_cap(DecodeBudgetOverride::Auto, false, 12, 99, None),
             12
+        );
+    }
+
+    // ── issue #1466/#1471: "Back to automatic" clears force-decode requests ──
+
+    /// Returning to `Auto` from a non-`Auto` override (the Settings picker's
+    /// "Back to automatic" toggle, or selecting Auto in the picker) MUST clear the
+    /// per-tile force-decode (PLAY) requests; every other transition keeps them.
+    ///
+    /// MUTATION SENSITIVITY: the production effect only clears
+    /// `user_requested_decode` when this returns `true`. If the clear were dropped
+    /// (the bug #1471 names — an inline `.clear()` that no test caught), or if the
+    /// condition were inverted/widened, the asserts below flip. Each arm pins a
+    /// distinct transition, so a one-sided mutation (e.g. always-true, or dropping
+    /// the `previous != Auto` half) fails at least one assert.
+    #[test]
+    fn back_to_auto_clears_force_decode_requests_only_on_return_to_auto() {
+        use DecodeBudgetOverride::{All, Auto, Fixed};
+
+        // Return to Auto from a manual mode → CLEAR.
+        assert!(
+            should_clear_force_decode_on_override_change(Fixed(5), Auto),
+            "Fixed -> Auto must clear force-decode requests"
+        );
+        assert!(
+            should_clear_force_decode_on_override_change(All, Auto),
+            "All -> Auto must clear force-decode requests"
+        );
+
+        // Leaving Auto for a manual mode, or moving between manual modes → KEEP
+        // (a PLAY request is still meaningful in an explicit manual mode).
+        assert!(
+            !should_clear_force_decode_on_override_change(Auto, Fixed(5)),
+            "Auto -> Fixed must NOT clear"
+        );
+        assert!(
+            !should_clear_force_decode_on_override_change(Auto, All),
+            "Auto -> All must NOT clear"
+        );
+        assert!(
+            !should_clear_force_decode_on_override_change(Fixed(5), All),
+            "Fixed -> All must NOT clear"
+        );
+        assert!(
+            !should_clear_force_decode_on_override_change(All, Fixed(3)),
+            "All -> Fixed must NOT clear"
+        );
+
+        // Non-transitions → KEEP. Auto -> Auto especially must not clear, or a
+        // spurious re-render would wipe the user's requests.
+        assert!(
+            !should_clear_force_decode_on_override_change(Auto, Auto),
+            "Auto -> Auto (no change) must NOT clear"
+        );
+        assert!(
+            !should_clear_force_decode_on_override_change(Fixed(5), Fixed(5)),
+            "Fixed -> same Fixed (no change) must NOT clear"
         );
     }
 

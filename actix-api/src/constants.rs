@@ -145,6 +145,77 @@ pub(crate) fn resolve_wt_outbound_channel_capacity(raw: Option<&str>) -> usize {
     }
 }
 
+/// Pure resolver for [`viewport_filter_enabled`]: maps the raw optional
+/// environment string to the concrete #1436 kill-switch boolean, applying
+/// the same recognised-boolean parsing and warn-on-unknown rules without
+/// touching any process-global state.
+///
+/// Default is `true`: the #988 per-subscriber viewport VIDEO filter is
+/// already LIVE in production, so the kill switch defaults to the status
+/// quo (filter ON). An empty string trims to `""`, matches no arm, and
+/// therefore takes the warn-and-default-`true` path — it is NOT special-cased.
+/// No input panics.
+///
+/// Extracted as a free function so unit tests can exercise the resolution
+/// logic without racing against the `OnceLock` cache or mutating the real
+/// process environment.
+pub(crate) fn resolve_viewport_filter_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "false" | "0" | "off" | "no" => false,
+            "true" | "1" | "on" | "yes" => true,
+            _ => {
+                tracing::warn!(
+                    "VIEWPORT_FILTER_ENABLED={:?} is not a recognised boolean; falling back to default true",
+                    value
+                );
+                true
+            }
+        },
+    }
+}
+
+/// Memoized accessor for the #1436 viewport-filter kill switch.
+///
+/// Reads `VIEWPORT_FILTER_ENABLED` exactly once on the first call and caches
+/// the resolved boolean in a process-global `OnceLock`. Consequently, flipping
+/// the environment variable requires a relay **process restart** to take
+/// effect — there is NO hot-reload. This is acceptable and intended for an ops
+/// kill switch: the #1436 requirement is to be able to revert the #988 filter
+/// WITHOUT a client redeploy, and a relay restart satisfies that requirement.
+///
+/// Cheap on the hot path after the first call (a single atomic load), which is
+/// why it can be invoked per VIDEO packet on the relay forward path.
+pub fn viewport_filter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        resolve_viewport_filter_enabled(std::env::var("VIEWPORT_FILTER_ENABLED").ok().as_deref())
+    })
+}
+
+/// Pure #988 viewport drop decision. Returns true iff the off-screen VIDEO
+/// packet must be dropped. `enabled` is the #1436 kill-switch state.
+///
+/// Fail-open semantics: `!enabled` -> `false` (the #1436 kill switch is OFF, so
+/// forward-all is restored); `None` source -> `false` (unparseable sender,
+/// fail open); empty viewport set -> `false` (no viewport signal yet, fail
+/// open); otherwise drop iff the source session is NOT present in the set.
+pub(crate) fn viewport_should_drop(
+    enabled: bool,
+    viewport_ids: &std::collections::HashSet<u64>,
+    source: Option<u64>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match source {
+        None => false,
+        Some(src) => !viewport_ids.is_empty() && !viewport_ids.contains(&src),
+    }
+}
+
 /// Bounded channel capacity for WebSocket outbound relay queue.
 ///
 /// Half the WebTransport capacity because WS frames are larger
@@ -730,23 +801,21 @@ pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_se
 ///
 /// The relay enters relief mode for a receiver when that receiver's REAL
 /// downlink backpressure surface — the bounded per-session `outbound_tx`
-/// channel overflowing on a slow socket — drives the windowed
-/// [`CongestionTracker`](crate::actors::session_logic::CongestionTracker) across
-/// its drop threshold (`is_actively_congested()`). The transport actor stamps a
-/// monotonic epoch into a shared atomic on each such crossing
-/// (`SessionLogic::on_outbound_drop`), and the per-receiver fan-out closure
-/// reads it against THIS window. While the most recent crossing is within the
-/// window, the closure (a) discards non-base-layer VIDEO/SCREEN BEFORE
-/// `try_send`, giving the downlink headroom to drain, and (b) emits one
-/// DOWNLINK_CONGESTION control packet so the client's LayerChooser steps its own
-/// receive layers down. AUDIO and base layer are NEVER shed.
+/// channel overflowing on a slow socket — fires an outbound drop
+/// (`SessionLogic::on_outbound_drop`). The transport actor stamps a monotonic
+/// epoch into a shared atomic on EVERY drop unconditionally (#1481), and the
+/// per-receiver fan-out closure reads it against THIS window. While the most
+/// recent drop is within the window, the closure (a) discards non-base-layer
+/// VIDEO/SCREEN BEFORE `try_send`, giving the downlink headroom to drain, and
+/// (b) emits one DOWNLINK_CONGESTION control packet so the client's
+/// LayerChooser steps its own receive layers down. AUDIO and base layer are
+/// NEVER shed.
 ///
 /// This is DELIBERATELY NOT keyed off the relay's actor-mailbox `Full` (which an
 /// earlier draft used): the mailbox sits in front of `outbound_tx` and overflows
 /// on a room-wide fan-out / scheduling burst that says nothing about any single
-/// receiver's downlink. The `CongestionTracker` one queue downstream is the
-/// genuine per-receiver signal — the same one the #979 keyframe-relax path
-/// already trusts.
+/// receiver's downlink. The per-receiver outbound channel overflow is the
+/// genuine per-receiver signal.
 ///
 /// ## Why a windowed decay, not a consecutive-success exit (B2)
 ///
@@ -759,15 +828,26 @@ pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_se
 /// time-decaying window recovers automatically: once the receiver stops
 /// overflowing for `RECEIVER_DOWNLINK_RELIEF_WINDOW`, full layers resume.
 ///
-/// ## Why 2 s
+/// ## Why 8 s (widened from 2 s in #1481)
 ///
-/// Set equal to [`KEYFRAME_CONGESTION_RELAX_WINDOW`] so the relay-side shed, the
-/// #979 keyframe relaxation, and the client step-down all reason about "recently
-/// congested" over the SAME horizon. 2 s is long enough that a brief stall keeps
-/// relief armed through the recovery (avoiding flap), short enough that a
-/// receiver whose downlink genuinely recovers is back to full quality within a
-/// couple of seconds.
-pub const RECEIVER_DOWNLINK_RELIEF_WINDOW: Duration = Duration::from_secs(2);
+/// Field data (CC7, 2026-06-18) showed the shed flapping on WebTransport in a
+/// cycle: shed activates → drops stop (works!) → epoch ages over 2 s → shed
+/// deactivates → L1+L2 resume → buffer slowly refills over 10-14 s → overflow
+/// → shed reactivates. The 2 s window was too short to bridge the quiet gap
+/// that naturally follows a successful shed on a constrained downlink.
+///
+/// 8 s bridges the typical 5-10 s quiet gap after a successful shed. The
+/// buffer drains in 2-5 s (only L0 = low bitrate), so 8 s gives 3-6 s of
+/// additional hold after the buffer is drained — enough for the receiver to
+/// stabilize. Recovery is still bounded: if drops truly stop (link improves),
+/// shedding releases after 8 s.
+///
+/// NOTE: [`KEYFRAME_CONGESTION_RELAX_WINDOW`] (2 s) is a SEPARATE concern
+/// (per-pair keyframe budget expansion) and is intentionally NOT changed here.
+/// They were previously equal but serve different purposes: the keyframe relax
+/// window arms a short budget burst for immediate recovery retries, while the
+/// downlink relief window holds the L1/L2 shed for sustained stabilization.
+pub const RECEIVER_DOWNLINK_RELIEF_WINDOW: Duration = Duration::from_secs(8);
 
 #[cfg(test)]
 mod tests {
@@ -830,5 +910,82 @@ mod tests {
             resolve_wt_outbound_channel_capacity(Some("")),
             WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
         );
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_unset_defaults_to_true() {
+        // #988 filter is already LIVE in prod; the #1436 kill switch must
+        // default to the status quo (filter ON) when unset.
+        assert!(resolve_viewport_filter_enabled(None));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_recognised_false_values_disable() {
+        assert!(!resolve_viewport_filter_enabled(Some("false")));
+        assert!(!resolve_viewport_filter_enabled(Some("0")));
+        assert!(!resolve_viewport_filter_enabled(Some("off")));
+        assert!(!resolve_viewport_filter_enabled(Some("no")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_recognised_true_values_enable() {
+        assert!(resolve_viewport_filter_enabled(Some("true")));
+        assert!(resolve_viewport_filter_enabled(Some("1")));
+        assert!(resolve_viewport_filter_enabled(Some("on")));
+        assert!(resolve_viewport_filter_enabled(Some("yes")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_is_case_insensitive() {
+        assert!(!resolve_viewport_filter_enabled(Some("FALSE")));
+        assert!(resolve_viewport_filter_enabled(Some("True")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_garbage_falls_back_to_default_true() {
+        // Unrecognised tokens warn and fall back to the default (ON).
+        assert!(resolve_viewport_filter_enabled(Some("GARBAGE")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_empty_falls_back_to_default_true() {
+        // "" trims to "", matches no arm, warns, and defaults to true.
+        // It is NOT special-cased.
+        assert!(resolve_viewport_filter_enabled(Some("")));
+    }
+
+    #[test]
+    fn viewport_should_drop_kill_switch_off_forwards_all() {
+        // enabled=false: forward-all restored regardless of set membership.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(!viewport_should_drop(false, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_drops_source_not_in_set() {
+        // enabled=true, non-empty set EXCLUDING the source -> drop.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_keeps_source_in_set() {
+        // enabled=true, source present in the set -> forward.
+        let ids: std::collections::HashSet<u64> = [1, 2, 99].into_iter().collect();
+        assert!(!viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_empty_set_fails_open() {
+        // enabled=true, empty set (no viewport signal yet) -> fail open.
+        let ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        assert!(!viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_none_source_fails_open() {
+        // enabled=true, unparseable source (None) -> fail open.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(!viewport_should_drop(true, &ids, None));
     }
 }

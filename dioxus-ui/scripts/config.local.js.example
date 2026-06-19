@@ -39,6 +39,10 @@ if (window.__APP_CONFIG) {
     // Mock remote participants without a full stack.
     // mockPeersEnabled: "false",
 
+    // Hide git commit/branch in the About modal + diagnostics build info
+    // (production behavior). Omit or set "false" to hide; "true" shows them.
+    // showBuildGitInfo: "false",
+
     // Smatter chat integration local setup:
     // keep these meet.localhost/id.localhost values out of config.js so the
     // committed default remains generic for normal local dev and CI. Enable

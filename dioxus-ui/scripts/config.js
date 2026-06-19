@@ -19,6 +19,7 @@ window.__APP_CONFIG = ({
   e2eeEnabled: "false",
   webTransportEnabled: "true",
   transportBadgeEnabled: "true",
+  showBuildGitInfo: "true",
   firefoxEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,
