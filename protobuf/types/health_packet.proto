@@ -328,6 +328,33 @@ message HealthPacket {
   // active_server_rtt was suppressed (observability-only; does NOT change the
   // suppression/re-election behavior, only counts it).
   optional uint64 rtt_probe_stale_suppressions_total = 86; // (#522)
+
+  // ---- #1482: per-peer device / hardware metrics ("if available") ----------
+  // Every field below is OPTIONAL and OMITTED (proto3 absent / Rust `None`)
+  // when the sending browser does not expose the source API — never a bogus
+  // default. STATIC fields (os/device_type/device_memory_gb) are read once per
+  // tick from JS globals; the dynamic load gauge is computed per interval.
+  //
+  // Human OS + version, e.g. "macOS 14.5", "Windows 11". Source:
+  // navigator.userAgentData.getHighEntropyValues() platform+platformVersion
+  // (Chromium), else a navigator.userAgent heuristic. Absent when neither is
+  // available (e.g. Firefox/Safari lack userAgentData high-entropy values).
+  optional string client_os = 87; // (#1482)
+  // Device form factor: "desktop" | "mobile" | "tablet". Source:
+  // navigator.userAgentData.mobile + model (Chromium), else a UA heuristic.
+  // Absent when the form factor cannot be determined.
+  optional string client_device_type = 88; // (#1482)
+  // 0.0-1.0 MAIN-THREAD busy fraction over the last health interval
+  // (sum of 'longtask' durations / interval_ms). This is a CPU PROXY for the
+  // sender's main thread, explicitly NOT system-wide CPU usage. Source:
+  // PerformanceObserver('longtask') (Chromium). Absent (None) when the
+  // 'longtask' entry type is unsupported (Firefox/Safari) — distinct from a
+  // genuine 0.0 (idle main thread on a browser that DOES support longtask).
+  optional double client_main_thread_load = 89; // (#1482)
+  // navigator.deviceMemory: total device RAM tier in GIGABYTES. Coarse and
+  // privacy-quantized by the browser (one of 0.25/0.5/1/2/4/8, capped at 8).
+  // Chromium only; absent on Firefox/Safari (which do not implement the API).
+  optional double client_device_memory_gb = 90; // (#1482)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

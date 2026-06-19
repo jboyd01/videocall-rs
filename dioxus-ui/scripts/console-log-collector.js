@@ -41,6 +41,8 @@
 
   var highEntropyPlatform = null;
   var highEntropyArchitecture = null;
+  var highEntropyModel = null;
+  var highEntropyMobile = null;
 
   if (navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === "function") {
     try {
@@ -57,6 +59,8 @@
           if (ua.architecture) {
             highEntropyArchitecture = ua.architecture;
           }
+          highEntropyModel = ua.model || "";
+          highEntropyMobile = (ua.mobile === true);
           updateClientMetadata();
         })
         .catch(function () {});
@@ -101,6 +105,47 @@
   // Shared helper: (re)write window.__videocall_client_metadata from current state.
   // Called from async callbacks (getHighEntropyValues, getBattery) and from writePreamble().
   function updateClientMetadata() {
+    // Issue #1482: peer hardware metrics. Computed inline from live navigator.*
+    // plus the async-filled high-entropy module vars. Every navigator access is
+    // typeof/&&-guarded so this function can NEVER throw — a throw here would
+    // wipe out architecture/gpu/network/battery from the metadata object too.
+    var nav = navigator || {};
+    // os: highEntropyPlatform is ALREADY OS+version (e.g. "macOS 14.5"). The
+    // non-Chromium fallbacks (userAgentData.platform, navigator.platform) are
+    // platform-only with no version. "" => None on the Rust side.
+    var osStr = highEntropyPlatform
+      || (nav.userAgentData && nav.userAgentData.platform)
+      || nav.platform
+      || "";
+    // device_type: "desktop" | "mobile" | "tablet". When userAgentData
+    // high-entropy resolved, highEntropyMobile is a bool; otherwise (null,
+    // Firefox/Safari) fall back to coarse UA sniffing.
+    var uaStr = (typeof nav.userAgent === "string") ? nav.userAgent : "";
+    var maxTouch = (typeof nav.maxTouchPoints === "number") ? nav.maxTouchPoints : 0;
+    var TABLET_RE = /ipad|tablet|sm-t|nexus 7|nexus 9/i;
+    var isIpadDesktopUA = (maxTouch > 1 && /Macintosh/.test(uaStr));
+    var deviceType = "";
+    if (highEntropyMobile === true) {
+      deviceType = "mobile";
+      if (TABLET_RE.test(highEntropyModel || "") || TABLET_RE.test(uaStr) || isIpadDesktopUA) {
+        deviceType = "tablet";
+      }
+    } else if (highEntropyMobile === false) {
+      deviceType = "desktop";
+    } else {
+      // highEntropyMobile === null: userAgentData high-entropy unsupported
+      // (Firefox/Safari). Check iPad/tablet BEFORE the mobile regex.
+      if (isIpadDesktopUA || /iPad/.test(uaStr)) {
+        deviceType = "tablet";
+      } else if (/Mobi|Android|iPhone/i.test(uaStr)) {
+        deviceType = "mobile";
+      } else {
+        deviceType = "desktop";
+      }
+    }
+    // device_memory_gb: NUMERIC navigator.deviceMemory. Unsupported => undefined
+    // so the key is dropped from the JSON view and read as None on the Rust side.
+    var deviceMemoryGb = (typeof nav.deviceMemory === "number") ? nav.deviceMemory : undefined;
     window.__videocall_client_metadata = {
       architecture: highEntropyArchitecture || "",
       gpu: gpuRenderer || "",
@@ -108,7 +153,10 @@
       network_downlink: networkInfo ? (networkInfo.downlink || 0) : 0,
       network_rtt: networkInfo ? (networkInfo.rtt || 0) : 0,
       battery_charging: batteryInfo ? batteryInfo.charging : null,
-      battery_level: batteryInfo ? batteryInfo.level : null
+      battery_level: batteryInfo ? batteryInfo.level : null,
+      os: osStr,
+      device_type: deviceType,
+      device_memory_gb: deviceMemoryGb
     };
   }
 

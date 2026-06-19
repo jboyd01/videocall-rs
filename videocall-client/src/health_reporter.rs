@@ -37,7 +37,7 @@ use crate::encode::{
 use log::{debug, trace, warn};
 use protobuf::Message;
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -235,6 +235,12 @@ pub struct HealthReporter {
     shutdown: Rc<AtomicBool>,
     /// TELEM-8: Accumulated long-task durations (ms) since last health packet.
     longtask_buffer: Rc<RefCell<Vec<f64>>>,
+    /// #1482: Set `true` the first time a real PerformanceObserver('longtask')
+    /// entry is observed this session. Lets the report loop distinguish a
+    /// genuine 0.0 main-thread load (idle main thread on a browser that DOES
+    /// support 'longtask') from an unsupported 'longtask' API (Firefox/Safari),
+    /// which must report `None`, not a fabricated 0.0. Never reset (sticky).
+    longtask_ever_observed: Rc<Cell<bool>>,
     /// TELEM-9: Latest render FPS reading from the rAF cadence observer.
     render_fps: Rc<RefCell<Option<f64>>>,
     /// #987: Latest adaptive decode-budget snapshot from the `decode_budget`
@@ -263,6 +269,15 @@ pub struct ClientMetadata {
     pub battery_charging: Option<bool>,
     pub battery_level: Option<f64>,
     pub capability_score: u32,
+    /// #1482: human OS + version, e.g. "macOS 14.5". `None` when the JS
+    /// metadata layer could not determine it (no userAgentData high-entropy).
+    pub os: Option<String>,
+    /// #1482: device form factor ("desktop"|"mobile"|"tablet"). `None` when
+    /// the JS metadata layer could not classify it.
+    pub device_type: Option<String>,
+    /// #1482: navigator.deviceMemory total-RAM tier in GB (coarse, capped at
+    /// 8). `None` on browsers without navigator.deviceMemory (Firefox/Safari).
+    pub device_memory_gb: Option<f64>,
 }
 
 /// Normalize a raw GPU renderer string to a short family name.
@@ -380,6 +395,30 @@ fn read_client_metadata() -> ClientMetadata {
             meta.battery_level = Some(f);
         }
     }
+    // #1482: OS / device-type / device-memory. Each stays `None` unless the JS
+    // metadata layer published a value of the right type — never a fabricated
+    // default ("if available").
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("os")) {
+        if let Some(s) = v.as_string() {
+            if !s.is_empty() {
+                meta.os = Some(s);
+            }
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("device_type")) {
+        if let Some(s) = v.as_string() {
+            if !s.is_empty() {
+                meta.device_type = Some(s);
+            }
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("device_memory_gb")) {
+        if let Some(f) = v.as_f64() {
+            if f.is_finite() && f > 0.0 {
+                meta.device_memory_gb = Some(f);
+            }
+        }
+    }
 
     meta
 }
@@ -424,6 +463,7 @@ impl HealthReporter {
             dwell_samples: Rc::new(RefCell::new(Rc::new(RefCell::new(Vec::new())))),
             shutdown: Rc::new(AtomicBool::new(false)),
             longtask_buffer: Rc::new(RefCell::new(Vec::new())),
+            longtask_ever_observed: Rc::new(Cell::new(false)),
             render_fps: Rc::new(RefCell::new(None)),
             decode_budget: Rc::new(RefCell::new(None)),
             agent_memory_bytes: Rc::new(RefCell::new(None)),
@@ -552,6 +592,7 @@ impl HealthReporter {
         let active_server_type = Rc::downgrade(&self.active_server_type);
         let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
         let longtask_buffer = Rc::downgrade(&self.longtask_buffer);
+        let longtask_ever_observed = Rc::downgrade(&self.longtask_ever_observed);
         let render_fps_state = Rc::downgrade(&self.render_fps);
         let decode_budget_state = Rc::downgrade(&self.decode_budget);
 
@@ -621,6 +662,16 @@ impl HealthReporter {
                                         if let Some(buf) = Weak::upgrade(&longtask_buffer) {
                                             if let Ok(mut v) = buf.try_borrow_mut() {
                                                 v.push(*duration);
+                                                // #1482: mark that 'longtask' is
+                                                // actually supported + emitting, so an
+                                                // empty drain later means a genuinely
+                                                // idle main thread (0.0), not an
+                                                // unsupported API (None).
+                                                if let Some(flag) =
+                                                    Weak::upgrade(&longtask_ever_observed)
+                                                {
+                                                    flag.set(true);
+                                                }
                                             }
                                         }
                                     }
@@ -1098,6 +1149,7 @@ impl HealthReporter {
         let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
         let dwell_samples = self.dwell_samples.clone();
         let longtask_buffer = self.longtask_buffer.clone();
+        let longtask_ever_observed = self.longtask_ever_observed.clone();
         let render_fps_cell = self.render_fps.clone();
         let decode_budget_cell = self.decode_budget.clone();
         // #1032: cached total-process memory reading sampled in the background.
@@ -1234,6 +1286,23 @@ impl HealthReporter {
                             .map(|mut v| std::mem::take(&mut *v))
                             .unwrap_or_default();
 
+                        // #1482: main-thread load = (sum of longtask ms this
+                        // interval) / interval_ms, clamped to 0.0..=1.0. HONEST
+                        // 0-vs-unsupported: an EMPTY drain when 'longtask' HAS
+                        // been observed this session is a genuine 0.0 (idle main
+                        // thread); an empty drain when 'longtask' was NEVER
+                        // observed means the API is unsupported (Firefox/Safari)
+                        // and we report `None`, not a fabricated 0.0. Reporting
+                        // 0.0 unconditionally would lie on those browsers.
+                        let longtask_ever_observed_now = longtask_ever_observed.get();
+                        let longtask_sum_ms: f64 = drained_longtasks.iter().sum();
+                        let main_thread_load: Option<f64> =
+                            if longtask_ever_observed_now && interval_ms > 0 {
+                                Some((longtask_sum_ms / interval_ms as f64).clamp(0.0, 1.0))
+                            } else {
+                                None
+                            };
+
                         // TELEM-9: read latest render FPS
                         let current_render_fps = render_fps_cell.try_borrow().ok().and_then(|v| *v);
 
@@ -1293,6 +1362,7 @@ impl HealthReporter {
                             drained_longtasks,
                             current_render_fps,
                             client_meta,
+                            main_thread_load,
                             decode_budget_snapshot,
                             agent_memory_bytes,
                         );
@@ -1361,6 +1431,10 @@ impl HealthReporter {
         longtask_durations: Vec<f64>,
         render_fps: Option<f64>,
         client_metadata: ClientMetadata,
+        // #1482: main-thread busy fraction (0.0-1.0) over the last interval, or
+        // `None` when 'longtask' is unsupported. Computed in the report loop
+        // rather than stored on ClientMetadata since it is a per-interval gauge.
+        client_main_thread_load: Option<f64>,
         decode_budget: Option<DecodeBudgetSnapshot>,
         agent_memory_bytes: Option<u64>,
     ) -> Option<PacketWrapper> {
@@ -1618,6 +1692,21 @@ impl HealthReporter {
         pb.client_battery_level = client_metadata.battery_level;
         if client_metadata.capability_score > 0 {
             pb.client_capability_score = Some(client_metadata.capability_score);
+        }
+        // #1482: per-peer device / hardware metrics. Each field is published
+        // ONLY when present ("if available"); an absent source API stays `None`
+        // on the wire (proto3 optional omitted), never a fabricated default.
+        if let Some(os) = &client_metadata.os {
+            pb.client_os = Some(os.clone());
+        }
+        if let Some(dt) = &client_metadata.device_type {
+            pb.client_device_type = Some(dt.clone());
+        }
+        if let Some(dm) = client_metadata.device_memory_gb {
+            pb.client_device_memory_gb = Some(dm);
+        }
+        if let Some(load) = client_main_thread_load {
+            pb.client_main_thread_load = Some(load);
         }
 
         // TELEM-8: Long task durations since last packet
@@ -2216,6 +2305,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
             None,
             None,
         )
@@ -2296,6 +2386,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
             decode_budget,
             None,
         )
@@ -2359,6 +2450,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
             None,
             None,
         )
@@ -2455,6 +2547,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
             None,
             agent_memory_bytes,
         )
@@ -2514,6 +2607,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
             None,
             None,
         )
@@ -2682,6 +2776,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
             None,
             None,
         )
@@ -2787,6 +2882,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
             None,
             Some(512),
         )
