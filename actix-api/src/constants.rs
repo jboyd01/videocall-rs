@@ -723,10 +723,10 @@ pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 /// serves (the exact O(n)-per-connection fan-out hazard the Change Impact Policy
 /// warns about).
 ///
-/// ## Why DEPARTURES are safe to debounce but JOINS are not
+/// ## Debounce policy per recompute trigger
 ///
-/// The emit policy is ASYMMETRIC (mirroring the suppress-lazy / restore-eager
-/// split in [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]):
+/// The emit policy has three tiers (per-LAYER_PREFERENCE is immediate; joins
+/// and departures are both debounced behind this trailing window):
 ///
 /// * **Departures (leave/evict) → DEBOUNCE.** A leaving receiver can only RAISE
 ///   a remaining publisher's fail-open union (its constraint disappears), and a

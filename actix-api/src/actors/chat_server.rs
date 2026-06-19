@@ -14911,7 +14911,6 @@ mod tests {
         );
     }
 
-    /// #1203: a JOIN-style recompute (`RecomputeLayerHints { source: None }`
     /// A direct `RecomputeLayerHints` message (e.g. from a per-LAYER_PREFERENCE
     /// recompute) runs IMMEDIATELY — it is NOT subject to the coalesce window.
     /// Contrast: a coalesced schedule (used by joins #1288 and departures #1203)
@@ -15281,6 +15280,138 @@ mod tests {
             !armed_final,
             "the flush must clear the timer handle so the next burst re-arms fresh"
         );
+    }
+
+    /// #1288: a burst of K joins into one room produces exactly ONE coalesced
+    /// recompute (not K immediate recomputes). This is the acceptance criterion
+    /// for issue #1288.
+    ///
+    /// MUTATION PROOF: revert the join site in `handle(JoinRoom)` from
+    /// `self.schedule_coalesced_recompute(&room, ctx)` back to the old
+    /// `ctx.address().do_send(RecomputeLayerHints { source: None, room })`
+    /// and this test FAILS: `invocations_before_window` becomes 5 (not 0)
+    /// because each join fires an immediate recompute instead of deferring.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1288_join_burst_coalesces_recomputes() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "i1288-join-coalesce-room".to_string();
+
+        let j1 = (1_288_001u64, "i1288-j1");
+        let j2 = (1_288_002u64, "i1288-j2");
+        let j3 = (1_288_003u64, "i1288-j3");
+        let j4 = (1_288_004u64, "i1288-j4");
+        let j5 = (1_288_005u64, "i1288-j5");
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        async fn join_member(
+            chat: &Addr<ChatServer>,
+            session: SessionId,
+            instance_id: &str,
+            room: &str,
+        ) {
+            let dummy = DummySession.start();
+            chat.send(Connect {
+                id: session,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+            chat.send(JoinRoom {
+                session,
+                room: room.to_string(),
+                user_id: format!("{instance_id}@example.com"),
+                display_name: instance_id.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(instance_id.to_string()),
+                is_host: false,
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        }
+
+        // Reset the global counter before the join burst.
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        // --- Drive a burst of 5 joins into the same room. ---
+        join_member(&chat, j1.0, j1.1, &room).await;
+        join_member(&chat, j2.0, j2.1, &room).await;
+        join_member(&chat, j3.0, j3.1, &room).await;
+        join_member(&chat, j4.0, j4.1, &room).await;
+        join_member(&chat, j5.0, j5.1, &room).await;
+
+        // Round-trip a state probe to drain all queued JoinRoom messages.
+        let (pending_after_burst, armed_after_burst) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+
+        // BEFORE the coalesce window elapses: NO recompute has run yet.
+        // This is the assertion that FAILS if the join site is reverted to
+        // an immediate `do_send(RecomputeLayerHints { ... })`.
+        let invocations_before_window =
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            invocations_before_window, 0,
+            "join-driven recomputes must be DEFERRED behind the coalesce window — \
+             a non-zero count means a join fired an immediate recompute (revert of #1288)"
+        );
+
+        // The room is pending and the timer is armed.
+        assert_eq!(
+            pending_after_burst, 1,
+            "five joins into one room => exactly one pending room in the coalesce set"
+        );
+        assert!(
+            armed_after_burst,
+            "the join burst must arm exactly one trailing coalesce timer"
+        );
+
+        // Wait out the coalesce window + slack for the flush to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 250,
+        ))
+        .await;
+
+        // Exactly ONE recompute fires (not 5). This directly asserts #1288's
+        // acceptance criterion: "a burst of K joins produces ≤ a small constant
+        // number of recomputes, not K."
+        let invocations_after_window =
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            invocations_after_window, 1,
+            "five joins into one room must yield exactly ONE coalesced recompute, not five"
+        );
+
+        // The flush drained the pending set and cleared the timer.
+        let (pending_final, armed_final) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_final, 0,
+            "the flush must drain the join coalesce set"
+        );
+        assert!(!armed_final, "the flush must clear the timer handle");
     }
 
     /// #1118 N1: a downgrade arms exactly ONE suppress-lazy re-check timer per
