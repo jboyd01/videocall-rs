@@ -53,7 +53,7 @@ Every code change must be evaluated in the context of a real-time conferencing a
 
 - No symlinks or hardlinks for source files. Each crate or UI must own its files independently.
 - WebSocket and WebTransport transport adapters have protocol-specific differences by design. Do not mechanically consolidate adapter I/O, keep-alive, or send-path code just because the high-level behavior is shared.
-- Adaptive-quality thresholds, timing, tier, and tuning values should stay centralized in `videocall-client/src/adaptive_quality_constants.rs`. Do not scatter magic numbers across encoders, PID/controller logic, or connection code.
+- Adaptive-quality thresholds, timing, tier, and tuning values should stay centralized in `videocall-aq/src/constants.rs` (re-exported as `videocall_client::adaptive_quality_constants::*` via the shim in `videocall-client/src/lib.rs`). Do not scatter magic numbers across encoders, PID/controller logic, or connection code.
 - `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` in `actix-api/src/constants.rs` is the source of truth for WebTransport outbound queue depth. The Helm env override is redundant; raise the value only for exceptional workloads because deep queues buffer stale video for slow receivers.
 
 ## Runtime Config Files
