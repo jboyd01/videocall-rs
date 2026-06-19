@@ -87,7 +87,9 @@
       effectiveType: navigator.connection.effectiveType || null,
       downlink: navigator.connection.downlink || null,
       rtt: navigator.connection.rtt || null,
-      saveData: navigator.connection.saveData || false
+      saveData: navigator.connection.saveData || false,
+      type: navigator.connection.type || null,
+      downlinkMax: navigator.connection.downlinkMax || null,
     };
   }
 
@@ -152,6 +154,8 @@
       network_effective_type: networkInfo ? (networkInfo.effectiveType || "") : "",
       network_downlink: networkInfo ? (networkInfo.downlink || 0) : 0,
       network_rtt: networkInfo ? (networkInfo.rtt || 0) : 0,
+      network_type: networkInfo ? (networkInfo.type || "") : "",
+      network_downlink_max: networkInfo ? (networkInfo.downlinkMax || 0) : 0,
       battery_charging: batteryInfo ? batteryInfo.charging : null,
       battery_level: batteryInfo ? batteryInfo.level : null,
       os: osStr,

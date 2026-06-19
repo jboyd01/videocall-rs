@@ -68,6 +68,10 @@ pub trait MicrophoneEncoderTrait {
     /// self-targeted server CONGESTION signal cuts the audio simulcast ladder to
     /// base-only. See [`MicrophoneEncoder::set_congestion_layer_ceiling`].
     fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>);
+    /// Returns the effective audio simulcast layer count (#1561).
+    fn effective_audio_layers(&self) -> u32;
+    /// Returns the shared CONGESTION audio layer-ceiling atom (#1561).
+    fn congestion_layer_ceiling(&self) -> Arc<AtomicU32>;
 }
 
 // Implement trait for Safari microphone encoder
@@ -102,6 +106,14 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>) {
         self.set_congestion_layer_ceiling(ceiling)
+    }
+
+    fn effective_audio_layers(&self) -> u32 {
+        self.effective_audio_layers()
+    }
+
+    fn congestion_layer_ceiling(&self) -> Arc<AtomicU32> {
+        self.congestion_layer_ceiling()
     }
 }
 

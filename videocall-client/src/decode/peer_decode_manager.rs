@@ -1197,6 +1197,17 @@ impl Peer {
             .audio_layer_chooser
             .choose(self.last_video_downlink, highest, now_ms);
         let desired = bounds.clamp(raw);
+        // #1561: log audio layer transitions (mirrors video/screen LAYER_SWITCH).
+        if desired != self.selected_audio_layer {
+            log::info!(
+                "LAYER_SWITCH session_id={} kind=audio from={} to={} site=tick constrained={} highest_available={}",
+                self.session_id,
+                self.selected_audio_layer,
+                desired,
+                self.audio_layer_chooser.is_constrained(),
+                highest
+            );
+        }
         self.selected_audio_layer = desired;
         desired
     }

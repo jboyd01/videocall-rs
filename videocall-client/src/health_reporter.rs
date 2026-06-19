@@ -213,6 +213,17 @@ pub struct HealthReporter {
     /// #1143: camera encoder ACTIVE simulcast layer count (layers presently
     /// encoded + sent; `<=` effective, the gap being AQ-shed layers).
     active_video_layers: Rc<RefCell<Rc<AtomicU32>>>,
+    /// #1561: screen encoder EFFECTIVE simulcast layer count (ladder depth).
+    effective_screen_layers: Rc<RefCell<Rc<AtomicU32>>>,
+    /// #1561: screen encoder ACTIVE simulcast layer count (layers currently sent).
+    active_screen_layers: Rc<RefCell<Rc<AtomicU32>>>,
+    /// #1561: microphone encoder EFFECTIVE audio simulcast layer count.
+    effective_audio_layers: Rc<RefCell<Rc<AtomicU32>>>,
+    /// #1561: CONGESTION-driven audio layer-ceiling atomic (issue #621).
+    audio_congestion_ceiling: Rc<RefCell<Arc<AtomicU32>>>,
+    /// #1561: latest per-(peer,kind) desired layer map from `tick_layer_choosers`.
+    /// Populated by the peer monitor tick in VideoCallClient and read here.
+    received_layers: Rc<RefCell<HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>>>,
     /// Shared tier transition buffers (camera + screen, drained each health packet).
     tier_transitions: TierTransitionBuffers,
     /// Climb-rate limiter snapshot, updated by the encoder each tick.
@@ -278,6 +289,13 @@ pub struct ClientMetadata {
     /// #1482: navigator.deviceMemory total-RAM tier in GB (coarse, capped at
     /// 8). `None` on browsers without navigator.deviceMemory (Firefox/Safari).
     pub device_memory_gb: Option<f64>,
+    /// #1556: navigator.connection.type ("wifi"|"ethernet"|"cellular"|etc).
+    /// Chrome/Edge only; `None` on Firefox/Safari.
+    pub network_type: Option<String>,
+    /// #1556: navigator.connection.downlinkMax (Mbps). 0 or None when unknown.
+    pub network_downlink_max: Option<f64>,
+    /// #1556: computed throttle flag. True when capability_score / cores < 150.
+    pub cpu_throttled: Option<bool>,
 }
 
 /// Normalize a raw GPU renderer string to a short family name.
@@ -419,6 +437,21 @@ fn read_client_metadata() -> ClientMetadata {
             }
         }
     }
+    // #1556: network type + downlink max from navigator.connection (Chrome/Edge only).
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("network_type")) {
+        if let Some(s) = v.as_string() {
+            if !s.is_empty() {
+                meta.network_type = Some(s);
+            }
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("network_downlink_max")) {
+        if let Some(f) = v.as_f64() {
+            if f.is_finite() && f > 0.0 {
+                meta.network_downlink_max = Some(f);
+            }
+        }
+    }
 
     meta
 }
@@ -456,6 +489,11 @@ impl HealthReporter {
             // `set_encoder_metric_sources`; a 0 effective count omits the field.
             effective_video_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             active_video_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            effective_screen_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            active_screen_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            effective_audio_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            audio_congestion_ceiling: Rc::new(RefCell::new(Arc::new(AtomicU32::new(u32::MAX)))),
+            received_layers: Rc::new(RefCell::new(HashMap::new())),
             tier_transitions: Rc::new(RefCell::new(Vec::new())),
             climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
                 ClimbLimiterSnapshot::default(),
@@ -570,6 +608,11 @@ impl HealthReporter {
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
+        // #1561: screen + audio layer metrics
+        effective_screen_layers: u32,
+        active_screen_layers: Rc<AtomicU32>,
+        effective_audio_layers: u32,
+        audio_congestion_ceiling: Arc<AtomicU32>,
     ) {
         *self.encoder_queue_depth_report.borrow_mut() = queue_depth_report;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
@@ -581,6 +624,26 @@ impl HealthReporter {
         *self.dwell_samples.borrow_mut() = dwell_samples;
         *self.effective_video_layers.borrow_mut() = effective_video_layers;
         *self.active_video_layers.borrow_mut() = active_video_layers;
+        // #1561: screen layers — effective is constant (static u32), wrapped in an
+        // atomic so the spawned health loop can read it uniformly.
+        *self.effective_screen_layers.borrow_mut() =
+            Rc::new(AtomicU32::new(effective_screen_layers));
+        *self.active_screen_layers.borrow_mut() = active_screen_layers;
+        // #1561: audio layers — effective is constant, same pattern.
+        *self.effective_audio_layers.borrow_mut() = Rc::new(AtomicU32::new(effective_audio_layers));
+        *self.audio_congestion_ceiling.borrow_mut() = audio_congestion_ceiling;
+    }
+
+    /// #1561: Update the receiver-side layer selection map snapshot. Called by
+    /// the peer monitor tick in `VideoCallClient` after `tick_layer_choosers` so
+    /// the health packet includes which layer this client is decoding per peer/kind.
+    pub fn update_received_layers(
+        &self,
+        desired: &HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
+    ) {
+        if let Ok(mut map) = self.received_layers.try_borrow_mut() {
+            *map = desired.clone();
+        }
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -1145,6 +1208,12 @@ impl HealthReporter {
         // #1143: send-side simulcast layer counts (camera encoder).
         let effective_video_layers = self.effective_video_layers.clone();
         let active_video_layers = self.active_video_layers.clone();
+        // #1561: screen + audio layer metrics.
+        let effective_screen_layers = self.effective_screen_layers.clone();
+        let active_screen_layers = self.active_screen_layers.clone();
+        let effective_audio_layers = self.effective_audio_layers.clone();
+        let audio_congestion_ceiling = self.audio_congestion_ceiling.clone();
+        let received_layers = self.received_layers.clone();
         let tier_transitions = self.tier_transitions.clone();
         let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
         let dwell_samples = self.dwell_samples.clone();
@@ -1249,6 +1318,21 @@ impl HealthReporter {
                             effective_video_layers.borrow().load(Ordering::Relaxed);
                         let active_layers_val =
                             active_video_layers.borrow().load(Ordering::Relaxed);
+                        // #1561: screen + audio layer counts.
+                        let effective_screen_layers_val =
+                            effective_screen_layers.borrow().load(Ordering::Relaxed);
+                        let active_screen_layers_val =
+                            active_screen_layers.borrow().load(Ordering::Relaxed);
+                        let effective_audio_layers_val =
+                            effective_audio_layers.borrow().load(Ordering::Relaxed);
+                        let audio_congestion_ceiling_val =
+                            audio_congestion_ceiling.borrow().load(Ordering::Relaxed);
+                        // #1561: snapshot the received-layer map for this health packet.
+                        let received_layers_snapshot = received_layers
+                            .try_borrow()
+                            .ok()
+                            .map(|m| m.clone())
+                            .unwrap_or_default();
 
                         // Drain tier transitions from all encoder buffers.
                         let mut drained_transitions = Vec::new();
@@ -1318,7 +1402,12 @@ impl HealthReporter {
                             agent_memory_cell.try_borrow().ok().and_then(|v| *v);
 
                         // TELEM-7: read client metadata from JS globals
-                        let client_meta = read_client_metadata();
+                        let mut client_meta = read_client_metadata();
+                        // #1556: compute CPU throttle flag from capability_score / cores
+                        if client_meta.cores > 0 && client_meta.capability_score > 0 {
+                            let score_per_core = client_meta.capability_score / client_meta.cores;
+                            client_meta.cpu_throttled = Some(score_per_core < 150);
+                        }
 
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
@@ -1365,6 +1454,12 @@ impl HealthReporter {
                             main_thread_load,
                             decode_budget_snapshot,
                             agent_memory_bytes,
+                            // #1561: screen + audio layer metrics
+                            effective_screen_layers_val,
+                            active_screen_layers_val,
+                            effective_audio_layers_val,
+                            audio_congestion_ceiling_val,
+                            received_layers_snapshot,
                         );
 
                         if let Some(packet) = health_packet {
@@ -1437,6 +1532,12 @@ impl HealthReporter {
         client_main_thread_load: Option<f64>,
         decode_budget: Option<DecodeBudgetSnapshot>,
         agent_memory_bytes: Option<u64>,
+        // #1561: screen + audio layer metrics. 0 = unwired/omitted.
+        effective_screen_layers: u32,
+        active_screen_layers: u32,
+        effective_audio_layers: u32,
+        audio_congestion_ceiling: u32,
+        received_layers: HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
     ) -> Option<PacketWrapper> {
         // Keep client-wide telemetry flowing even before any peer stats have
         // been observed (solo sessions / warm-up).
@@ -1513,6 +1614,41 @@ impl HealthReporter {
         if effective_video_layers > 0 {
             pb.effective_video_layers = Some(effective_video_layers);
             pb.active_video_layers = Some(active_video_layers.min(effective_video_layers));
+        }
+
+        // #1561: screen encoder simulcast layer counts. Same gating convention as video.
+        if effective_screen_layers > 0 {
+            pb.effective_screen_layers = Some(effective_screen_layers);
+            pb.active_screen_layers = Some(active_screen_layers.min(effective_screen_layers));
+        }
+        // #1561: audio encoder layer count + congestion ceiling. Gated same as video.
+        if effective_audio_layers > 0 {
+            pb.effective_audio_layers = Some(effective_audio_layers);
+            // audio_congestion_ceiling: u32::MAX = fail-open (no cap). Only emit
+            // a meaningful ceiling (< effective count or within the ladder depth).
+            if audio_congestion_ceiling < u32::MAX {
+                pb.audio_congestion_ceiling = Some(audio_congestion_ceiling);
+            }
+        }
+        // #1561: receiver-side per-(peer,kind) desired layer map. Keyed by
+        // session_id string so the relay/analyzer can correlate. Only constrained
+        // peers appear (below-top); an empty map means all receivers are healthy.
+        {
+            use crate::decode::layer_chooser::PrefMediaKind;
+            for (&(session_id, kind), &layer) in &received_layers {
+                let key = session_id.to_string();
+                match kind {
+                    PrefMediaKind::Video => {
+                        pb.received_video_layer.insert(key, layer);
+                    }
+                    PrefMediaKind::Screen => {
+                        pb.received_screen_layer.insert(key, layer);
+                    }
+                    PrefMediaKind::Audio => {
+                        pb.received_audio_layer.insert(key, layer);
+                    }
+                }
+            }
         }
 
         if encoder_target_bitrate_kbps.is_finite() {
@@ -1704,6 +1840,16 @@ impl HealthReporter {
         }
         if let Some(dm) = client_metadata.device_memory_gb {
             pb.client_device_memory_gb = Some(dm);
+        }
+        // #1556: navigator.connection.type + downlinkMax, and computed throttle flag.
+        if let Some(ref s) = client_metadata.network_type {
+            pb.client_network_type = Some(s.clone());
+        }
+        if let Some(f) = client_metadata.network_downlink_max {
+            pb.client_network_downlink_max = Some(f);
+        }
+        if let Some(b) = client_metadata.cpu_throttled {
+            pb.client_cpu_throttled = Some(b);
         }
         if let Some(load) = client_main_thread_load {
             pb.client_main_thread_load = Some(load);
@@ -2308,6 +2454,11 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            HashMap::new(), // received_layers (#1561)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2389,6 +2540,11 @@ mod tests {
             None, // #1482: client_main_thread_load
             decode_budget,
             None,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            HashMap::new(), // received_layers (#1561)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2453,6 +2609,11 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            HashMap::new(), // received_layers (#1561)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2550,6 +2711,11 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             agent_memory_bytes,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            HashMap::new(), // received_layers (#1561)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2610,6 +2776,11 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            HashMap::new(), // received_layers (#1561)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2779,6 +2950,11 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            HashMap::new(), // received_layers (#1561)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2885,6 +3061,11 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             Some(512),
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            HashMap::new(), // received_layers (#1561)
         )
         .expect("empty peer map must still produce a packet");
 

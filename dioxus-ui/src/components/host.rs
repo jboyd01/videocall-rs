@@ -309,6 +309,11 @@ pub fn Host(
             // #1143: send-side simulcast layer counts (camera encoder atoms).
             camera.shared_effective_layer_count(),
             camera.shared_active_layer_count(),
+            // #1561: screen + audio layer metrics.
+            screen.effective_screen_layer_count(),
+            screen.shared_active_layer_count(),
+            microphone.effective_audio_layers(),
+            microphone.congestion_layer_ceiling(),
         );
 
         // Wire up encoder controls. Issue #1108: the encoder AQ is now a
