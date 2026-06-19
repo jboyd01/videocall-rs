@@ -952,14 +952,13 @@ pub struct ChatServer {
     /// lock needed). Entries are reaped when the publisher leaves (its
     /// `(room, source, _)` keys are dropped in `leave_rooms` / `forget_session`).
     layer_hint_state: HashMap<(String, SessionId, i32), LayerHintEmitState>,
-    /// Rooms with a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
-    /// pending behind the coalescing debounce window (#1203).
+    /// Rooms with a membership-driven (join/leave/evict) room-wide LAYER_HINT
+    /// recompute pending behind the coalescing debounce window (#1203, #1288).
     ///
-    /// Departures fire one room-wide recompute per disconnecting connection
-    /// (`leave_rooms` / `forget_session`). A reconnection wave or a meeting
-    /// ending disconnects many sessions in a burst → an O(n) recompute storm in
-    /// the single-threaded actor (each recompute is itself O(publishers ×
-    /// receivers)). Instead of `do_send`-ing a recompute per departure, we record
+    /// Joins and departures each fire one room-wide recompute per event. A join
+    /// wave or reconnection burst → an O(n) recompute storm in the
+    /// single-threaded actor (each recompute is itself O(publishers ×
+    /// receivers)). Instead of `do_send`-ing a recompute per event, we record
     /// the affected room HERE and arm a single trailing
     /// [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] timer ([`recompute_coalesce_handle`]);
     /// when it fires, [`Handler<FlushPendingRecomputes>`] drains this set and runs
@@ -1135,8 +1134,8 @@ impl ChatServer {
             //      RAISES a remaining publisher's fail-open union (restore) and
             //      nobody is actively waiting on it, so collapsing a reconnection
             //      / meeting-end disconnect burst into ONE recompute over settled
-            //      membership avoids the O(n) per-connection storm. (JOINs stay
-            //      immediate — a real viewer waits on their tile.)
+            //      membership avoids the O(n) per-connection storm. (Joins also
+            //      coalesce — #1288; encoder reaction time dominates.)
             self.forget_layer_hint_state_for_source(room_id, *session_id, actor_ctx);
             if !room_became_empty {
                 let room_owned = room_id.to_string();
@@ -1806,9 +1805,9 @@ impl ChatServer {
             });
     }
 
-    /// Coalesce a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
-    /// for `room` behind the [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] trailing
-    /// debounce (#1203), instead of `do_send`-ing a recompute immediately.
+    /// Coalesce a membership-driven (join/leave/evict) room-wide LAYER_HINT
+    /// recompute for `room` behind the [`LAYER_HINT_RECOMPUTE_COALESCE_MS`]
+    /// trailing debounce (#1203, #1288).
     ///
     /// Records `room` in [`pending_recompute_rooms`] and arms ONE
     /// [`FlushPendingRecomputes`] timer if none is already in flight. A re-arm
@@ -2600,14 +2599,14 @@ impl Handler<RecomputeLayerHints> for ChatServer {
     }
 }
 
-/// Trailing-debounce flush for coalesced DEPARTURE-driven recomputes (#1203).
+/// Trailing-debounce flush for coalesced join/departure recomputes (#1203, #1288).
 ///
 /// Drains [`ChatServer::pending_recompute_rooms`] and runs ONE room-wide
-/// recompute per distinct room that saw a departure during the coalesce window,
-/// then clears the in-flight timer handle so the NEXT departure burst arms a
+/// recompute per distinct room that saw membership change during the coalesce
+/// window, then clears the in-flight timer handle so the NEXT burst arms a
 /// fresh trailing timer. Reusing the existing `RecomputeLayerHints { source:
 /// None }` room-wide branch keeps the union computation in one place; the only
-/// thing #1203 changes is WHEN/HOW OFTEN that branch runs for departures.
+/// thing the coalescer changes is WHEN/HOW OFTEN that branch runs.
 ///
 /// A room whose membership drained to empty during the window self-clears: the
 /// room-wide branch returns early when `room_members` has no entry, so a stale
@@ -15066,12 +15065,12 @@ mod tests {
     ///   => 2 distinct affected rooms => exactly 2 recomputes total, NOT one per
     ///      departure (which would be 3).
     ///
-    /// The counter is reset AFTER all joins/activations complete. This is load-
-    /// bearing: the JoinRoom handler's synchronous body does
-    /// `do_send(RecomputeLayerHints { source: None })` (the #1108 Stage-3 join
-    /// restore), so each join bumps the counter; resetting after a drain probe
-    /// isolates the count to the departures under test. `ActivateConnection` on a
-    /// session with a fresh, unshared instance_id is an eviction no-op
+    /// The counter is reset AFTER all joins/activations complete and the join-
+    /// driven coalesce timer has flushed. This is load-bearing: the JoinRoom
+    /// handler schedules a coalesced recompute (#1288), so the flush fires the
+    /// counter; waiting past the window + resetting after a drain probe isolates
+    /// the count to the departures under test. `ActivateConnection` on a session
+    /// with a fresh, unshared instance_id is an eviction no-op
     /// (`instance_index.get(iid)` is None on first activation) so it schedules no
     /// recompute of its own.
     ///
@@ -15169,15 +15168,6 @@ mod tests {
             .await
             .expect("ActivateConnection should succeed");
 
-        // Drain every queued JoinRoom-restore recompute (one per non-observer
-        // join) and the ActivateConnection work by round-tripping a state probe,
-        // THEN reset the counter so it reflects ONLY the departures under test.
-        let _ = chat
-            .send(TestCoalesceState)
-            .await
-            .expect("state probe should succeed");
-        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
-
         // After the join phase, the coalesce set contains the rooms that were
         // joined (#1288: joins now route through the coalescer too). Flush the
         // pending join-driven recomputes before testing the departure burst so
@@ -15195,6 +15185,10 @@ mod tests {
             "join-driven coalesce timer should have flushed by now"
         );
         assert!(!armed_pre, "coalesce timer should not be armed after flush");
+
+        // Reset the counter AFTER the join-driven flush has fired (it increments
+        // the counter). This ensures the count reflects ONLY departures under test.
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
 
         // --- Drive the departure burst through the REAL handlers. ---
         // Room A, departure 1: explicit Leave -> leave_rooms. A2 + A3 remain, so
