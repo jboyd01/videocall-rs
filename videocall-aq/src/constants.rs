@@ -618,6 +618,13 @@ pub struct AudioQualityTier {
     pub bitrate_kbps: u32,
     pub enable_dtx: bool,
     pub enable_fec: bool,
+    /// Expected packet-loss percentage (0-100) passed to the Opus encoder
+    /// (`OPUS_SET_PACKET_LOSS_PERC`). libopus scales how much redundant FEC
+    /// data it embeds by this hint, so it is only meaningful when
+    /// `enable_fec` is true. The top ("high") tier keeps 0 (FEC off); the
+    /// degraded tiers escalate the hint so the encoder embeds proportionally
+    /// more recovery data as the network worsens.
+    pub packet_loss_perc: u32,
 }
 
 /// Audio quality tiers, ordered from highest (index 0) to lowest.
@@ -627,24 +634,30 @@ pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
         bitrate_kbps: 50,
         enable_dtx: true,
         enable_fec: false,
+        // No FEC at the top tier: the link is healthy, so spend no overhead.
+        packet_loss_perc: 0,
     },
     AudioQualityTier {
         label: "medium",
         bitrate_kbps: 32,
         enable_dtx: true,
         enable_fec: true, // enable FEC under moderate loss
+        // First degraded tier: tell Opus to expect ~10% loss (issue #619 range).
+        packet_loss_perc: 10,
     },
     AudioQualityTier {
         label: "low",
         bitrate_kbps: 24,
         enable_dtx: true,
         enable_fec: true,
+        packet_loss_perc: 15,
     },
     AudioQualityTier {
         label: "emergency",
         bitrate_kbps: 16,
         enable_dtx: true,
         enable_fec: true,
+        packet_loss_perc: 20,
     },
 ];
 
@@ -2626,6 +2639,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- issue #619: Opus FEC + packet-loss-% tier wiring -------------------
+
+    #[test]
+    fn test_audio_tier_packet_loss_perc_in_range() {
+        // OPUS_SET_PACKET_LOSS_PERC accepts 0-100; an out-of-range value would
+        // be silently clamped/rejected by libopus, so pin it here.
+        for tier in AUDIO_QUALITY_TIERS {
+            assert!(
+                tier.packet_loss_perc <= 100,
+                "audio tier '{}': packet_loss_perc {} must be 0-100",
+                tier.label,
+                tier.packet_loss_perc,
+            );
+        }
+    }
+
+    #[test]
+    fn test_audio_tier_loss_perc_implies_fec() {
+        // A non-zero packet-loss hint only does anything when inband FEC is on
+        // (libopus uses it to scale FEC redundancy). If a tier ever sets a loss
+        // hint without enabling FEC, that's wasted intent — fail loudly.
+        for tier in AUDIO_QUALITY_TIERS {
+            if tier.packet_loss_perc > 0 {
+                assert!(
+                    tier.enable_fec,
+                    "audio tier '{}' has packet_loss_perc {} but FEC is off; \
+                     the loss hint only matters with FEC enabled",
+                    tier.label, tier.packet_loss_perc,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_audio_top_tier_is_healthy() {
+        // The top (index 0) tier represents a healthy link: no FEC overhead and
+        // a 0% loss hint. This is also the tier the mic encoder inits at, so it
+        // defines default-state audio. Pin it so a future edit can't silently
+        // turn on FEC overhead for everyone at init.
+        let top = &AUDIO_QUALITY_TIERS[0];
+        assert!(!top.enable_fec, "top audio tier must keep FEC off");
+        assert_eq!(
+            top.packet_loss_perc, 0,
+            "top audio tier must have a 0% loss hint"
+        );
     }
 
     // =====================================================================

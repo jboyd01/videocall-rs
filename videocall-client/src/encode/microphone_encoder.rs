@@ -1016,10 +1016,19 @@ impl MicrophoneEncoder {
             output_handler.forget();
 
             // Use the tier-controlled bitrate (defaults to AUDIO_QUALITY_TIERS[0]),
-            // and pass FEC/DTX settings from the initial audio tier.
-            // NOTE: FEC and DTX require AudioWorklet support; the fields are
-            // serialized here for forward-compatibility but the worklet currently
-            // ignores them.  See audio_worklet_codec.rs for details.
+            // and pass FEC/DTX/loss-% from the initial audio tier. The worklet
+            // (encoderWorker.min.js) applies the matching Opus ctl calls, but
+            // ONLY at this init send — there is no live reconfig path.
+            //
+            // What this means at runtime:
+            //  - DTX engages today: every tier (including this top tier) sets
+            //    enable_dtx=true, so DTX is active for the whole call.
+            //  - Inband FEC does NOT engage on a mid-call AQ tier drop: we init
+            //    at the healthy top tier (enable_fec=false, packet_loss_perc=0),
+            //    and a later tier change only writes shared atomics — it never
+            //    re-applies the ctl to the running encoder. Wiring the flag is
+            //    the prerequisite; runtime FEC engagement (a live ctl-reconfig
+            //    message) is tracked as a follow-up (see #1567). See audio_worklet_codec.rs.
             let initial_tier = &AUDIO_QUALITY_TIERS[0];
             // Base-layer bitrate: in single-layer mode use the tier default
             // (byte-identical to today). In simulcast mode the base layer IS the
@@ -1038,6 +1047,7 @@ impl MicrophoneEncoder {
                     encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
                     encoder_fec: Some(initial_tier.enable_fec),
                     encoder_dtx: Some(initial_tier.enable_dtx),
+                    encoder_packet_loss_perc: Some(initial_tier.packet_loss_perc),
                     ..Default::default()
                 }),
             });
@@ -1117,6 +1127,7 @@ impl MicrophoneEncoder {
                                 encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
                                 encoder_fec: Some(initial_tier.enable_fec),
                                 encoder_dtx: Some(initial_tier.enable_dtx),
+                                encoder_packet_loss_perc: Some(initial_tier.packet_loss_perc),
                                 ..Default::default()
                             }),
                         });
