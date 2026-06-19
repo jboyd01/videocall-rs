@@ -4185,6 +4185,23 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   letter-spacing: 0.02em;
 }
 
+/* Guest join link (issue 1551): a full meeting URL can exceed the card width.
+   .settings-field-value sets `white-space: nowrap` + ellipsis for single-line
+   stat rows, which suppresses wrapping and made the link overflow its card.
+   This modifier restores wrapping for the long URL so it stays inside the card.
+   `min-width: 0` lets it shrink as a flex child of the column-layout row. */
+.settings-guest-link {
+  font-size: 0.75rem;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
+  text-align: left;
+}
+
 .settings-field-compact {
   display: flex;
   justify-content: space-between;

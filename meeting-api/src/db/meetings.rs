@@ -295,12 +295,14 @@ pub async fn list_joined_by_user(
             FROM meeting_participants
             WHERE meeting_id = m.id
               AND status = 'admitted'
+              AND left_at IS NULL
         ) pc ON TRUE
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS waiting_count
             FROM meeting_participants
             WHERE meeting_id = m.id
               AND status = 'waiting'
+              AND left_at IS NULL
         ) wc ON TRUE
         WHERE m.deleted_at IS NULL
           AND p.admitted_at IS NOT NULL
@@ -382,12 +384,16 @@ pub struct FeedMeetingRow {
 ///
 /// ## Folded counts
 ///
-/// `participant_count` (rows with `status = 'admitted'`) and `waiting_count`
-/// (rows with `status = 'waiting'`) are computed inside the same query via
-/// LEFT JOIN LATERAL subqueries so the route handler issues exactly one
-/// round-trip regardless of feed length. Status semantics match the legacy
-/// `db_participants::count_admitted` / `count_waiting` so the
-/// /feed counts are byte-for-byte identical to the per-row helpers.
+/// `participant_count` (rows with `status = 'admitted' AND left_at IS NULL`) and
+/// `waiting_count` (rows with `status = 'waiting' AND left_at IS NULL`) are
+/// computed inside the same query via LEFT JOIN LATERAL subqueries so the route
+/// handler issues exactly one round-trip regardless of feed length. The
+/// `left_at IS NULL` guard restricts both counts to participants who are
+/// CURRENTLY present (issue #1551) — a departed participant (explicit REST
+/// `/leave` or a transport disconnect marked by the `PARTICIPANT_LEFT` consumer)
+/// is excluded. Status + presence semantics match the legacy
+/// `db_participants::count_admitted` / `count_waiting` so the /feed counts stay
+/// byte-for-byte identical to the per-row helpers.
 pub async fn list_feed_for_user(
     pool: &PgPool,
     user_id: &str,
@@ -426,12 +432,14 @@ pub async fn list_feed_for_user(
             FROM meeting_participants
             WHERE meeting_id = m.id
               AND status = 'admitted'
+              AND left_at IS NULL
         ) pc ON TRUE
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS waiting_count
             FROM meeting_participants
             WHERE meeting_id = m.id
               AND status = 'waiting'
+              AND left_at IS NULL
         ) wc ON TRUE
         WHERE m.deleted_at IS NULL
           AND (m.creator_id = $1 OR p.last_admit IS NOT NULL)

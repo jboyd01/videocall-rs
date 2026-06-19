@@ -126,6 +126,11 @@ async fn main() {
         nats_consumers::spawn_meeting_ended_by_host_consumer(nats.clone(), pool.clone());
     let _empty_consumer =
         nats_consumers::spawn_meeting_became_empty_consumer(nats.clone(), pool.clone());
+    // Marks a participant `status='left', left_at=NOW()` when actix-api reports
+    // their session left a room (issue #1551), so an abnormal disconnect (no
+    // REST /leave) stops being counted as a present participant.
+    let _participant_left_consumer =
+        nats_consumers::spawn_participant_left_consumer(nats.clone(), pool.clone());
 
     // Spawn the in-process console-log retention task. Returns `None` (no-op)
     // when `CONSOLE_LOG_UPLOAD_ENABLED` is not `"true"`. The handle is leaked
