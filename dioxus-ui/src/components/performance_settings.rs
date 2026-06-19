@@ -49,8 +49,8 @@
 use dioxus::prelude::*;
 use std::rc::Rc;
 use videocall_client::{
-    DegradeReason, LiveQualitySnapshot, PeerReceiveDiag, PrefMediaKind, QualityState,
-    ReceivedLayerSnapshot, ScreenQualitySnapshot, SimulcastSendSnapshot,
+    DegradeReason, LiveQualitySnapshot, PeerDeviceInfo, PeerReceiveDiag, PrefMediaKind,
+    QualityState, ReceivedLayerSnapshot, ScreenQualitySnapshot, SimulcastSendSnapshot,
 };
 use wasm_bindgen::JsCast;
 
@@ -213,6 +213,95 @@ pub fn format_peer_kind_line(
     ))
 }
 
+/// Format a coarse device-memory tier (GB) trimming a trailing `.0` so the
+/// browser's quantized whole-number tiers (1/2/4/8) read as `8 GB`, not
+/// `8.0 GB`, while a fractional tier (`0.5`) keeps its decimal (`0.5 GB`).
+/// (#1482 device display helper.)
+fn format_device_memory_gb(gb: f64) -> String {
+    // `{}` on an f64 already drops a trailing `.0` for whole values in Rust
+    // (8.0 → "8", 0.5 → "0.5"), which is exactly the trim we want. Guard NaN/
+    // negative defensively even though the client-side ingest already filtered
+    // them; a stray value here must never render a broken label.
+    if !gb.is_finite() || gb <= 0.0 {
+        return "0 GB".to_string();
+    }
+    format!("{gb} GB")
+}
+
+/// Format the main-thread busy fraction (0.0-1.0) as a rounded integer
+/// percentage, e.g. `0.42` → `"42%"`. This is the honest CPU-PROXY figure
+/// (sender main-thread load), deliberately NOT labeled "CPU usage". (#1482.)
+fn format_main_thread_load_pct(load: f64) -> String {
+    let clamped = if load.is_finite() {
+        load.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    format!("{}%", (clamped * 100.0).round() as i64)
+}
+
+/// Build the ordered `(label, value)` device-info rows for a peer (#1482).
+///
+/// Only fields that are `Some` produce a pair; a `None` field is OMITTED
+/// entirely (never an empty value). The fixed order is:
+/// OS, Device, Cores, Architecture, Memory, Main-thread load.
+/// Returns an empty `Vec` when the peer has reported nothing ("if available").
+///
+/// Pure + host-testable: the diagnostics panel and the signal-quality popup
+/// both render from this single source of truth, so the labels/format live in
+/// one place.
+pub fn format_peer_device_lines(info: &PeerDeviceInfo) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if let Some(os) = &info.client_os {
+        rows.push(("OS".to_string(), os.clone()));
+    }
+    if let Some(device) = &info.client_device_type {
+        rows.push(("Device".to_string(), device.clone()));
+    }
+    if let Some(cores) = info.client_cores {
+        rows.push(("Cores".to_string(), cores.to_string()));
+    }
+    if let Some(arch) = &info.client_architecture {
+        rows.push(("Architecture".to_string(), arch.clone()));
+    }
+    if let Some(mem) = info.client_device_memory_gb {
+        rows.push(("Memory".to_string(), format_device_memory_gb(mem)));
+    }
+    if let Some(load) = info.client_main_thread_load {
+        rows.push((
+            "Main-thread load".to_string(),
+            format_main_thread_load_pct(load),
+        ));
+    }
+    rows
+}
+
+/// Render the per-peer device rows as a single COMPACT dot-separated line for
+/// the small signal-quality popup, e.g.
+/// `"macOS 14.5 · desktop · 8 cores · 8 GB · 42% load"`. Returns `None` when
+/// there is nothing to show so the caller can omit the block. (#1482.)
+///
+/// Built on the same `format_peer_device_lines` source of truth: it relabels
+/// the verbose panel rows into compact tokens (Cores → "N cores", Main-thread
+/// load → "N% load", OS/Device/Architecture/Memory as-is) so the panel and the
+/// popup can never drift apart on which fields are present.
+pub fn format_peer_device_compact(info: &PeerDeviceInfo) -> Option<String> {
+    let rows = format_peer_device_lines(info);
+    if rows.is_empty() {
+        return None;
+    }
+    let tokens: Vec<String> = rows
+        .into_iter()
+        .map(|(label, value)| match label.as_str() {
+            "Cores" => format!("{value} cores"),
+            "Main-thread load" => format!("{value} load"),
+            // OS / Device / Architecture / Memory render as the bare value.
+            _ => value,
+        })
+        .collect();
+    Some(tokens.join(" · "))
+}
+
 /// A cloneable, `PartialEq`-able handle around the live diagnostics readers
 /// (issue #1095). Mirrors [`SnapshotReader`]: compared by `Rc` pointer identity,
 /// built once per `Host` mount, so it never spuriously re-renders the panel.
@@ -233,6 +322,16 @@ pub struct DiagnosticsReader {
     pub send_screen: Rc<dyn Fn() -> Option<SimulcastSendSnapshot>>,
     /// Reads the per-peer RECEIVE diagnostics.
     pub per_peer_receive: Rc<dyn Fn() -> Vec<PeerReceiveDiag>>,
+    /// #1482: reads a peer's self-reported device/hardware metrics by relay
+    /// `session_id`, or `None` when unknown / nothing reported. Reads LIVE
+    /// through to the client on every call. The diagnostics panel resolves this
+    /// per peer that appears in `per_peer_received_snapshots`; an AUDIO-ONLY
+    /// sender (e.g. Firefox with no video) is included there because audio
+    /// counts as flowing media, but a peer with NO media flowing at all is
+    /// omitted from the panel's Device section (the panel iterates the receive
+    /// list). The signal-quality popup resolves device info per open tile, so it
+    /// is not subject to that limitation.
+    pub per_peer_device_info: Rc<dyn Fn(u64) -> Option<PeerDeviceInfo>>,
 }
 
 impl DiagnosticsReader {
@@ -244,6 +343,7 @@ impl DiagnosticsReader {
             send_video: Rc::new(|| None),
             send_screen: Rc::new(|| None),
             per_peer_receive: Rc::new(Vec::new),
+            per_peer_device_info: Rc::new(|_| None),
         }
     }
 }
@@ -256,6 +356,7 @@ impl PartialEq for DiagnosticsReader {
             && Rc::ptr_eq(&self.send_video, &other.send_video)
             && Rc::ptr_eq(&self.send_screen, &other.send_screen)
             && Rc::ptr_eq(&self.per_peer_receive, &other.per_peer_receive)
+            && Rc::ptr_eq(&self.per_peer_device_info, &other.per_peer_device_info)
     }
 }
 
@@ -5778,5 +5879,131 @@ mod tests {
         // Out-of-range index falls back to best tier (panic-safe).
         let oob = audio_send_rung(Some(999));
         assert_eq!(oob.res_label, AUDIO_TIER_LABELS[0]);
+    }
+
+    // ── #1482 per-peer device formatter ────────────────────────────────
+    // These pin the EXACT label + value strings the diagnostics panel and
+    // the signal popup render, so mutating any format string (e.g. "{} GB"
+    // → "{} G", or the "Main-thread load" label, or the "%" suffix) fails
+    // the assertion against a real literal (not X==X).
+
+    /// (a) Every field present → every expected pair, in the fixed order
+    /// OS, Device, Cores, Architecture, Memory, Main-thread load, with the
+    /// exact formatted value strings.
+    #[test]
+    fn format_peer_device_lines_all_fields_in_order() {
+        let info = PeerDeviceInfo {
+            client_cores: Some(8),
+            client_architecture: Some("arm".to_string()),
+            client_os: Some("macOS 14.5".to_string()),
+            client_device_type: Some("desktop".to_string()),
+            client_main_thread_load: Some(0.42),
+            client_memory_used_mb: Some(123.0),
+            client_device_memory_gb: Some(8.0),
+        };
+        let rows = format_peer_device_lines(&info);
+        assert_eq!(
+            rows,
+            vec![
+                ("OS".to_string(), "macOS 14.5".to_string()),
+                ("Device".to_string(), "desktop".to_string()),
+                ("Cores".to_string(), "8".to_string()),
+                ("Architecture".to_string(), "arm".to_string()),
+                ("Memory".to_string(), "8 GB".to_string()),
+                ("Main-thread load".to_string(), "42%".to_string()),
+            ]
+        );
+    }
+
+    /// (b) All fields None → empty Vec (so the caller renders NOTHING).
+    #[test]
+    fn format_peer_device_lines_all_none_is_empty() {
+        let info = PeerDeviceInfo::default();
+        assert!(format_peer_device_lines(&info).is_empty());
+    }
+
+    /// (c) Partial (only OS + Cores) → exactly those two pairs, in order;
+    /// every None field is OMITTED (no empty-value pair).
+    #[test]
+    fn format_peer_device_lines_partial_omits_none() {
+        let info = PeerDeviceInfo {
+            client_os: Some("Windows 11".to_string()),
+            client_cores: Some(4),
+            ..Default::default()
+        };
+        let rows = format_peer_device_lines(&info);
+        assert_eq!(
+            rows,
+            vec![
+                ("OS".to_string(), "Windows 11".to_string()),
+                ("Cores".to_string(), "4".to_string()),
+            ]
+        );
+    }
+
+    /// (d) Main-thread load 0.42 → exactly "42%" (rounded integer percent).
+    #[test]
+    fn format_peer_device_lines_main_thread_load_pct() {
+        let info = PeerDeviceInfo {
+            client_main_thread_load: Some(0.42),
+            ..Default::default()
+        };
+        let rows = format_peer_device_lines(&info);
+        assert_eq!(
+            rows,
+            vec![("Main-thread load".to_string(), "42%".to_string())]
+        );
+        // Rounds to nearest integer (0.426 → 43%, not truncated 42%).
+        let info2 = PeerDeviceInfo {
+            client_main_thread_load: Some(0.426),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_peer_device_lines(&info2),
+            vec![("Main-thread load".to_string(), "43%".to_string())]
+        );
+    }
+
+    /// (e) device_memory 8.0 → "8 GB" (trailing .0 trimmed); a fractional
+    /// tier keeps its decimal.
+    #[test]
+    fn format_peer_device_lines_memory_gb_trim() {
+        let info = PeerDeviceInfo {
+            client_device_memory_gb: Some(8.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_peer_device_lines(&info),
+            vec![("Memory".to_string(), "8 GB".to_string())]
+        );
+        let half = PeerDeviceInfo {
+            client_device_memory_gb: Some(0.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_peer_device_lines(&half),
+            vec![("Memory".to_string(), "0.5 GB".to_string())]
+        );
+    }
+
+    /// Compact popup form: dot-separated, with "N cores" and "N% load"
+    /// relabels. Pins the exact compact string the small popup renders.
+    #[test]
+    fn format_peer_device_compact_full_line() {
+        let info = PeerDeviceInfo {
+            client_cores: Some(8),
+            client_architecture: Some("arm".to_string()),
+            client_os: Some("macOS 14.5".to_string()),
+            client_device_type: Some("desktop".to_string()),
+            client_main_thread_load: Some(0.42),
+            client_memory_used_mb: None,
+            client_device_memory_gb: Some(8.0),
+        };
+        assert_eq!(
+            format_peer_device_compact(&info),
+            Some("macOS 14.5 · desktop · 8 cores · arm · 8 GB · 42% load".to_string())
+        );
+        // Nothing reported → None so the popup omits the block.
+        assert_eq!(format_peer_device_compact(&PeerDeviceInfo::default()), None);
     }
 }

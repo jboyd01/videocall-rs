@@ -913,6 +913,9 @@ pub fn Host(
             };
             let state_v = state.clone();
             let state_s = state.clone();
+            // #1482: a second client handle for the per-peer device-info reader;
+            // the `per_peer_receive` closure below moves the first one.
+            let client_dev = client.clone();
             DiagnosticsReader {
                 summary,
                 // Gate the camera snapshot on the camera being enabled, mirroring
@@ -931,6 +934,10 @@ pub fn Host(
                 }),
                 send_screen: Rc::new(move || state_s.borrow().screen.live_simulcast_snapshot()),
                 per_peer_receive: Rc::new(move || client.per_peer_received_snapshots()),
+                // #1482: live per-peer device-info lookup, keyed by session_id.
+                // Reads through to the client on every call (no captured value),
+                // so the diagnostics panel always renders the current metrics.
+                per_peer_device_info: Rc::new(move |sid| client_dev.peer_device_info(sid)),
             }
         })
     };

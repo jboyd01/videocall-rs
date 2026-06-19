@@ -26,7 +26,7 @@ use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
-use crate::decode::peer_decode_manager::{PeerDecodeError, PeerReceiveDiag};
+use crate::decode::peer_decode_manager::{PeerDecodeError, PeerDeviceInfo, PeerReceiveDiag};
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
+use videocall_types::protos::health_packet::HealthPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
@@ -2127,6 +2128,22 @@ impl VideoCallClient {
             .unwrap_or_default()
     }
 
+    /// #1482: returns a remote peer's self-reported device/hardware metrics by
+    /// relay `session_id`, or `None` when the peer is unknown / has reported no
+    /// metric (all fields default). The UI polls this each render via the
+    /// diagnostics-reader closure and the signal-quality popup, so it must read
+    /// LIVE state every call — it does (it locks the inner and reads through to
+    /// [`PeerDecodeManager::peer_device_info`] on every invocation; no value is
+    /// captured or cached at the call site). Read-only on the manager, so it
+    /// borrows the inner immutably; returns `None` on a transient borrow clash
+    /// rather than blocking the render.
+    pub fn peer_device_info(&self, session_id: u64) -> Option<crate::decode::PeerDeviceInfo> {
+        self.inner
+            .try_borrow()
+            .ok()
+            .and_then(|inner| inner.peer_decode_manager.peer_device_info(session_id))
+    }
+
     /// Returns a shared reference to the camera force-keyframe flag.
     ///
     /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
@@ -2726,6 +2743,13 @@ impl VideoCallClient {
     }
 }
 
+/// Clamp a peer-controlled label to 64 chars (char-boundary-safe — `chars().take`
+/// never splits a multibyte sequence, unlike `String::truncate`). DoS/bloat guard:
+/// a hostile peer could otherwise push multi-MB strings that stick via the merge.
+fn clamp_label(s: Option<String>) -> Option<String> {
+    s.map(|v| v.chars().take(64).collect())
+}
+
 impl Inner {
     /// Returns `true` if this peer event was already seen recently (within 30 s).
     ///
@@ -3069,10 +3093,73 @@ impl Inner {
                 }
             }
             Ok(PacketType::HEALTH) => {
-                debug!(
-                    "Received unexpected health packet from {}, ignoring",
-                    String::from_utf8_lossy(&response.user_id)
-                );
+                // #1482: a remote peer's self-reported device/hardware metrics.
+                // Never our own — we already publish (not consume) our health,
+                // and a self HEALTH would overwrite a remote slot. Skip first.
+                if self.own_session_id == Some(response.session_id) {
+                    return peer_status;
+                }
+                // FAN-OUT/PERF: HealthPackets arrive ~0.2 Hz PER remote peer
+                // (5 s default interval), so this arm is O(peers) per 5 s. Keep
+                // it CHEAP — parse + update the per-peer fields in place. The arm
+                // body emits no signal/callback and writes no UI state (pull-style;
+                // the UI reads via `peer_device_info`). Note: peer creation and the
+                // resulting on_peer_added are handled by the shared tail return as
+                // for every packet type, not by this arm.
+                match HealthPacket::parse_from_bytes(&response.data) {
+                    Ok(hp) => {
+                        // `hp` is owned and not used after this, so MOVE the
+                        // String fields out instead of cloning them.
+                        let info = PeerDeviceInfo {
+                            // bound peer-controlled core count to a sane range so a
+                            // hostile peer can't report an absurd value; out-of-range
+                            // -> None (no fabricated default), matching the float
+                            // and string guards below. #1482: cores come from the
+                            // TELEM-7 client-metadata field 56 (client_cores), which
+                            // the sender populates from navigator.hardwareConcurrency.
+                            // Absent senders omit it (proto3 None); a hostile/absent 0
+                            // is dropped by the `>= 1` bound (never a fabricated 0).
+                            client_cores: hp.client_cores.filter(|c| *c >= 1 && *c <= 1024),
+                            // clamp peer-controlled labels (DoS/bloat guard): a
+                            // hostile peer could otherwise push multi-MB strings
+                            // that stick via the merge's `incoming.or(existing)`.
+                            // #1482: architecture comes from the TELEM-7 client-metadata
+                            // field 57 (client_architecture), populated from the
+                            // userAgentData high-entropy "architecture". Honest absence:
+                            // the sender only sets field 57 when non-empty, so an honest
+                            // sender yields None here (proto3 absent), never Some("").
+                            client_architecture: clamp_label(hp.client_architecture),
+                            client_os: clamp_label(hp.client_os),
+                            client_device_type: clamp_label(hp.client_device_type),
+                            // sanitize peer-controlled floats (NaN/negative/huge) so
+                            // a hostile value can't drive a broken UI gauge.
+                            client_main_thread_load: hp
+                                .client_main_thread_load
+                                .filter(|v| v.is_finite())
+                                .map(|v| v.clamp(0.0, 1.0)),
+                            // HealthPacket.memory_used_bytes (field 12) is in
+                            // BYTES; convert to the `_mb` field by dividing by
+                            // 1 MiB (1024 * 1024). The unit is mebibytes (MiB),
+                            // matching the codebase's existing heap-size labels;
+                            // it is not decimal megabytes.
+                            client_memory_used_mb: hp
+                                .memory_used_bytes
+                                .map(|b| b as f64 / (1024.0 * 1024.0)),
+                            client_device_memory_gb: hp
+                                .client_device_memory_gb
+                                .filter(|v| v.is_finite() && *v > 0.0),
+                        };
+                        // Keyed by relay session_id (u64) — the SAME key MEDIA
+                        // uses (NOT response.user_id bytes).
+                        self.peer_decode_manager
+                            .set_peer_device_info(response.session_id, info);
+                    }
+                    Err(e) => {
+                        debug!("Failed to parse HEALTH packet: {e}");
+                    }
+                }
+                // Fall through to the shared tail return (like the DIAGNOSTICS
+                // sibling arm); do NOT early-return after storing.
             }
             Ok(PacketType::SESSION_ASSIGNED) => {
                 info!(
