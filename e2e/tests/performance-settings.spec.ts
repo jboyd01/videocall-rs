@@ -1846,6 +1846,15 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(buildTable).toBeHidden();
     await buildSummary.click();
     await expect(buildTable).toBeVisible();
+
+    // Issue #1480 — Build info columns. The `Built` column is now ALWAYS present
+    // (it was not before #1480). The Commit/Branch columns are gated on
+    // showBuildGitInfo: the committed e2e config.js ships it "true", so this
+    // solo-runner stack renders the 4-col `--git` variant. The header cells
+    // (`.build-info-cell` inside `.build-info-header`) pin the exact columns.
+    const buildHeaderCells = buildTable.locator(".build-info-header .build-info-cell");
+    await expect(buildTable).toHaveClass(/build-info-table--git/);
+    await expect(buildHeaderCells).toHaveText(["Component", "Commit", "Branch", "Built"]);
   });
 
   // ── ITERATION 3/4 — All-Peers placeholder vs single-peer NetEq charts (#1131 / #1222) ─

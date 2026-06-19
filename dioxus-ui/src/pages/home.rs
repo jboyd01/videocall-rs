@@ -174,6 +174,12 @@ pub fn Home() -> Element {
     // itself doesn't pay for a network round-trip on every load.
     let mut show_about = use_signal(|| false);
 
+    // Issue #1480: build date shows on ALL builds (not github info). Omit the
+    // "· built …" suffix entirely when the timestamp is the build.rs sentinel.
+    let about_built_suffix = crate::constants::build_date(env!("BUILD_TIMESTAMP"))
+        .map(|d| format!(" · built {d}"))
+        .unwrap_or_default();
+
     // Tracks which (if any) info-icon tooltip the user has explicitly
     // parked open via click / Enter / Space.  CSS still handles the
     // hover and keyboard-focus reveal; this signal exists so we can
@@ -769,6 +775,7 @@ pub fn Home() -> Element {
                         onclick: move |_| show_about.set(true),
                         "About videocall-ui v"
                         "{env!(\"CARGO_PKG_VERSION\")}"
+                        "{about_built_suffix}"
                     }
                 }
 
