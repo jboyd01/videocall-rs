@@ -88,6 +88,26 @@ Every change must satisfy the applicable rules below. These are derived from rec
 | **Is a test-reliability or de-flake change** | Demonstrate the spec **actually runs green** after the fix (local docker or CI dispatch). A de-flake PR that hasn't been run proves nothing about reliability. |
 | **Has a merge conflict with the base branch** | Rebase clean before requesting review. Red CI from a merge conflict is a blocker regardless of code quality. |
 
+## Mandatory Adversarial Review
+
+Use the repository skill `$videocall-adversarial-review` for both of these workflows:
+
+- Before creating, updating, or marking a PR ready, run its **pre-submit mode** against the complete base-to-head diff. Fix blockers and rerun affected validation before proceeding.
+- Whenever reviewing or re-reviewing a PR, run its **pull-request mode**, including complete conversation collection, independent verification of every prior sub-finding, current-head CI and mergeability checks, a formal verdict, and terminal label reconciliation.
+
+This review is mandatory unless the user explicitly requests a WIP push or asks to skip it. A WIP exception does not permit describing the change as review-ready.
+
+Non-negotiable review rules:
+
+1. Read every formal review, issue comment, inline comment, and commit relevant to the current PR head. Do not truncate long bodies.
+2. Verify every sub-point of a multi-part finding independently against current code. Classify prior findings as resolved/stale, live, or over-indexed with evidence.
+3. Classify the change and enforce the skill's test obligations. Missing required tests, tests that bypass production code, and tests that would pass on unfixed code block approval.
+4. Trace real execution paths, lifecycle states, both transports, network conditions, scale behavior, cross-layer assumptions, and failure cleanup wherever applicable.
+5. Compile or run test targets; plain `cargo check` is not enough when Rust test code is part of the verdict.
+6. Verify required CI on the exact reviewed head SHA and investigate failing logs. Do not infer that a failure is a flake.
+7. Check mergeability immediately before approval. Conflicts, required-test gaps, unexplained red CI, and code blockers are incompatible with approval.
+8. Lead with concrete findings ordered by severity and supported by file:line evidence. Do not manufacture findings or block on taste.
+
 ## Verification Checklist
 
 1. **Mutation sensitivity**: Tests must fail when the production code they guard is reverted. A test that re-implements production logic inline (instead of calling the production function) is NOT testing the production code — flag it.
@@ -110,13 +130,11 @@ Apply this checklist to Rust, TypeScript, CI workflows, shell, YAML, Helm, Docke
 
 ## Pre-Submission Review
 
-There is currently no Codex hook or command that enforces the old Claude `/pre-submit` gate. Until one exists, do not describe `git push` or `gh pr create` as mechanically blocked by Codex.
-
-Before pushing or creating a PR, run this manual pre-submission review unless the user explicitly says to skip it:
+Before pushing or creating a PR, run the **pre-submit mode** of `$videocall-adversarial-review` unless the user explicitly says to skip it. At minimum:
 
 - Run `make clippy-ci`.
 - Run `cargo fmt --all --check`.
-- For substantive changes, explicitly ask Codex to spawn the personal custom agents `videocall-code-reviewer` and `videocall-performance-reviewer`, or run an equivalent fresh-context adversarial review.
+- For substantive changes, use an independent review agent when available, or perform the skill's equivalent fresh-context adversarial review.
 - Route domain-specific changes to the right kind of review: backend/relay/transport, frontend/client transport, security, database/schema/wire format, E2E test sync, and UX/accessibility.
 - Do not push if the gate finds blocking issues. Fix findings first, then rerun the gate.
 
@@ -126,4 +144,4 @@ Escalate further for changes spanning 5+ files of core transport/session/auth lo
 
 ## Code Review Output Format
 
-When the user asks for a code review, report only problems. Be concise: one line per finding with file:line reference. No praise, no summaries, no politeness. If zero problems are found, say `No issues found.` and nothing else.
+When the user asks for a code review, report problems first, ordered by severity, with file:line references. Do not add praise or a generic summary. If zero problems are found, say `No issues found.` For pull-request reviews, also include the prior-finding audit, evidence gaps, formal verdict, and label outcome required by `$videocall-adversarial-review`.
