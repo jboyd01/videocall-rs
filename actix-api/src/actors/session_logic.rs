@@ -663,8 +663,18 @@ impl SessionLogic {
             }
             PacketKind::Health => {
                 trace!("Health packet from {}", self.user_id);
+                // #1482: process for server-side NATS telemetry AND forward to peers
+                // so each peer's client can read the sender's self-reported
+                // device/hardware metrics (peer_device_info). Previously returned
+                // Processed, which consumed the packet and starved the per-peer
+                // Device UI of data. HEALTH carries no media and is unencrypted; the
+                // outbound observer allowlist in ChatServer::handle_msg still drops it
+                // for waiting-room observers, so isolation is preserved.
+                // No observer guard here (unlike Data/KeyframeRequest): an observer
+                // may publish HEALTH and it is forwarded — intentional, as HEALTH is
+                // non-media diagnostics, mirroring the RTT arm's observer policy.
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
-                InboundAction::Processed
+                InboundAction::Forward(Arc::new(data.to_vec()))
             }
             PacketKind::KeyframeRequest {
                 target_user_id,
