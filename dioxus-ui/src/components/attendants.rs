@@ -92,8 +92,11 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 /// Minimum width (px) a drawer can be dragged to. Below this the panel chrome
-/// (headers, controls) stops being usable.
-const DRAWER_MIN_WIDTH: f64 = 240.0;
+/// (headers, controls) stops being usable. The floor is driven by the
+/// connection-manager section's Progress `.status-item` row (a `.progress-container`
+/// with min-width 120px plus its "Progress:" label) — see issue 1482; 300px keeps
+/// that row from overflowing inside the section/sidebar padding chrome.
+const DRAWER_MIN_WIDTH: f64 = 300.0;
 /// Absolute maximum drawer width (px). The per-side cap is the smaller of this
 /// and 50% of the viewport (see `max_for_side` in the render body).
 const DRAWER_MAX_ABS: f64 = 720.0;
