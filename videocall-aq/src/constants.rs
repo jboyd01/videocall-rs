@@ -489,6 +489,68 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// Maximum number of SCREEN simulcast layers (issue #989, Phase 3).
 pub const SCREEN_SIMULCAST_MAX_LAYERS: usize = 3;
 
+/// Initial number of ACTIVE screen simulcast layers seeded at (re)share start
+/// (issue #1553).
+///
+/// # Why this exists (issue #1553)
+/// The screen path used to seed `active_layer_count == 1` (base rung only) and
+/// relied on the headroom-probe ramp ([`LAYER_PROBE_CLEAR_WINDOW_MS`]) to earn
+/// every upper rung. That ramp demands the encoder queue be **uninterruptedly**
+/// clear for 6 s per rung; on a busy share in a large (~15-peer) meeting the
+/// queue never stays clear that long, so the share stalled permanently on the
+/// base rung — `low` (720p / 500 kbps / 5 fps) — and looked FUZZY forever.
+///
+/// # Decision: start OPTIMISTIC, shed DOWN on real backpressure (Option B)
+/// Seed the screen ladder at this many active rungs instead of 1, so a clear
+/// share gets a solid baseline from frame one without waiting on the 6 s ramp.
+/// At the `2`-rung seed the ladder is `[low, high]` (see
+/// [`simulcast_screen_layers`] just below: `n == 2 => [low, high]`), so the
+/// publisher emits the base `low` (720p / 500 kbps) AND the top `high`
+/// (1080p / 2500 kbps) rung — ≈ 3000 kbps across TWO simultaneous encodes (one
+/// of them the full 1080p) immediately. The EXISTING shed-down machinery
+/// (`drop_top_layer` under sustained encoder backpressure / congestion) still
+/// reduces active toward the floor (1) under genuine congestion, and the ramp
+/// can still earn the deferred MIDDLE rung up to the full 3-rung ceiling when
+/// uplink allows.
+///
+/// # Why `2` and not the full ladder (the #1200 tradeoff)
+/// Issue #1200 deliberately removed the "all rungs hot from frame one" cold
+/// start (active == n == 3 → `[low, medium, high]`, ~4.2 Mbps across THREE
+/// simultaneous encodes the instant a share begins) because that slam was too
+/// aggressive. Seeding at `2` is the middle ground that honors BOTH issues:
+/// - **#1553**: publishing the sharp `high` (1080p) rung immediately is exactly
+///   what de-fuzzes the shared content for a healthy receiver — the whole point
+///   of the issue — instead of stalling at the base rung waiting on the 6 s ramp.
+/// - **#1200**: 2 is strictly fewer than the 3-rung ladder, so it does NOT
+///   reintroduce the all-rungs-hot slam. What the seed leaves OFF is the THIRD
+///   simultaneous encode — the MIDDLE `medium` rung (720p / 1200 kbps), present
+///   only in the full `[low, medium, high]` ladder — NOT the 1080p top. The
+///   honest comparison is "2 encodes (incl. the 1080p `high`) / ≈ 3000 kbps" at
+///   the seed vs "3 encodes / ≈ 4200 kbps" for the #1200 slam; the deferred
+///   `medium` rung is earned by the ramp (or restored after a shed).
+///
+/// Clamped against the actual ladder size by the seed method (a `1`-layer /
+/// single-stream session stays at active 1), so this never exceeds the ceiling.
+pub const SCREEN_INITIAL_ACTIVE_LAYERS: usize = 2;
+
+// The optimistic seed must be ≥ 1 (the base rung is always published) and must
+// not exceed the screen ladder ceiling (otherwise the "middle ground vs #1200"
+// intent collapses into the full all-rungs-hot slam #1200 removed). Asserting at
+// COMPILE time so a future retune that violates either bound fails the build.
+const _: () = assert!(
+    SCREEN_INITIAL_ACTIVE_LAYERS >= 1,
+    "screen initial-active seed must include at least the base rung"
+);
+const _: () = assert!(
+    SCREEN_INITIAL_ACTIVE_LAYERS <= SCREEN_SIMULCAST_MAX_LAYERS,
+    "screen initial-active seed must not exceed the screen ladder ceiling"
+);
+const _: () = assert!(
+    SCREEN_INITIAL_ACTIVE_LAYERS < SCREEN_SIMULCAST_MAX_LAYERS,
+    "screen initial-active seed must be strictly below the ceiling — seeding the \
+     full ladder reintroduces the all-rungs-hot cold-start slam removed by #1200"
+);
+
 /// Resolve the SCREEN simulcast layer tiers for an `n`-layer ladder
 /// (issue #989, Phase 3), **lowest layer first** (index == `layer_id`).
 ///
