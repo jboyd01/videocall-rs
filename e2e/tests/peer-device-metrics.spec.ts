@@ -380,9 +380,17 @@ const ALWAYS_AVAILABLE_DEVICE_LABELS = ["OS", "Device", "Cores", "Architecture",
 
 test.describe("Per-peer device / hardware metrics (#1482)", () => {
   // Heavy: two camera-on WebCodecs renderers + a full ~5 s health-interval wait
-  // before device fields populate. Serial caps the peak heavy-renderer count on
-  // the CI runner (mirrors simulcast-per-receiver.spec.ts).
-  test.describe.configure({ mode: "serial", timeout: 180_000 });
+  // before device fields populate. The three tests below are fully independent —
+  // each launches its own two browsers, stands up its own 2-peer call, and tears
+  // them down in its own `finally` (no shared state). The project config already
+  // sets `fullyParallel: false` + `workers: 2`, so the tests in THIS file run
+  // sequentially on a single worker regardless of mode — serial mode added no
+  // resource benefit here, and its skip-on-first-failure semantics risked silently
+  // skipping the device tests (2 & 3) whenever the unrelated popup test (1) flaked,
+  // turning a real validation gap into a false green. Default mode keeps the same
+  // within-file sequential execution but lets each test fail and retry independently
+  // (`retries: CI ? 2 : 0`). The extended timeout is retained for the heavy setup.
+  test.describe.configure({ timeout: 180_000 });
 
   test.beforeAll(async () => {
     await waitForServices();
