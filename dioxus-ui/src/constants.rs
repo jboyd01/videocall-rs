@@ -493,6 +493,43 @@ pub(crate) fn build_date(ts: &str) -> Option<String> {
     Some(trimmed.split('T').next().unwrap_or(trimmed).to_string())
 }
 
+/// Issue #1480: compact a build timestamp to `YYYY-MM-DD HH:MM` so the About
+/// modal and the diagnostics build-info table render the SAME Built value on
+/// both surfaces (date + minute, seconds and trailing `Z`/timezone dropped).
+/// Splits an ISO `2026-06-19T13:48:11Z` on `'T'`: the left side is the date and
+/// the right side is the time-with-zone, from which only `HH:MM` is kept (the
+/// dropped seconds component carries the `Z`, so no `Z` leaks). Mirrors
+/// `build_date`'s degradation contract: returns `None` for the build.rs failure
+/// sentinel `"unknown"` or an empty string so callers can omit the token. An
+/// already-bare date (no `'T'`) is returned unchanged with no time appended, and
+/// a malformed/short time (fewer than two `':'`-separated parts) degrades to the
+/// date alone rather than panicking. All slicing is via `split`/`next` so it is
+/// scalar-safe (never index-slices a multi-byte boundary).
+pub(crate) fn build_datetime(ts: &str) -> Option<String> {
+    let trimmed = ts.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return None;
+    }
+    let mut parts = trimmed.splitn(2, 'T');
+    let date = parts.next().unwrap_or(trimmed);
+    match parts.next() {
+        // Already a bare date (no time component): pass through unchanged.
+        None => Some(date.to_string()),
+        Some(time) => {
+            // Keep only the first two `':'`-separated components (HH:MM); the
+            // trailing seconds component (which carries `Z`/timezone) is dropped.
+            let mut tparts = time.split(':');
+            match (tparts.next(), tparts.next()) {
+                (Some(h), Some(m)) if !h.is_empty() && !m.is_empty() => {
+                    Some(format!("{date} {h}:{m}"))
+                }
+                // Malformed/short time -> degrade gracefully to the date alone.
+                _ => Some(date.to_string()),
+            }
+        }
+    }
+}
+
 /// Issue #1480: truncate a git SHA to its first 7 characters (canonical short
 /// form). Returns `"unknown"` when empty and the input unchanged when already
 /// shorter than 7 chars (or non-ASCII — `chars().take` is scalar-safe). Moved
@@ -880,7 +917,7 @@ mod log_level_tests {
 
 #[cfg(test)]
 mod build_info_tests {
-    use super::{build_date, git_info_visible, short_sha};
+    use super::{build_date, build_datetime, git_info_visible, short_sha};
 
     /// Issue #1480: pins the FAIL-CLOSED default. Empty / falsey -> github info
     /// hidden; only an explicit truthy ("true"/"1") shows it. The accessor
@@ -914,6 +951,30 @@ mod build_info_tests {
             build_date("2026-06-18"),
             Some("2026-06-18".to_string()),
             "already-bare date returned unchanged"
+        );
+    }
+
+    /// Issue #1480: full ISO timestamp compacts to `YYYY-MM-DD HH:MM` (seconds and
+    /// trailing `Z` dropped); the build.rs failure sentinel and blank inputs return
+    /// None (caller omits the token); an already-bare date passes through unchanged.
+    /// Real literal assertions — would FAIL if the format regressed to ISO or date.
+    #[test]
+    fn build_datetime_compacts_to_minute() {
+        assert_eq!(
+            build_datetime("2026-06-19T13:48:11Z"),
+            Some("2026-06-19 13:48".to_string())
+        );
+        assert_eq!(
+            build_datetime("2026-06-18T14:30:00Z"),
+            Some("2026-06-18 14:30".to_string())
+        );
+        assert_eq!(build_datetime("unknown"), None);
+        assert_eq!(build_datetime(""), None);
+        assert_eq!(build_datetime("  "), None);
+        assert_eq!(
+            build_datetime("2026-06-19"),
+            Some("2026-06-19".to_string()),
+            "already-bare date returned unchanged (no time appended)"
         );
     }
 

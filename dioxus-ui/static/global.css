@@ -3583,12 +3583,19 @@ html[data-theme="light"] #invite-overlay p {
   font-weight: 600;
 }
 
+/* issue 1480: nowrap on the mono cells (Commit + Built + Branch) guarantees the
+   compact `YYYY-MM-DD HH:MM` Built timestamp and the 7-char commit stay on one
+   line and never wrap. The 1fr grid tracks are pushed by the nowrap content, so
+   no track min-width bump is needed; non-mono cells keep word-break (unchanged).
+   On screens <=540px the row collapses to a single column, giving these cells
+   full row width — no wrap is re-introduced there. */
 .about-modal-value--mono {
   font-family:
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
     monospace;
   font-size: 0.8125rem;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .about-modal-status {
