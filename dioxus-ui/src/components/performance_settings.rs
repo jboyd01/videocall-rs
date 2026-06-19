@@ -332,6 +332,13 @@ pub struct DiagnosticsReader {
     /// list). The signal-quality popup resolves device info per open tile, so it
     /// is not subject to that limitation.
     pub per_peer_device_info: Rc<dyn Fn(u64) -> Option<PeerDeviceInfo>>,
+    /// issue 1482: reads EVERY known peer's self-reported device info as
+    /// `(session_id, label, info)`, independent of whether media is flowing.
+    /// The diagnostics "Device (per peer)" section iterates this (NOT the
+    /// receive list) so a camera-off peer that reports device metrics still
+    /// renders. The label mirrors the receive-list label so a receiving peer's
+    /// label is unchanged. Reads LIVE through to the client on every call.
+    pub per_peer_device_all: Rc<dyn Fn() -> Vec<(u64, String, PeerDeviceInfo)>>,
 }
 
 impl DiagnosticsReader {
@@ -344,6 +351,7 @@ impl DiagnosticsReader {
             send_screen: Rc::new(|| None),
             per_peer_receive: Rc::new(Vec::new),
             per_peer_device_info: Rc::new(|_| None),
+            per_peer_device_all: Rc::new(Vec::new),
         }
     }
 }
@@ -357,6 +365,7 @@ impl PartialEq for DiagnosticsReader {
             && Rc::ptr_eq(&self.send_screen, &other.send_screen)
             && Rc::ptr_eq(&self.per_peer_receive, &other.per_peer_receive)
             && Rc::ptr_eq(&self.per_peer_device_info, &other.per_peer_device_info)
+            && Rc::ptr_eq(&self.per_peer_device_all, &other.per_peer_device_all)
     }
 }
 
