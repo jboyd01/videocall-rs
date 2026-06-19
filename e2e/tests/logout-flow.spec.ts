@@ -71,23 +71,31 @@ test.describe("Logout flow (#1547)", () => {
     await context.close();
   });
 
-  test("Sign Out clears tokens and navigates to /logout", async () => {
+  test("Sign Out performs a top-level navigation to /logout (not fetch)", async () => {
     const page = await context.newPage();
+
+    // Abort the /logout navigation so the page stays on the :3001 origin.
+    // The synchronous WASM clear_* + set_href fires before the browser leaves,
+    // and aborting prevents the cross-origin hop that would lose sessionStorage.
+    await page.route("**/logout*", async (route) => {
+      await route.abort();
+    });
+
     await page.goto("/");
 
-    // Wait for the authenticated dropdown trigger to appear (proves profile loaded)
     const trigger = page.locator(".auth-dropdown-trigger");
     await expect(trigger).toBeVisible({ timeout: 10_000 });
 
-    // The JWT cookie injection doesn't populate sessionStorage (it's cookie-based),
-    // but verify the auth dropdown IS showing (proves authenticated state)
-    await expect(trigger).toBeVisible();
-
-    // Track navigation to /logout
-    let logoutNavigationDetected = false;
+    // Track only NAVIGATION requests to /logout — fetch/XHR must not count.
+    let logoutNavDetected = false;
+    let logoutFetchDetected = false;
     page.on("request", (req) => {
       if (req.url().includes("/logout")) {
-        logoutNavigationDetected = true;
+        if (req.isNavigationRequest()) {
+          logoutNavDetected = true;
+        } else {
+          logoutFetchDetected = true;
+        }
       }
     });
 
@@ -97,17 +105,27 @@ test.describe("Logout flow (#1547)", () => {
     await expect(signoutBtn).toBeVisible();
     await signoutBtn.click();
 
-    // Verify: navigation to /logout occurred (top-level, not fetch)
-    // Give it a moment to navigate
+    // Give the set_href call a moment to fire
     await page.waitForTimeout(2_000);
-    expect(logoutNavigationDetected).toBe(true);
+
+    // The load-bearing assertion: /logout was reached via top-level navigation,
+    // NOT via fetch(). This is the exact regression class #1547 introduced.
+    expect(logoutNavDetected).toBe(true);
+    expect(logoutFetchDetected).toBe(false);
   });
 
   test("After logout, sessionStorage tokens are cleared", async () => {
     const page = await context.newPage();
 
-    // Seed some tokens in sessionStorage to simulate a real session
+    // Abort the /logout navigation so the page stays on the :3001 origin
+    // where we seeded the tokens. This lets us verify sessionStorage post-click.
+    await page.route("**/logout*", async (route) => {
+      await route.abort();
+    });
+
     await page.goto("/");
+
+    // Seed tokens in sessionStorage to simulate a real PKCE session
     await page.evaluate(() => {
       sessionStorage.setItem("vc_id_token", "fake-id-token");
       sessionStorage.setItem("vc_access_token", "fake-access-token");
@@ -118,26 +136,16 @@ test.describe("Logout flow (#1547)", () => {
     const trigger = page.locator(".auth-dropdown-trigger");
     await expect(trigger).toBeVisible({ timeout: 10_000 });
 
-    // Intercept the /logout navigation so we don't leave the page entirely
-    // (in the e2e stack there's no real /logout backend on port 8080)
-    await page.route("**/logout*", async (route) => {
-      await route.fulfill({
-        status: 302,
-        headers: { Location: "/" },
-      });
-    });
-
     // Click Sign Out
     await trigger.click();
     const signoutBtn = page.locator(".auth-dropdown-signout");
     await expect(signoutBtn).toBeVisible();
-
     await signoutBtn.click();
 
-    // Give the synchronous clear + navigation a moment
+    // The synchronous clear calls run before set_href fires. With navigation
+    // aborted, we stay on :3001 and can read the same-origin sessionStorage.
     await page.waitForTimeout(500);
 
-    // Tokens should be gone after the click handler runs
     const tokensAfter = await page.evaluate(() => ({
       idToken: sessionStorage.getItem("vc_id_token"),
       accessToken: sessionStorage.getItem("vc_access_token"),
