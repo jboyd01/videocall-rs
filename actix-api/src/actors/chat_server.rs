@@ -4584,6 +4584,10 @@ fn handle_msg(
     let emit_downlink_congestion: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let emit_flag = Arc::clone(&emit_downlink_congestion);
 
+    // issue #630: room + session are stable for the forwarder's lifetime, so the
+    // self-subject is precomputed once here instead of re-allocating it per packet.
+    let self_subject = format!("room.{room}.{session}").replace(' ', "_");
+
     let forward = move |msg: async_nats::Message,
                         parsed: Option<&PacketWrapper>|
           -> Result<(), std::io::Error> {
@@ -4655,7 +4659,7 @@ fn handle_msg(
         // client-sent CONGESTION/LAYER_HINT (anti-reflection) is a separate,
         // still-open concern tracked in #1119 and is orthogonal to delivery —
         // do not conflate the two here.
-        let subject_self = msg.subject == format!("room.{room}.{session}").replace(' ', "_").into();
+        let subject_self = msg.subject.as_str() == self_subject;
         // N.B. `session_id` inside the packet is partially attacker-controlled;
         // this field is only safe for self-echo suppression, not for identity verification.
         let inner_session_self = parsed
