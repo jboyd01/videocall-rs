@@ -152,6 +152,7 @@
 //!     None, // vad_threshold
 //!     Some(camera.shared_audio_tier_bitrate()),
 //!     Some(camera.shared_audio_tier_fec()),
+//!     Some(camera.shared_audio_tier_index()), // drives live Opus FEC reconfig (#1567)
 //!     1, // max simulcast layers (1 = single stream / off)
 //! );
 //! use std::sync::atomic::AtomicBool;

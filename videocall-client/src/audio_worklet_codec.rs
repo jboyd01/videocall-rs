@@ -170,6 +170,40 @@ pub enum CodecMessages<Options: Serialize> {
     Decode {
         pages: Vec<u8>,
     },
+    /// Live Opus ctl re-application on the RUNNING encoder (issue #1567), with
+    /// NO destroy/create — so a mid-call AQ audio-tier drop can actually engage
+    /// inband FEC without an audio gap or buffer re-alloc storm.
+    ///
+    /// Serializes (via `tag = "command"`, `rename_all = "camelCase"`) to
+    /// `{"command":"reconfigOpus","fec":<bool>,"packetLossPerc":<u32>}`. The
+    /// AudioWorklet (`encoderWorker.min.js`) handles the `reconfigOpus` command
+    /// by calling, on the live `OggOpusEncoder`,
+    /// `setOpusControl(4012, fec?1:0)` (OPUS_SET_INBAND_FEC) and
+    /// `setOpusControl(4014, packetLossPerc|0)` (OPUS_SET_PACKET_LOSS_PERC).
+    ///
+    /// This is the runtime-engagement half of #619/#1568: init still applies the
+    /// initial tier's FEC/DTX/loss (via [`EncoderInitOptions`]); this re-applies
+    /// FEC + loss-% when the tier later changes. DTX is intentionally NOT touched
+    /// here — every tier inits with DTX on, so it is already live for the whole
+    /// call and needs no runtime toggle. This is the INBAND-FEC ctl, separate
+    /// from the application-level RED path (`AUDIO_REDUNDANCY_ENABLED`).
+    ///
+    /// Safety: if this message is never sent, the worklet's behavior is
+    /// byte-identical to today; the worklet's `reconfigOpus` case lives inside
+    /// its `if (this.encoder)` guard, so a missing/destroyed encoder is a safe
+    /// no-op (not a throw).
+    ///
+    /// The enum-level `rename_all` renames the VARIANT (→ `"reconfigOpus"` tag),
+    /// not the inline fields, so the per-variant `rename_all` below is required
+    /// to emit `packetLossPerc` (the key the worklet reads as
+    /// `data.packetLossPerc`). Without it the field would serialize as
+    /// `packet_loss_perc` and the worklet would read `undefined` → `|0` → 0,
+    /// silently dropping the loss hint. The serde tests pin this.
+    #[serde(rename_all = "camelCase")]
+    ReconfigOpus {
+        fec: bool,
+        packet_loss_perc: u32,
+    },
 }
 
 pub type EncoderMessages = CodecMessages<EncoderInitOptions>;
@@ -317,6 +351,41 @@ mod tests {
             json.get("encoderPacketLossPerc").is_none(),
             "encoderPacketLossPerc must be omitted when unset"
         );
+    }
+
+    #[test]
+    fn reconfig_opus_serializes_with_exact_worklet_command_and_keys() {
+        // Live ctl-reconfig (issue #1567). The worklet's switch matches on
+        // `data.command === "reconfigOpus"` and reads `data.fec` /
+        // `data.packetLossPerc`. If the tag or either key name drifts, the
+        // worklet silently ignores the message (hits `default:`) and inband FEC
+        // never engages at runtime — so pin the EXACT wire shape, not just "it
+        // serializes".
+        let json = serde_json::to_value(EncoderMessages::ReconfigOpus {
+            fec: true,
+            packet_loss_perc: 15,
+        })
+        .expect("ReconfigOpus must serialize");
+
+        assert_eq!(json["command"], serde_json::json!("reconfigOpus"));
+        assert_eq!(json["fec"], serde_json::json!(true));
+        assert_eq!(json["packetLossPerc"], serde_json::json!(15));
+    }
+
+    #[test]
+    fn reconfig_opus_off_serializes_fec_false() {
+        // The recover path turns FEC back OFF; the worklet's `data.fec?1:0`
+        // must receive a literal `false` (not an omitted key) so it applies
+        // OPUS_SET_INBAND_FEC(0). `fec` is a plain bool field (no skip), so it
+        // always serializes.
+        let json = serde_json::to_value(EncoderMessages::ReconfigOpus {
+            fec: false,
+            packet_loss_perc: 0,
+        })
+        .expect("ReconfigOpus must serialize");
+
+        assert_eq!(json["fec"], serde_json::json!(false));
+        assert_eq!(json["packetLossPerc"], serde_json::json!(0));
     }
 
     #[test]

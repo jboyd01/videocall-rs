@@ -17,8 +17,9 @@
  */
 
 use crate::adaptive_quality_constants::{
-    AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS, AUDIO_CONGESTION_RECOVERY_TICK_MS, AUDIO_QUALITY_TIERS,
-    AUDIO_REDUNDANCY_ENABLED, AUDIO_RED_FORMAT, VAD_POLL_INTERVAL_MS,
+    AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS, AUDIO_CONGESTION_RECOVERY_TICK_MS,
+    AUDIO_FEC_RECONFIG_TICK_MS, AUDIO_QUALITY_TIERS, AUDIO_REDUNDANCY_ENABLED, AUDIO_RED_FORMAT,
+    VAD_POLL_INTERVAL_MS,
 };
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
@@ -261,6 +262,44 @@ fn audio_congestion_tick(
     (next, next, next_cut)
 }
 
+/// Change-detection + debounce for the live Opus FEC ctl-reconfig (issue #1567).
+///
+/// Given the audio tier's CURRENT `(enable_fec, packet_loss_perc)` and the
+/// `(fec, loss%)` we LAST sent to the worklet, returns `Some(current)` only when
+/// it differs (a real transition that must be re-applied to the live encoder),
+/// and `None` when unchanged (suppress — do not spam the worklet).
+///
+/// `last_sent == None` means "nothing applied beyond the encoder's INIT state".
+/// We treat the init state as the healthy top tier (`AUDIO_QUALITY_TIERS[0]` =
+/// FEC off, 0% loss) — the only tier the mic ever inits at (see
+/// [`MicrophoneEncoder::start`]). So a first observation that already equals
+/// `(false, 0)` is correctly suppressed (no redundant reconfig at startup while
+/// healthy), and the FIRST drop to a FEC tier returns `Some`, engaging FEC.
+///
+/// Pure (no clock, no atomics, no `Interval`) so the "only send on change"
+/// debounce — the mutation-meaningful core of the fix — is host-testable without
+/// a browser, mirroring how [`audio_congestion_tick`] is tested.
+///
+/// The CADENCE/rate-limit is supplied by the caller: the reconfig `Interval`
+/// ticks at [`AUDIO_FEC_RECONFIG_TICK_MS`] (1 Hz), so this helper can emit at
+/// most one reconfig per second, and only on a genuine FEC/loss transition. A
+/// tier that flaps but re-evaluates to the same `(fec, loss%)` between ticks is
+/// coalesced to a single (or zero) reconfig.
+fn audio_fec_reconfig_change(
+    current: (bool, u32),
+    last_sent: Option<(bool, u32)>,
+) -> Option<(bool, u32)> {
+    // The init state is the top tier: FEC off, 0% loss. Until we have sent an
+    // explicit reconfig, the live encoder is at that init state, so suppress a
+    // first observation that already matches it.
+    let baseline = last_sent.unwrap_or((false, 0));
+    if current == baseline {
+        None
+    } else {
+        Some(current)
+    }
+}
+
 /// Holds the previous audio frame for RED-style redundancy.
 pub(crate) struct PreviousAudioFrame {
     data: Vec<u8>,
@@ -388,6 +427,16 @@ pub struct MicrophoneEncoder {
     /// side (NOT the camera AQ loop) so recovery works even when the camera is
     /// off (audio-only).
     congestion_recovery_interval: Rc<RefCell<Option<Interval>>>,
+    /// Live Opus FEC ctl-reconfig timer (issue #1567). Created in [`Self::start`]
+    /// and torn down on stop / disable / reconnect exactly like
+    /// [`Self::vad_interval`] and [`Self::congestion_recovery_interval`], so it
+    /// cannot outlive the encoder. Ticks at
+    /// [`AUDIO_FEC_RECONFIG_TICK_MS`] (1 Hz), reads the shared audio-tier index,
+    /// and — only when the tier's `(enable_fec, packet_loss_perc)` changed —
+    /// posts a `reconfigOpus` message to the live worklet encoder(s). Owned on
+    /// the MIC side (NOT the camera AQ loop) so it works even when the camera is
+    /// off (audio-only), and so the worklet ports are in scope.
+    fec_reconfig_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
     /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps).
     /// Shared with the camera encoder's quality manager.
@@ -400,6 +449,15 @@ pub struct MicrophoneEncoder {
     /// When true AND `AUDIO_REDUNDANCY_ENABLED`, each packet carries the
     /// previous frame as redundant data for loss recovery.
     tier_enable_fec: Rc<AtomicBool>,
+    /// Current audio quality tier INDEX (0 = healthy "high", up; written by the
+    /// camera encoder's AQ loop on each audio-tier change). The live FEC
+    /// ctl-reconfig timer (issue #1567) reads this once per second, maps it to
+    /// `AUDIO_QUALITY_TIERS[idx]` to recover BOTH `enable_fec` and
+    /// `packet_loss_perc` from a single source of truth, and re-applies the Opus
+    /// ctl to the running worklet encoder when that pair changes. Sharing the
+    /// INDEX (not a second loss-% atom) keeps FEC and loss-% from ever drifting
+    /// apart vs. the existing `tier_enable_fec` bool. Defaults to 0 (top tier).
+    shared_audio_tier_index: Rc<AtomicU32>,
     /// User SEND audio layer-ceiling (perf-panel "layers published" thumb). The
     /// performance panel lets the user bound how many audio simulcast layers this
     /// publisher emits; the UI writes the chosen layer COUNT here (via
@@ -455,12 +513,17 @@ pub struct MicrophoneEncoder {
 impl MicrophoneEncoder {
     /// Construct a microphone encoder.
     ///
-    /// `shared_audio_tier_bitrate` and `shared_audio_tier_fec` are shared
-    /// atomics owned by the `CameraEncoder`. The camera encoder's quality
-    /// manager writes to these when the audio tier changes, and the
-    /// microphone encoder reads them to apply the current audio settings.
-    /// This avoids creating a duplicate `EncoderBitrateController` that
+    /// `shared_audio_tier_bitrate`, `shared_audio_tier_fec`, and
+    /// `shared_audio_tier_index` are shared atomics owned by the `CameraEncoder`.
+    /// The camera encoder's quality manager writes to these when the audio tier
+    /// changes, and the microphone encoder reads them to apply the current audio
+    /// settings. This avoids creating a duplicate `EncoderBitrateController` that
     /// would redundantly process the same diagnostics packets.
+    ///
+    /// `shared_audio_tier_index` (issue #1567) drives the live Opus FEC
+    /// ctl-reconfig timer: the mic maps the index to `AUDIO_QUALITY_TIERS[idx]`
+    /// to derive `(enable_fec, packet_loss_perc)` and re-apply them to the live
+    /// encoder worklet on a mid-call tier change.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: VideoCallClient,
@@ -470,6 +533,7 @@ impl MicrophoneEncoder {
         vad_threshold: Option<f32>,
         shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
         shared_audio_tier_fec: Option<Rc<AtomicBool>>,
+        shared_audio_tier_index: Option<Rc<AtomicU32>>,
         max_layers: u32,
     ) -> Self {
         let default_audio_bitrate_bps = AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000;
@@ -487,11 +551,18 @@ impl MicrophoneEncoder {
             is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
             congestion_recovery_interval: Rc::new(RefCell::new(None)),
+            fec_reconfig_interval: Rc::new(RefCell::new(None)),
             vad_threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
             tier_audio_bitrate: shared_audio_tier_bitrate
                 .unwrap_or_else(|| Rc::new(AtomicU32::new(default_audio_bitrate_bps))),
             tier_enable_fec: shared_audio_tier_fec
                 .unwrap_or_else(|| Rc::new(AtomicBool::new(default_enable_fec))),
+            // Audio tier INDEX shared from the camera AQ loop (issue #1567).
+            // Defaults to 0 (the healthy top tier the mic inits at) when no
+            // shared atom is provided, so the FEC-reconfig timer observes the
+            // init state and stays quiescent until a real tier change.
+            shared_audio_tier_index: shared_audio_tier_index
+                .unwrap_or_else(|| Rc::new(AtomicU32::new(0))),
             // User SEND audio layer-ceiling (perf-panel). Fail-open: u32::MAX =
             // Auto / no user cap until the panel writes a layer count.
             shared_user_layer_ceiling: Rc::new(AtomicU32::new(u32::MAX)),
@@ -608,6 +679,10 @@ impl MicrophoneEncoder {
         // Tear down the congestion-recovery timer (issue #621), mirroring the
         // vad_interval teardown above.
         if let Some(interval) = self.congestion_recovery_interval.borrow_mut().take() {
+            drop(interval);
+        }
+        // Tear down the live FEC ctl-reconfig timer (issue #1567), same pattern.
+        if let Some(interval) = self.fec_reconfig_interval.borrow_mut().take() {
             drop(interval);
         }
         // Reset speaking state and audio level when encoder stops
@@ -811,6 +886,15 @@ impl MicrophoneEncoder {
         let congestion_ceiling_for_recovery = self.shared_congestion_layer_ceiling.clone();
         let congestion_recovery_holder = self.congestion_recovery_interval.clone();
         let configured_audio_layers = n_audio_layers as u32;
+        // Live Opus FEC ctl-reconfig state (issue #1567), cloned into the async
+        // block. `fec_reconfig_tier_index` is the shared audio-tier index the
+        // camera AQ loop writes; `fec_reconfig_codecs` are the live worklet
+        // codec handles (Rc-backed, share the nodes with `self.codecs`) the
+        // timer posts `reconfigOpus` to; `fec_reconfig_holder` owns the timer so
+        // stop()/disable can tear it down.
+        let fec_reconfig_tier_index = self.shared_audio_tier_index.clone();
+        let fec_reconfig_codecs: Vec<AudioWorkletCodec> = self.codecs.clone();
+        let fec_reconfig_holder = self.fec_reconfig_interval.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -1278,6 +1362,72 @@ impl MicrophoneEncoder {
             });
             *congestion_recovery_holder.borrow_mut() = Some(recovery_interval);
 
+            // --- Live Opus FEC ctl-reconfig timer (issue #1567) ---
+            // Makes inband FEC actually ENGAGE on a mid-call AQ audio-tier drop
+            // (and DISENGAGE on recovery) WITHOUT an encoder teardown. The mic
+            // inits at the healthy top tier (FEC off); a later tier change only
+            // wrote shared atomics, so the live encoder never re-applied the
+            // Opus ctl. This 1 Hz timer reads the shared audio-tier index, maps
+            // it to `AUDIO_QUALITY_TIERS[idx]` to recover `(enable_fec,
+            // packet_loss_perc)`, and — ONLY when that pair changed since the
+            // last reconfig (see `audio_fec_reconfig_change`) — posts a
+            // `reconfigOpus` message to every live worklet encoder. The worklet
+            // calls OPUS_SET_INBAND_FEC (4012) + OPUS_SET_PACKET_LOSS_PERC
+            // (4014) on the RUNNING OggOpusEncoder. DTX is untouched (every tier
+            // inits with DTX on). This is the INBAND-FEC ctl, separate from the
+            // application-level RED path (`AUDIO_REDUNDANCY_ENABLED`).
+            //
+            // Cadence/debounce: a 1 Hz tick rate-limits reconfigs to at most one
+            // per second so a flapping tier cannot flood the worklet; the change
+            // check suppresses ticks where the tier is stable, so a steady call
+            // sends ZERO reconfigs. `last_sent = None` means the encoder is at
+            // its INIT state (top tier, FEC off), so the first observation while
+            // still healthy is correctly coalesced to no message.
+            let fec_enabled_check = enabled.clone();
+            let fec_switching_check = switching.clone();
+            let fec_tier_index = fec_reconfig_tier_index;
+            let fec_codecs = fec_reconfig_codecs;
+            // `None` = nothing re-applied beyond the encoder's init state.
+            let fec_last_sent: Rc<Cell<Option<(bool, u32)>>> = Rc::new(Cell::new(None));
+            let fec_reconfig_interval = Interval::new(AUDIO_FEC_RECONFIG_TICK_MS, move || {
+                if !fec_enabled_check.load(Ordering::Acquire)
+                    || fec_switching_check.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                // Map the live tier index to the static tier table; clamp
+                // defensively so a stale/out-of-range index can never panic.
+                let idx = (fec_tier_index.load(Ordering::Relaxed) as usize)
+                    .min(AUDIO_QUALITY_TIERS.len() - 1);
+                let tier = &AUDIO_QUALITY_TIERS[idx];
+                let current = (tier.enable_fec, tier.packet_loss_perc);
+                // Pure, host-tested change-detection: emit only on a real
+                // transition; coalesce an unchanged tier to no message.
+                if let Some((fec, packet_loss_perc)) =
+                    audio_fec_reconfig_change(current, fec_last_sent.get())
+                {
+                    // Re-apply to EVERY live layer's encoder (base + any
+                    // simulcast rungs) so all stay in lockstep. A not-yet/no-
+                    // longer-instantiated codec is a safe no-op: send_message
+                    // returns Err (no port) and the worklet's `reconfigOpus`
+                    // case is inside its `if(this.encoder)` guard.
+                    for codec in &fec_codecs {
+                        let _ = codec.send_message(
+                            &CodecMessages::<EncoderInitOptions>::ReconfigOpus {
+                                fec,
+                                packet_loss_perc,
+                            },
+                        );
+                    }
+                    fec_last_sent.set(Some((fec, packet_loss_perc)));
+                    log::info!(
+                        "MicrophoneEncoder: live Opus reconfig applied (tier {idx} '{}'): fec={fec}, packet_loss_perc={packet_loss_perc}",
+                        tier.label,
+                    );
+                }
+            });
+            *fec_reconfig_holder.borrow_mut() = Some(fec_reconfig_interval);
+
             // Monitor for stop conditions and clean up when needed
             let check_interval = VAD_POLL_INTERVAL_MS as i32; // Check every VAD_POLL_INTERVAL_MS
             let enabled_check_monitor = enabled.clone();
@@ -1313,6 +1463,10 @@ impl MicrophoneEncoder {
                     if let Some(interval) = congestion_recovery_holder.borrow_mut().take() {
                         drop(interval);
                     }
+                    // Tear down the live FEC ctl-reconfig timer too (issue #1567).
+                    if let Some(interval) = fec_reconfig_holder.borrow_mut().take() {
+                        drop(interval);
+                    }
 
                     // Stop the media track
                     audio_track.stop();
@@ -1342,10 +1496,13 @@ impl MicrophoneEncoder {
 #[cfg(test)]
 mod layer_count_tests {
     use super::{
-        audio_congestion_recover, audio_congestion_tick, audio_layer_is_published,
-        clamp_audio_layer_count, AUDIO_SIMULCAST_LAYER_KBPS, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
+        audio_congestion_recover, audio_congestion_tick, audio_fec_reconfig_change,
+        audio_layer_is_published, clamp_audio_layer_count, AUDIO_SIMULCAST_LAYER_KBPS,
+        AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
     };
-    use crate::adaptive_quality_constants::AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS;
+    use crate::adaptive_quality_constants::{
+        AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS, AUDIO_QUALITY_TIERS,
+    };
 
     #[test]
     fn clamp_audio_layer_count_treats_zero_and_one_as_one() {
@@ -1610,6 +1767,114 @@ mod layer_count_tests {
         let (c, _ls, cut) = audio_congestion_tick(c, ls, cfg, climb2_at + cd, cut, cd);
         assert_eq!(c, u32::MAX, "fully recovered after the second cooldown");
         assert_eq!(cut, None, "cut memory cleared on full recovery");
+    }
+
+    // --- Live Opus FEC ctl-reconfig change-detection (issue #1567) ---
+    //
+    // These pin the mutation-meaningful core of the runtime-engagement fix: the
+    // "only post a reconfigOpus when the tier's (fec, loss%) actually changed"
+    // debounce that the 1 Hz mic timer relies on. The actual Opus ctl
+    // re-application is browser/worklet runtime (validated by the serde-shape
+    // test in `audio_worklet_codec.rs` + manual/codec validation — see #619);
+    // these cover the change/suppress decision that gates whether a message is
+    // sent at all.
+
+    #[test]
+    fn fec_reconfig_suppresses_at_init_state_while_healthy() {
+        // First observation with last_sent=None and the encoder at its init
+        // (top-tier) state (FEC off, 0% loss) must NOT send a reconfig — the
+        // live encoder already inited there, so a startup message would be
+        // redundant spam.
+        assert_eq!(audio_fec_reconfig_change((false, 0), None), None);
+    }
+
+    #[test]
+    fn fec_reconfig_sends_on_drop_to_fec_tier() {
+        // The production scenario: start healthy (last_sent=None ≡ top tier),
+        // then the AQ audio tier drops to a FEC tier. This MUST emit so inband
+        // FEC actually engages on the live encoder.
+        assert_eq!(
+            audio_fec_reconfig_change((true, 10), None),
+            Some((true, 10)),
+            "drop to a FEC tier must engage FEC at runtime"
+        );
+    }
+
+    #[test]
+    fn fec_reconfig_suppresses_unchanged_tier() {
+        // A tier that re-evaluates to the SAME (fec, loss%) between ticks must be
+        // coalesced to no message — this is the anti-spam debounce. Mutating the
+        // helper to "always Some" would fail this; mutating it to "always None"
+        // would fail `sends_on_drop`/`toggles_off` — so the pair pins both arms.
+        assert_eq!(
+            audio_fec_reconfig_change((true, 10), Some((true, 10))),
+            None
+        );
+        assert_eq!(
+            audio_fec_reconfig_change((false, 0), Some((false, 0))),
+            None
+        );
+    }
+
+    #[test]
+    fn fec_reconfig_toggles_off_on_recovery() {
+        // Recovery: tier climbs from a FEC tier back to the healthy top tier.
+        // FEC must be turned back OFF on the live encoder (not left stuck on).
+        assert_eq!(
+            audio_fec_reconfig_change((false, 0), Some((true, 10))),
+            Some((false, 0)),
+            "recovery to the top tier must disengage FEC"
+        );
+    }
+
+    #[test]
+    fn fec_reconfig_sends_when_only_loss_perc_changes() {
+        // Stepping between two FEC tiers keeps fec=true but changes the loss
+        // hint (e.g. 10% → 15%); libopus scales FEC aggressiveness off this, so
+        // a loss-only change must still re-apply.
+        assert_eq!(
+            audio_fec_reconfig_change((true, 15), Some((true, 10))),
+            Some((true, 15)),
+            "a loss-% change at the same FEC state must re-apply"
+        );
+    }
+
+    #[test]
+    fn fec_reconfig_full_lifecycle_drop_then_recover() {
+        // End-to-end debounce trace over the real tier table, threading
+        // last_sent exactly as the timer does: healthy → FEC tier (engage) →
+        // same tier (suppress) → top tier (disengage) → top tier (suppress).
+        let top = (
+            AUDIO_QUALITY_TIERS[0].enable_fec,
+            AUDIO_QUALITY_TIERS[0].packet_loss_perc,
+        );
+        let fec_tier = (
+            AUDIO_QUALITY_TIERS[1].enable_fec,
+            AUDIO_QUALITY_TIERS[1].packet_loss_perc,
+        );
+        assert_eq!(top, (false, 0), "table sanity: top tier is FEC-off");
+        assert!(fec_tier.0, "table sanity: tier 1 enables FEC");
+
+        let mut last_sent: Option<(bool, u32)> = None;
+
+        // Healthy at init: suppress.
+        assert_eq!(audio_fec_reconfig_change(top, last_sent), None);
+
+        // Drop to the FEC tier: engage.
+        let sent = audio_fec_reconfig_change(fec_tier, last_sent);
+        assert_eq!(sent, Some(fec_tier));
+        last_sent = sent;
+
+        // Tier stable: suppress (no flap spam).
+        assert_eq!(audio_fec_reconfig_change(fec_tier, last_sent), None);
+
+        // Recover to the top tier: disengage.
+        let sent = audio_fec_reconfig_change(top, last_sent);
+        assert_eq!(sent, Some(top));
+        last_sent = sent;
+
+        // Healthy stable: suppress.
+        assert_eq!(audio_fec_reconfig_change(top, last_sent), None);
     }
 }
 

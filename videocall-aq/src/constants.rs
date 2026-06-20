@@ -1512,6 +1512,22 @@ pub const AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS: f64 = CLIMB_COOLDOWN_BASE_MS;
 /// 20 Hz VAD interval, which would wake 20× as often for a minutes-long cooldown).
 pub const AUDIO_CONGESTION_RECOVERY_TICK_MS: u32 = 1000;
 
+/// Poll cadence (milliseconds) of the live Opus FEC ctl-reconfig timer (issue
+/// #1567). The mic encoder runs a 1 Hz timer that reads the current audio tier,
+/// derives `(enable_fec, packet_loss_perc)`, and — ONLY when that pair changed
+/// since the last reconfig — posts a `reconfigOpus` message to the live encoder
+/// worklet so inband FEC actually engages on a mid-call AQ tier drop (and
+/// disengages on recovery).
+///
+/// 1 Hz is the chosen RATE-LIMIT: it caps reconfigs at one per second, so a
+/// flapping tier cannot flood the worklet, while still engaging FEC within ~1 s
+/// of a drop — far faster than packet-loss concealment matters at human
+/// timescales. Combined with the change-detection in `audio_fec_reconfig_change`
+/// (suppress when unchanged), a stable tier sends ZERO reconfigs. Matches
+/// [`AUDIO_CONGESTION_RECOVERY_TICK_MS`] so the two mic-side 1 Hz timers share a
+/// cadence and a wakeup budget on battery-constrained devices.
+pub const AUDIO_FEC_RECONFIG_TICK_MS: u32 = 1000;
+
 // ---------------------------------------------------------------------------
 // Client-Side WebSocket Backpressure Self-Detection
 // ---------------------------------------------------------------------------

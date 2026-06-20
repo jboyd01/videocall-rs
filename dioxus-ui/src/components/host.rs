@@ -207,6 +207,10 @@ pub fn Host(
             vad_threshold().ok(),
             Some(camera.shared_audio_tier_bitrate()),
             Some(camera.shared_audio_tier_fec()),
+            // Audio tier INDEX (issue #1567): drives the mic's live Opus FEC
+            // ctl-reconfig so inband FEC actually engages on a mid-call AQ
+            // audio-tier drop (and disengages on recovery).
+            Some(camera.shared_audio_tier_index()),
             // Audio simulcast layer ceiling (issue #989, Phase 3c → #1082):
             // decoupled from the VIDEO CPU ceiling (audio encodes off-main-thread
             // and is cheap), but still gated by the SAME runtime flag so it stays
