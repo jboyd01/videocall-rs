@@ -437,6 +437,177 @@ test.describe("Adaptive decode budget (#987)", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
+  // Test A (#1142 FINAL DESIGN) — THE GAP-1 REGRESSION GUARD.
+  //
+  // The persistent "N videos paused" pill
+  // (`data-testid="decode-paused-pill"`, see
+  // dioxus-ui/src/components/decode_paused_pill.rs) and the onset BANNER
+  // (`decode-budget-banner`) are MUTUALLY EXCLUSIVE: the pill suppresses while
+  // the banner is on screen and TAKES OVER the instant the banner hides —
+  // including when the banner is DISMISSED by the user. This pins issue #1142
+  // Gap 1: dismissing the alert banner must NOT leave the user in a silent
+  // paused state. The pill is the always-available signpost that survives the
+  // dismiss; it has NO back-off and NO dismiss button.
+  //
+  // WHY this is the high-value guard: if the pill used the OLD shadow-damper
+  // (an approximation that could not see the banner's dismiss), after dismiss
+  // the pill would stay suppressed and the paused state would go silent — the
+  // very Gap-1 defect. The fix wires the banner's TRUE on-screen visibility
+  // into a shared `banner_on_screen` signal the pill reads; the eligibility
+  // streak runs purely on `avatar_count` and is NOT disturbed by the banner, so
+  // when the banner hides an already-eligible pill appears immediately. The
+  // assertions below are ORDERED so that exact contract is what's pinned:
+  //   banner visible + pill suppressed → banner dismissed + tiles STILL paused
+  //   → pill now visible. Revert the Gap-1 fix and step 4 fails.
+  //
+  // Timing: the pill needs PILL_APPEAR_MS (2 s) of sustained off-budget tiles
+  // before it is eligible, then a 1 Hz poll publishes its output. By the time
+  // `enterPressuredAutoState` has the banner up, tiles have been paused well
+  // past 2 s, so the pill is already eligible-but-suppressed; after dismiss it
+  // surfaces on the next poll. We keep injecting LOW_FPS across the dismiss +
+  // poll window so the control loop does not let pressure decay and unpause the
+  // tiles before the pill assertion (no pass-by-timing-luck).
+  // ──────────────────────────────────────────────────────────────────────
+  test("dismissing the banner under sustained pressure surfaces the persistent paused pill", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "pill_after_dismiss");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+    if (!(await hasInjectHook(page))) {
+      test.skip(true, "window.__videocall_inject_render_fps not registered");
+      return;
+    }
+
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await closeSettingsModal(page);
+
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
+
+    await enterPressuredAutoState(page);
+
+    const banner = page.locator('[data-testid="decode-budget-banner"]');
+    const pill = page.locator('[data-testid="decode-paused-pill"]');
+
+    // The banner fires on onset; while it is on screen the pill is SUPPRESSED
+    // (the two are mutually exclusive).
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+    await expect(pill).toBeHidden();
+
+    // Dismiss the banner. The banner hides; the pill's eligibility streak is
+    // untouched by the dismiss (it ran purely on avatar_count), so it should
+    // now take over.
+    await page.locator('[data-testid="decode-budget-dismiss"]').click();
+    await expect(banner).not.toBeVisible({ timeout: 5_000 });
+
+    // KEY ASSERTION (Gap-1 fix). Keep injecting LOW_FPS so tiles stay paused
+    // across the ~1 Hz poll window, then prove tiles are STILL paused and the
+    // pill has surfaced. Generous timeout covers the poll cadence; the
+    // interleaved injections stop pressure decaying out from under the assert.
+    const pillAppeared = expect(pill).toBeVisible({ timeout: 15_000 });
+    for (let i = 0; i < 8; i++) {
+      await injectFps(page, LOW_FPS);
+      await page.waitForTimeout(INJECT_INTERVAL_MS);
+    }
+    await pillAppeared;
+
+    // Tiles must STILL be paused at the moment the pill is up — the pill is the
+    // signpost for the live paused state, not a stale artifact of the dismiss.
+    await expect(offBudgetTiles(page)).not.toHaveCount(0);
+
+    // The pill names the paused count ("N videos paused" on this desktop width).
+    await expect(pill).toContainText("paused");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test B (#1142 FINAL DESIGN) — the paused pill's "Show all" reveals every
+  // tile and persists the `All` override.
+  //
+  // The pill's action button (`decode-paused-pill-show-all`, visible text
+  // "Show all") takes the SAME escape-hatch path as the banner's Show-all and
+  // the appearance panel: it sets the decode-budget override to `All` (issue
+  // #1466) and persists the literal "all" to localStorage
+  // (`vc_decode_budget_override`). `All` tracks the live natural count, so every
+  // present peer decodes and stays decoded as peers join. Once avatar_count hits
+  // 0 the pill settles back to Hidden on its own — it has no dismiss.
+  //
+  // We reach the pill via the deterministic dismiss-then-pill route proven in
+  // Test A (banner up → dismiss → pill takes over), then click the pill's
+  // action and assert: all tiles decode, the pill auto-hides, and the override
+  // persisted as "all" (mirrors the banner Show-all test's assertion exactly).
+  // ──────────────────────────────────────────────────────────────────────
+  test("the paused pill Show all reveals every tile and persists the All override", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "pill_show_all");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+    if (!(await hasInjectHook(page))) {
+      test.skip(true, "window.__videocall_inject_render_fps not registered");
+      return;
+    }
+
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await closeSettingsModal(page);
+
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
+
+    await enterPressuredAutoState(page);
+
+    const banner = page.locator('[data-testid="decode-budget-banner"]');
+    const pill = page.locator('[data-testid="decode-paused-pill"]');
+
+    // Deterministic route to the pill: surface the banner, dismiss it, let the
+    // pill take over (the path Test A pins). Keep injecting LOW_FPS so tiles
+    // stay paused across the dismiss + poll window.
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+    await page.locator('[data-testid="decode-budget-dismiss"]').click();
+    await expect(banner).not.toBeVisible({ timeout: 5_000 });
+
+    const pillAppeared = expect(pill).toBeVisible({ timeout: 15_000 });
+    for (let i = 0; i < 8; i++) {
+      await injectFps(page, LOW_FPS);
+      await page.waitForTimeout(INJECT_INTERVAL_MS);
+    }
+    await pillAppeared;
+
+    // Click the pill's "Show all" — override → All.
+    await page.locator('[data-testid="decode-paused-pill-show-all"]').click();
+
+    // Every tile decodes again; no off-budget avatars remain. `All` tracks the
+    // live natural count, so this holds even though we never stopped the
+    // (now-ignored) low-FPS pressure injected above.
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0, { timeout: 15_000 });
+
+    // avatar_count → 0, so the pill settles to Hidden on its own (no dismiss).
+    await expect(pill).not.toBeVisible({ timeout: 10_000 });
+
+    // Persistence: the override is pinned to the `All` variant, persisted as the
+    // literal "all" (mirror of the banner Show-all test's assertion).
+    const stored = await page.evaluate(() => localStorage.getItem("vc_decode_budget_override"));
+    expect(stored).toBe("all");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
   // Test 3 — manual override takes effect with NO render-fps event (review
   // FIX 1). REGRESSION GUARD: the effective cap is derived at render time from
   // the override signal, so selecting Fixed(n) must produce exactly n decoded

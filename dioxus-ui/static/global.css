@@ -176,6 +176,13 @@ html[data-theme="dark"] {
    * contrast).
    */
   --error-text: #ff7a6e;
+  /*
+   * Higher-contrast warning amber for use as foreground TEXT on the glass
+   * surface (mirrors --error-text). Dark theme: the saturated --warning
+   * #ff9f0a already clears AA (~4.93:1) on the --btn-warning-bg-over-glass
+   * composite, so the dark value keeps it. The light theme below darkens it.
+   */
+  --warning-text: #ff9f0a;
 
   /* Liquid Glass material (theme-dependent) */
   --glass-bg: rgba(255, 255, 255, 0.06);
@@ -241,6 +248,13 @@ html[data-theme="light"] {
   --warning: #ff9f0a;
   --error: #ff3b30;
   --error-text: #d70015;
+  /*
+   * Light theme: --warning #ff9f0a on the faint --btn-warning-bg over the
+   * light glass computes only ~1.85:1 — fails AA badly. Darkened to #a85800,
+   * which clears AA at ~4.66:1 as TEXT on that button fill (and ~5.17:1 as a
+   * border against the surrounding pill glass) while still reading as amber.
+   */
+  --warning-text: #a85800;
   /*
    * Receive-quality tokens (issue #1131), light theme. The amber is darkened to
    * an AA-safe ochre (#9a6a00) since the chip background is faint over a light
@@ -1450,6 +1464,14 @@ html[data-theme="light"] #invite-overlay p {
   --radius-input: 12px;
   --radius-button: 10px;
   --radius-pill: 9999px;
+
+  /* Vertical room to reserve below the controls dock: dock bottom 20px + dock
+     height ~79px + ~12px gap = 112px. (The ~79px = .video-control-button 3.1rem
+     ≈49.6px + .video-controls-container padding 0.85rem×2 ≈27.2px + 2px border;
+     anchored at bottom 20px so its top edge is ≈99px from the viewport bottom.)
+     Used to anchor the decode-paused pill just above the controls dock in grid
+     mode. Issue 1142. */
+  --controls-dock-clearance: 112px;
 
   /* Gradient tokens — consolidated fade/rim/reflection effects */
   --gradient-fade-video: linear-gradient(

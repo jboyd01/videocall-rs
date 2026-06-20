@@ -511,16 +511,18 @@ h3 {
   opacity: 0.7;
 }
 
-/* Issue #987, task 1a.4: off-budget avatar tiles. These peers are present and
-   audible but their video is not being decoded (the adaptive decode-budget
-   controller capped how many tiles decode to protect CPU). A dashed border and
-   slightly muted surface distinguishes "I'm not decoding your video" from a
-   normal camera-off tile, without hiding who is in the meeting. The tile reuses
-   the standard `.grid-item` + `.placeholder-content` markup; only the framing
-   differs. E2E queries `.grid-item.off-budget-tile` / `[data-off-budget=true]`. */
+/* Off-budget avatar tiles. These peers are present and audible but their video
+   is not being decoded (the adaptive decode-budget controller capped how many
+   tiles decode to protect CPU). issue 1142 FINAL DESIGN consolidated the tile
+   treatment to a SINGLE signal: a slightly muted surface, the dimmed
+   placeholder content (`.placeholder-content--paused`), and a centered PLAY
+   overlay (`.decode-play-overlay`). The earlier dashed border was dropped — the
+   muted surface + dim + PLAY are enough to read "paused by your device" without
+   the noisier dashed framing. The tile reuses the standard `.grid-item` +
+   `.placeholder-content` markup. E2E queries `.grid-item.off-budget-tile` /
+   `[data-off-budget=true]`, so the class and attribute are LOAD-BEARING — do
+   not remove them. */
 .grid-item.off-budget-tile {
-  border-style: dashed;
-  border-color: var(--color-border-emphasis);
   background-color: var(--surface);
 }
 
@@ -4911,6 +4913,190 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
   .decode-budget-banner-action {
     padding: 0 10px;
+    font-size: 12px;
+  }
+}
+
+/* ── Decode-paused pill (issue 1142 FINAL DESIGN) ──────────────────────
+   The persistent "N videos paused" signpost. It is the steady-state counterpart
+   to the onset banner above; the two never co-exist on screen (the pill
+   suppresses while the banner is visible — see decode_paused_pill.rs).
+
+   Unlike the banner — which is a hardcoded-dark surface and so MUST use literal
+   light-on-dark colors (the issue 1189 trap) — the pill is a GLASS surface. It uses
+   the theme-aware glass + text tokens, so it reads correctly in BOTH light and
+   dark themes with no literal colors. In grid mode it anchors above the controls
+   dock via --controls-dock-clearance; in screen-share mode the dock is not the
+   bottom anchor, so it moves to the top (see the .has-screen-share override). */
+.decode-paused-pill {
+  position: absolute;
+  /* Grid-mode default: pinned bottom-center, just above the controls dock. */
+  bottom: var(--controls-dock-clearance);
+  top: auto;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 55;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: auto;
+  min-height: 36px;
+  padding: 0 6px 0 12px;
+  max-width: min(420px, calc(100% - 24px));
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  box-shadow: var(--shadow-sm);
+  font-family: inherit;
+  animation: decode-pill-enter 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.decode-paused-pill:hover {
+  background: var(--glass-bg-hover);
+}
+
+/* Screen-share mode: the controls dock is not the bottom anchor, so move the
+   pill to the top. Higher specificity (#grid-container.has-screen-share) than
+   the bare `.decode-paused-pill` and the ≤639px `.decode-paused-pill` rule, so
+   it wins on mobile in SS mode too. */
+#grid-container.has-screen-share .decode-paused-pill {
+  top: 12px;
+  bottom: auto;
+}
+
+.decode-paused-pill-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  color: var(--text-on-glass-muted);
+}
+
+/* Full label, shown >639px. */
+.decode-paused-pill-label {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* Compact "N paused" — hidden on wider viewports, shown ≤639px. */
+.decode-paused-pill-count {
+  display: none;
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.decode-paused-pill-action {
+  flex-shrink: 0;
+  /* a11y: a real ≥44px touch hit target. min-height (not a fixed height) sets
+     the rendered button height to 44px; the pill bar uses height:auto +
+     min-height:36px so it grows to CONTAIN this 44px action without the button
+     overhanging — same height:auto+padding technique as .decode-budget-banner. */
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 12px;
+  border-radius: var(--radius-pill);
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.decode-paused-pill-action-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.decode-paused-pill-action:hover {
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
+}
+
+.decode-paused-pill-action:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
+}
+
+/* Light theme: --warning (#ff9f0a) on the pale light btn-warning-bg over the
+   light glass fails WCAG AA (~1.85:1). The pill uses theme-aware glass (unlike
+   the always-dark banner), so the light case must use the darkened --warning-text
+   (#a85800, ~4.66:1 as text, ~5.17:1 as border). Issue 1142. */
+html[data-theme="light"] .decode-paused-pill-action {
+  color: var(--warning-text);
+  border-color: var(--warning-text);
+}
+
+/* Enter: cross-fade + a 2px lift. The transform must KEEP the centering
+   translateX(-50%) in every frame or the pill would jump horizontally. */
+@keyframes decode-pill-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Reduced motion: fade only, no lift — but KEEP translateX(-50%) so the pill
+   stays centered, and reset any hover transform (mirrors the
+   `.decode-play-overlay` reduced-motion technique). */
+@media (prefers-reduced-motion: reduce) {
+  .decode-paused-pill {
+    animation: decode-pill-enter-reduced 0.15s ease-out;
+  }
+  @keyframes decode-pill-enter-reduced {
+    from {
+      opacity: 0;
+      transform: translateX(-50%);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(-50%);
+    }
+  }
+}
+
+/* Mobile ≤639px: tighter chrome, swap the full label for the compact count,
+   and raise the grid-mode bottom anchor to clear the mobile controls dock. The
+   dock shrinks at @media (max-width: 640px) (NOT 568px) to button 2.75rem ≈44px
+   + padding 0.75rem×2 (24px) + 2px border ≈70px tall, at bottom: 1rem (16px), so
+   its top edge is ≈86px; pill bottom 98px = 86px + ~12px gap. At exactly 640px
+   the pill uses the desktop 112px clearance while the dock is already mobile
+   (top ~86px), so the pill sits comfortably above it — the 639/640 one-pixel
+   breakpoint offset is harmless. The SS-mode `top:12px` override above has higher
+   specificity, so it still wins in screen-share mode. */
+@media (max-width: 639px) {
+  .decode-paused-pill {
+    min-height: 34px;
+    padding: 0 5px 0 10px;
+    gap: 7px;
+    max-width: calc(100% - 16px);
+    bottom: 98px;
+  }
+  .decode-paused-pill-label {
+    display: none;
+  }
+  .decode-paused-pill-count {
+    display: inline-block;
+    font-size: 12px;
+  }
+  .decode-paused-pill-action {
     font-size: 12px;
   }
 }
