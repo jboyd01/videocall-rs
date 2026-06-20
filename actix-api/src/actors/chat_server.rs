@@ -58,7 +58,8 @@ use crate::metrics::{
     RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
     RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
-    RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
+    RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL,
+    RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL, RELAY_VIEWPORT_SET_SIZE,
     RELAY_VIEWPORT_UPDATES_TOTAL,
 };
 use videocall_types::protos::downlink_congestion_packet::DownlinkCongestionPacket;
@@ -4912,6 +4913,30 @@ fn handle_msg(
                 // filter below, dropping nothing on the viewport.
                 let viewport_enabled = crate::constants::viewport_filter_enabled();
                 if viewport_enabled {
+                    // #1437 invariant tripwire (defense-in-depth for the #988
+                    // is_video guard at line ~4903). We are inside `if is_video`,
+                    // so by construction `wire_media_kind == Ok(MediaKind::VIDEO)`
+                    // here and the branch below is DEAD on every real packet. It
+                    // exists only so that if a future refactor widens/moves the
+                    // `if is_video` guard and lets a non-VIDEO packet reach the
+                    // viewport drop-decision site, the counter trips (and
+                    // `debug_assert!` panics in debug builds) WITHOUT changing
+                    // forwarding behavior — observability only, no `return`, no
+                    // control-flow change. Cost on the happy path: one
+                    // already-known boolean re-check (`enum_value()` was computed
+                    // at line ~4879); no new lock, no allocation, no second
+                    // viewport-set read.
+                    let nonvideo_reached_drop_branch =
+                        crate::constants::nonvideo_reached_viewport_drop_branch(wire_media_kind);
+                    debug_assert!(
+                        !nonvideo_reached_drop_branch,
+                        "#1437: non-VIDEO packet reached viewport drop branch — #988 is_video guard regressed"
+                    );
+                    if nonvideo_reached_drop_branch {
+                        RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+                            .with_label_values(&[&room])
+                            .inc();
+                    }
                     // ----- Viewport filter (#988): "is this SENDER wanted?" -----
                     //
                     // Read the viewport set ONCE: derive both the drop decision and

@@ -180,6 +180,9 @@ pub fn forget_room_metrics(room: &str) {
     // Single-label room counters: one tuple each.
     let _ = RELAY_VIEWPORT_FILTERED_TOTAL.remove_label_values(&[room]);
     let _ = RELAY_VIEWPORT_FORWARDED_TOTAL.remove_label_values(&[room]);
+    // relay_viewport_nonvideo_at_drop_branch_total{room} (#1437): single-label
+    // `room`, one tuple — GC'd like its FILTERED/FORWARDED siblings.
+    let _ = RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL.remove_label_values(&[room]);
     let _ = RELAY_LAYER_FILTERED_TOTAL.remove_label_values(&[room]);
     let _ = RELAY_LAYER_FORWARDED_TOTAL.remove_label_values(&[room]);
     // relay_congestion_filtered_total{room} (#1220).
@@ -1126,6 +1129,30 @@ lazy_static! {
     )
     .expect("Failed to create relay_viewport_forwarded_total metric");
 
+    /// #1437 invariant tripwire — MUST ALWAYS BE 0 in production.
+    ///
+    /// Counts the IMPOSSIBLE case: a NON-VIDEO packet reaching the viewport
+    /// drop-decision site. The viewport filter is VIDEO-only and is guarded by
+    /// the `is_video` check at `chat_server.rs` (~line 4903, HCL #988); by
+    /// construction nothing but `MediaKind::VIDEO` can reach the drop branch, so
+    /// this counter can only increment if a FUTURE REFACTOR bypasses or widens
+    /// that `is_video` guard and lets AUDIO/SCREEN/unknown reach the viewport
+    /// drop-decision site. A NONZERO value is therefore a STRUCTURAL-INVARIANT
+    /// BREACH, not a normal viewport drop — it means the #988 guard regressed,
+    /// and should page (see the #1437 alert in alert_rules.yml). It is wired
+    /// purely as observability (a `debug_assert!` + this counter); it never
+    /// changes forwarding behavior. See #1437, #988.
+    ///
+    /// CARDINALITY: `room` only (user-provided, unbounded over time) — same
+    /// caveat as the other room-labeled counters above. Swept by
+    /// `forget_room_metrics` when the room drains.
+    pub static ref RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL: CounterVec = register_counter_vec!(
+        "relay_viewport_nonvideo_at_drop_branch_total",
+        "INVARIANT TRIPWIRE (must always be 0): non-VIDEO packets that reached the viewport drop-decision site — only possible if the #988 is_video guard regresses (HCL #1437)",
+        &["room"]
+    )
+    .expect("Failed to create relay_viewport_nonvideo_at_drop_branch_total metric");
+
     /// Current viewport (desired-streams) set size, per room (HCL #988).
     ///
     /// Updated on every ACCEPTED VIEWPORT inside `try_intercept_viewport`. A
@@ -1951,6 +1978,38 @@ mod tests {
     }
 
     #[test]
+    #[serial(viewport_nonvideo_guard_metric)]
+    fn viewport_nonvideo_guard_is_labeled_by_room_and_independent_of_filtered_and_forwarded() {
+        // The #1437 invariant tripwire must be its own series — bumping it must
+        // not leak into the FILTERED or FORWARDED counters (the "% filtered"
+        // panel and the blackout alert both depend on those two being clean).
+        let room = "wiretest_room_nonvideo_guard";
+        let guard_before = snapshot(&RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL, &[room]);
+        let filt_before = snapshot(&RELAY_VIEWPORT_FILTERED_TOTAL, &[room]);
+        let fwd_before = snapshot(&RELAY_VIEWPORT_FORWARDED_TOTAL, &[room]);
+
+        RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+            .with_label_values(&[room])
+            .inc();
+
+        assert_eq!(
+            snapshot(&RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL, &[room]) - guard_before,
+            1.0,
+            "guard bump must land on the nonvideo-guard series for this room"
+        );
+        assert_eq!(
+            snapshot(&RELAY_VIEWPORT_FILTERED_TOTAL, &[room]) - filt_before,
+            0.0,
+            "guard bump must NOT leak into the filtered series"
+        );
+        assert_eq!(
+            snapshot(&RELAY_VIEWPORT_FORWARDED_TOTAL, &[room]) - fwd_before,
+            0.0,
+            "guard bump must NOT leak into the forwarded series"
+        );
+    }
+
+    #[test]
     #[serial(viewport_updates_metric)]
     fn viewport_updates_increments_per_outcome() {
         // Cardinality contract: exactly four outcomes are valid labels. This
@@ -2178,6 +2237,9 @@ mod tests {
         RELAY_VIEWPORT_FORWARDED_TOTAL
             .with_label_values(&[room])
             .inc();
+        RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+            .with_label_values(&[room])
+            .inc();
         RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[room]).inc();
         RELAY_LAYER_FORWARDED_TOTAL.with_label_values(&[room]).inc();
         RELAY_CONGESTION_FILTERED_TOTAL
@@ -2252,6 +2314,13 @@ mod tests {
             1.0,
             "downlink-congestion-filtered seed must be observable before removal (non-vacuous)"
         );
+        assert_eq!(
+            RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            1.0,
+            "nonvideo-guard seed must be observable before removal (non-vacuous)"
+        );
 
         // Drain the room.
         forget_room_metrics(room);
@@ -2269,6 +2338,14 @@ mod tests {
                 .with_label_values(&[room])
                 .get(),
             0.0
+        );
+        assert_eq!(
+            RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0,
+            "relay_viewport_nonvideo_at_drop_branch_total{{room}} must be swept by \
+             forget_room_metrics (#1437)"
         );
         assert_eq!(
             RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[room]).get(),
