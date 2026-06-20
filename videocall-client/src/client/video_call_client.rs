@@ -2069,6 +2069,28 @@ impl VideoCallClient {
         }
     }
 
+    /// Lower this client's RECEIVED simulcast layer preferences in response to
+    /// LOCAL CPU/render pressure (Stage 1 of the #1562 decode-pressure cascade).
+    /// Called from the decode-budget loop on a Down edge. Composes with the relay
+    /// DOWNLINK_CONGESTION path: both want lower layers, and the chooser's one-rung
+    /// STEP + clean-window recovery make repeated seeds safe (floors at base; re-grows
+    /// when pressure clears). RECEIVER-ONLY: never touches the local publisher's
+    /// encoder. Returns whether any peer was stepped down.
+    ///
+    /// The wall clock is read HERE at the `&self` boundary (this method only ever
+    /// runs on wasm in production) and injected into the `Inner` helper, so the
+    /// shared `Inner::seed_local_congestion_and_publish` is itself clock-free and
+    /// host-testable with a fixed `now_ms`.
+    pub fn apply_local_cpu_pressure_congestion(&self) -> bool {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            let now_ms = js_sys::Date::now() as u64;
+            inner.seed_local_congestion_and_publish(now_ms)
+        } else {
+            warn!("apply_local_cpu_pressure_congestion: inner busy, layer step skipped this call");
+            false
+        }
+    }
+
     /// The user's current RECEIVE-side layer bounds (issue #989, Phase 4), for
     /// the UI to render its current min/max selection. Default fully-open.
     pub fn receive_layer_bounds(&self) -> ReceiveLayerBounds {
@@ -2804,6 +2826,51 @@ impl Inner {
         } else {
             true // duplicate
         }
+    }
+
+    /// Seed synthetic downlink congestion into every connected peer's receiver-side
+    /// LayerChooser (video+screen, audio protected) and publish the resulting layer
+    /// preference change through the change-detected sender. Returns whether anything
+    /// was seeded. Shared by BOTH the relay DOWNLINK_CONGESTION arm (#1219 Half 2) and
+    /// the LOCAL CPU-pressure path (#1569) so the two seed+publish bodies cannot drift.
+    /// STEP, not latch: the chooser's clean-window recovery re-grows layers when
+    /// pressure clears. Caller is responsible for any self-target gating (the relay arm
+    /// gates on session_id; local pressure has no session to gate).
+    ///
+    /// LOG-FREE on purpose: the relay arm keeps its own `warn!` above the call and the
+    /// local budget-loop caller relies on its existing cap-transition log, so a `warn!`
+    /// here would double-log on the relay path.
+    ///
+    /// `now_ms` is injected by the caller (one wall clock per cycle), mirroring
+    /// `seed_downlink_congestion_for_connected_peers` / `current_desired_preferences`.
+    /// Keeping the clock OUT of this helper makes it host-testable: a plain
+    /// `#[test]` can drive it with a fixed timestamp instead of trapping on the
+    /// `js_sys::Date::now()` wasm-bindgen import.
+    fn seed_local_congestion_and_publish(&mut self, now_ms: u64) -> bool {
+        // Copy snapshot of the user's receive bounds to avoid aliasing the
+        // `&mut peer_decode_manager` borrow below.
+        let bounds = self.receive_layer_bounds;
+        // Synthetic forced-congestion step-down: feeds a synthetic congested
+        // sample into each peer's chooser, independent of the real (zero on
+        // lossless transports) `last_video_downlink`. The early-seed primitive
+        // would no-op here because the real sample is not congested.
+        let seeded = self
+            .peer_decode_manager
+            .seed_downlink_congestion_for_connected_peers(now_ms, &bounds);
+        // Publish the resulting (possibly held) preference via the existing
+        // change-detected sender, exactly as `set_receive_layer_bounds` does.
+        let desired = self
+            .peer_decode_manager
+            .current_desired_preferences(now_ms, &bounds);
+        if let Some(entries) = self
+            .layer_preference_sender
+            .take_if_changed(&desired, now_ms)
+        {
+            let user_id = self.options.user_id.clone();
+            let cc = self.connection_controller.clone();
+            send_layer_preference_via(&cc, &user_id, entries);
+        }
+        seeded
     }
 
     /// Returns `true` if this host action event was already seen within the
@@ -3874,28 +3941,7 @@ impl Inner {
                          stepping down receive layer preferences (#1219 Half 2)"
                     );
                     let now_ms = js_sys::Date::now() as u64;
-                    // Copy snapshot of the user's receive bounds to avoid aliasing the
-                    // `&mut peer_decode_manager` borrow below.
-                    let bounds = self.receive_layer_bounds;
-                    // Synthetic forced-congestion step-down: feeds a synthetic congested
-                    // sample into each peer's chooser, independent of the real (zero on
-                    // lossless transports) `last_video_downlink`. The early-seed primitive
-                    // would no-op here because the real sample is not congested.
-                    self.peer_decode_manager
-                        .seed_downlink_congestion_for_connected_peers(now_ms, &bounds);
-                    // Publish the resulting (possibly held) preference via the existing
-                    // change-detected sender, exactly as `set_receive_layer_bounds` does.
-                    let desired = self
-                        .peer_decode_manager
-                        .current_desired_preferences(now_ms, &bounds);
-                    if let Some(entries) = self
-                        .layer_preference_sender
-                        .take_if_changed(&desired, now_ms)
-                    {
-                        let user_id = self.options.user_id.clone();
-                        let cc = self.connection_controller.clone();
-                        send_layer_preference_via(&cc, &user_id, entries);
-                    }
+                    self.seed_local_congestion_and_publish(now_ms);
                 }
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
@@ -4529,6 +4575,9 @@ mod cooldown_reset_hardening_tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use videocall_types::Callback;
+    // Receiver-side layer-chooser types, mirroring the host primitives in
+    // `peer_decode_manager.rs` (e.g. `downlink_congestion_steps_down_with_zero_loss`).
+    use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
 
     fn build_test_client() -> VideoCallClient {
         VideoCallClient::new(VideoCallClientOptions {
@@ -4578,6 +4627,92 @@ mod cooldown_reset_hardening_tests {
             is_guest: false,
             allow_post_rebase_retry: true,
         })
+    }
+
+    /// HOST `#[test]` (NOT `#[wasm_bindgen_test]`): the local CPU-pressure
+    /// seed+publish path is driven through the clock-free `Inner` helper
+    /// `seed_local_congestion_and_publish` (issue #1569), so it runs on the
+    /// native host target under `cargo test -p videocall-client --lib`. This is
+    /// the PER-PR HOST gate for the new shared seed path — unlike the now-deleted
+    /// `#[wasm_bindgen_test]` (which was `run_in_browser` and so ran ONLY under a
+    /// `/run-e2e` browser dispatch, never in per-PR CI). It asserts the REAL
+    /// step-down, not just "the method is wired".
+    ///
+    /// MUTATION CHECK: gut `Inner::seed_local_congestion_and_publish` to
+    /// `return false;` (or remove its
+    /// `seed_downlink_congestion_for_connected_peers` call) and ALL THREE
+    /// assertions below fail: (1) `seeded` becomes `false`; (2) the peer's chooser
+    /// stays at layer 2 instead of stepping to 1 (nothing seeded the synthetic
+    /// congestion); (3) `current_desired_preferences` no longer advertises
+    /// `Some(1)` for the peer's video, because the chooser never dropped below
+    /// the climbed-to top. The seeded peer reports ZERO real loss, so the
+    /// early-seed path cannot mask a gutted helper — only the synthetic seed in
+    /// the helper can produce the step-down.
+    ///
+    /// BORROW NOTE: `inner` is borrowed once for the whole test and the `Inner`
+    /// method is called DIRECTLY on it. We deliberately do NOT call the public
+    /// `client.apply_local_cpu_pressure_congestion()` here — that would re-borrow
+    /// `client.inner` while this guard is held and panic. The public wrapper only
+    /// reads the wall clock and forwards to this same helper, which is what we
+    /// test directly with a fixed `now_ms`.
+    #[test]
+    fn local_cpu_pressure_steps_connected_peer_down_one_rung() {
+        let client = build_test_client();
+        let mut inner = client.inner.borrow_mut();
+
+        // Seed a CONNECTED peer with a learned 3-layer ladder and a ZERO-LOSS
+        // real downlink sample (the WebSocket / reliable-WT blindness case): the
+        // only thing that can step it down is the synthetic seed inside the
+        // helper under test.
+        inner
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(700);
+
+        // One clean unconstrained tick climbs the chooser to the TOP (layer 2),
+        // so the synthetic seed has room to step DOWN from 2 to 1.
+        let open = ReceiveLayerBounds::default();
+        let _ = inner.peer_decode_manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "precondition: chooser climbed to the top before the local-pressure seed"
+        );
+
+        // The path under test: seed synthetic local-pressure congestion at a
+        // FIXED now_ms and publish the resulting preference. Returns whether
+        // anything was seeded.
+        let seeded = inner.seed_local_congestion_and_publish(2000);
+        assert!(
+            seeded,
+            "local CPU-pressure seed must report it stepped a connected peer down"
+        );
+
+        // The receiver-side decode guard stepped down exactly one rung: 2 -> 1.
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "local CPU-pressure seed must step the peer's video chooser down one rung (2 -> 1)"
+        );
+
+        // And the lowered preference is advertised through the change-detected
+        // sender's desired map.
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .current_desired_preferences(2000, &open)
+                .get(&(700, PrefMediaKind::Video))
+                .copied(),
+            Some(1),
+            "the stepped-down receive-layer preference must be advertised for the peer"
+        );
     }
 
     #[test]

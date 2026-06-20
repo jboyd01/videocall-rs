@@ -2615,8 +2615,11 @@ pub fn AttendantsComponent(
     //     session (a machine that demonstrated it can struggle stays in
     //     conservative adaptive mode). It is reset on a Fixed -> Auto transition.
     let mut decode_budget_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    let client_for_budget = client.clone();
     use_effect(move || {
+        let client_for_budget = client_for_budget.clone();
         let task = spawn(async move {
+            let client_for_budget = client_for_budget.clone();
             use crate::components::decode_budget::{
                 median_render_fps, non_distress_growth_qualifying, recovery_qualifying,
                 severe_label, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
@@ -2954,6 +2957,12 @@ pub fn AttendantsComponent(
                                 natural,
                             );
                         }
+                        // Issue #1569 — option (a) CONCURRENT: layer-down (resolution) and
+                        // tile-shed (count) are complementary actuators fired on the SAME
+                        // Down edge for fastest relief. Lowers RECEIVED simulcast layers
+                        // under local CPU pressure (Stage 1), composing with the relay
+                        // DOWNLINK_CONGESTION path. RECEIVER-ONLY.
+                        client_for_budget.apply_local_cpu_pressure_congestion();
                     }
                     continue;
                 }
@@ -3031,6 +3040,9 @@ pub fn AttendantsComponent(
                                 natural,
                             );
                         }
+                        // Issue #1569 — option (a) CONCURRENT layer-down on the same Down
+                        // edge as the tile-cap step. RECEIVER-ONLY.
+                        client_for_budget.apply_local_cpu_pressure_congestion();
                     }
                     BudgetStep::Up => {
                         let prev_cap = state.cap;

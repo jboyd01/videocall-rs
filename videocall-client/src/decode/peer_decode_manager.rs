@@ -2442,6 +2442,22 @@ impl PeerDecodeManager {
         }
     }
 
+    /// TEST-ONLY: insert a connected peer that has learned a 3-layer ladder
+    /// (`highest_available == 2`) and reports a ZERO-LOSS real downlink sample,
+    /// i.e. the WebSocket / reliable-WT case where per-peer telemetry can never
+    /// observe congestion. This is the minimal seam the HOST `#[test]`s in
+    /// `video_call_client.rs` need to drive `seed_local_congestion_and_publish`
+    /// against a real connected peer without touching any browser/JS API.
+    ///
+    /// `#[cfg(test)]`-gated so it never appears in production builds. It is a thin
+    /// wrapper over the existing host-safe `make_zero_loss_top_peer` test helper so
+    /// the 50-field `Peer` literal stays single-sourced (no duplication / drift).
+    #[cfg(test)]
+    pub(crate) fn insert_zero_loss_top_peer_for_test(&mut self, session_id: u64) {
+        self.connected_peers
+            .insert(session_id, make_zero_loss_top_peer(session_id));
+    }
+
     /// Set the callback used to send packets back through the connection.
     /// This is required for the PLI (keyframe request) mechanism.
     pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>, user_id: String) {
@@ -3884,6 +3900,135 @@ impl PeerDecodeManager {
 }
 
 // ---------------------------------------------------------------------------
+// Shared test fixtures (parent-module scope, still `#[cfg(test)]`)
+// ---------------------------------------------------------------------------
+// These were hoisted out of `mod tests` so the production-only test seam
+// `PeerDecodeManager::insert_zero_loss_top_peer_for_test` (a `#[cfg(test)]`
+// method on the main impl) can build the same host-safe peer without
+// duplicating the 50-field `Peer` literal. They never compile into a non-test
+// build. `mod tests` re-imports them via its `use super::*;`, so every existing
+// bare-name call site there keeps working unchanged.
+
+/// No-op audio decoder for unit tests.
+/// Muted state is stored in an `Rc<Cell<bool>>` so tests can inspect it
+/// after handing ownership to `Peer`.
+#[cfg(test)]
+struct MockAudioDecoder {
+    muted: Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(test)]
+impl MockAudioDecoder {
+    fn new() -> (Self, Rc<std::cell::Cell<bool>>) {
+        let muted = Rc::new(std::cell::Cell::new(true));
+        (
+            Self {
+                muted: muted.clone(),
+            },
+            muted,
+        )
+    }
+}
+
+#[cfg(test)]
+impl AudioPeerDecoderTrait for MockAudioDecoder {
+    fn decode(&mut self, _packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
+        Ok(DecodeStatus::SKIPPED)
+    }
+    fn flush(&mut self) {}
+    fn set_muted(&mut self, muted: bool) {
+        self.muted.set(muted);
+    }
+}
+
+/// Create a `Peer` with no-op decoders (no browser APIs required).
+/// Returns the peer and an `Rc<Cell<bool>>` handle to the mock audio
+/// decoder's muted state for test assertions.
+#[cfg(test)]
+fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
+    let sid_str = session_id.to_string();
+    let (mock_audio, muted_handle) = MockAudioDecoder::new();
+    let peer = Peer {
+        audio: Box::new(mock_audio),
+        video: VideoPeerDecoder::noop(),
+        screen: VideoPeerDecoder::noop(),
+        session_id,
+        sid_str,
+        user_id: "test@test.com".into(),
+        video_canvas_id: format!("video-{session_id}"),
+        screen_canvas_id: format!("screen-{session_id}"),
+        aes: None,
+        activity_count: 1,
+        missed_heartbeat_checks: 0,
+        video_enabled: false,
+        audio_enabled: false,
+        screen_enabled: false,
+        display_name: None,
+        device_info: PeerDeviceInfo::default(),
+        is_guest: false,
+        visible: false,
+        context_initialized: false,
+        has_received_heartbeat: false,
+        is_speaking: false,
+        audio_level: 0.0,
+        transport_type: TransportType::TRANSPORT_UNKNOWN,
+        vad_threshold: None,
+        selected_video_layer: 0,
+        video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+        video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+        last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        },
+        selected_screen_layer: 0,
+        screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+        screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+        last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        },
+        selected_audio_layer: 0,
+        audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+        audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+        video_seq_tracker: SequenceTracker::new(),
+        screen_seq_tracker: SequenceTracker::new(),
+        last_screen_frame_ms: 0,
+        last_video_frame_ms: 0,
+        last_audio_frame_ms: 0,
+        last_video_switch: LastLayerSwitch::default(),
+        last_screen_switch: LastLayerSwitch::default(),
+    };
+    (peer, muted_handle)
+}
+
+/// Build a connected peer with a learned 3-layer ladder (highest_available
+/// == 2) and a ZERO-LOSS real downlink sample (`{0.0, 0.0}`) — the WebSocket /
+/// reliable-WT case where the per-peer telemetry can never see congestion.
+/// This is the #1219 Half 2 precondition: unlike `make_congested_top_peer`,
+/// the real sample is NOT congested, so the early-seed path is a no-op here and
+/// only the synthetic DOWNLINK_CONGESTION seed can step the chooser down.
+#[cfg(test)]
+fn make_zero_loss_top_peer(session_id: u64) -> Peer {
+    let (mut peer, _muted) = make_test_peer(session_id);
+    // Learn layers 0,1,2 so highest_available == 2 (room to drop to 1).
+    for layer in 0..3u32 {
+        peer.video_layer_availability.observe(layer, 1000);
+        peer.screen_layer_availability.observe(layer, 1000);
+        peer.audio_layer_availability.observe(layer, 1000);
+    }
+    // Zero-loss real telemetry — the lossless-transport blindness (#1219).
+    peer.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+        loss_per_sec: 0.0,
+        kf_per_sec: 0.0,
+    };
+    peer.last_screen_downlink = crate::decode::layer_chooser::DownlinkSample {
+        loss_per_sec: 0.0,
+        kf_per_sec: 0.0,
+    };
+    peer
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
@@ -3899,36 +4044,11 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    // -- mock audio decoder -----------------------------------------------
-
-    /// No-op audio decoder for unit tests.
-    /// Muted state is stored in an `Rc<Cell<bool>>` so tests can inspect it
-    /// after handing ownership to `Peer`.
-    struct MockAudioDecoder {
-        muted: Rc<Cell<bool>>,
-    }
-
-    impl MockAudioDecoder {
-        fn new() -> (Self, Rc<Cell<bool>>) {
-            let muted = Rc::new(Cell::new(true));
-            (
-                Self {
-                    muted: muted.clone(),
-                },
-                muted,
-            )
-        }
-    }
-
-    impl AudioPeerDecoderTrait for MockAudioDecoder {
-        fn decode(&mut self, _packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
-            Ok(DecodeStatus::SKIPPED)
-        }
-        fn flush(&mut self) {}
-        fn set_muted(&mut self, muted: bool) {
-            self.muted.set(muted);
-        }
-    }
+    // `MockAudioDecoder`, `make_test_peer`, and `make_zero_loss_top_peer` were
+    // hoisted to the parent module (still `#[cfg(test)]`) so the production-only
+    // test seam `PeerDecodeManager::insert_zero_loss_top_peer_for_test` can build
+    // the same host-safe peer without duplicating the 50-field `Peer` literal.
+    // They remain reachable here unchanged via the `use super::*;` above.
 
     // -- helpers ----------------------------------------------------------
 
@@ -4019,65 +4139,6 @@ mod tests {
         let mut wrapper = packet_wrapper(&media, session_id);
         wrapper.simulcast_layer_id = layer;
         Arc::new(wrapper)
-    }
-
-    /// Create a `Peer` with no-op decoders (no browser APIs required).
-    /// Returns the peer and an `Rc<Cell<bool>>` handle to the mock audio
-    /// decoder's muted state for test assertions.
-    fn make_test_peer(session_id: u64) -> (Peer, Rc<Cell<bool>>) {
-        let sid_str = session_id.to_string();
-        let (mock_audio, muted_handle) = MockAudioDecoder::new();
-        let peer = Peer {
-            audio: Box::new(mock_audio),
-            video: VideoPeerDecoder::noop(),
-            screen: VideoPeerDecoder::noop(),
-            session_id,
-            sid_str,
-            user_id: "test@test.com".into(),
-            video_canvas_id: format!("video-{session_id}"),
-            screen_canvas_id: format!("screen-{session_id}"),
-            aes: None,
-            activity_count: 1,
-            missed_heartbeat_checks: 0,
-            video_enabled: false,
-            audio_enabled: false,
-            screen_enabled: false,
-            display_name: None,
-            device_info: PeerDeviceInfo::default(),
-            is_guest: false,
-            visible: false,
-            context_initialized: false,
-            has_received_heartbeat: false,
-            is_speaking: false,
-            audio_level: 0.0,
-            transport_type: TransportType::TRANSPORT_UNKNOWN,
-            vad_threshold: None,
-            selected_video_layer: 0,
-            video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
-            video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
-            last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
-                loss_per_sec: 0.0,
-                kf_per_sec: 0.0,
-            },
-            selected_screen_layer: 0,
-            screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
-            screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
-            last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
-                loss_per_sec: 0.0,
-                kf_per_sec: 0.0,
-            },
-            selected_audio_layer: 0,
-            audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
-            audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
-            video_seq_tracker: SequenceTracker::new(),
-            screen_seq_tracker: SequenceTracker::new(),
-            last_screen_frame_ms: 0,
-            last_video_frame_ms: 0,
-            last_audio_frame_ms: 0,
-            last_video_switch: LastLayerSwitch::default(),
-            last_screen_switch: LastLayerSwitch::default(),
-        };
-        (peer, muted_handle)
     }
 
     /// #1025 leak guard: `clear_send_packet_callback` (disconnect teardown) must
@@ -6507,32 +6568,6 @@ mod tests {
             "early-seed must advertise the clamped layer 0 (≤ user max), never \
              {advertised:?} above the user's cap"
         );
-    }
-
-    /// Build a connected peer with a learned 3-layer ladder (highest_available
-    /// == 2) and a ZERO-LOSS real downlink sample (`{0.0, 0.0}`) — the WebSocket /
-    /// reliable-WT case where the per-peer telemetry can never see congestion.
-    /// This is the #1219 Half 2 precondition: unlike `make_congested_top_peer`,
-    /// the real sample is NOT congested, so the early-seed path is a no-op here and
-    /// only the synthetic DOWNLINK_CONGESTION seed can step the chooser down.
-    fn make_zero_loss_top_peer(session_id: u64) -> Peer {
-        let (mut peer, _muted) = make_test_peer(session_id);
-        // Learn layers 0,1,2 so highest_available == 2 (room to drop to 1).
-        for layer in 0..3u32 {
-            peer.video_layer_availability.observe(layer, 1000);
-            peer.screen_layer_availability.observe(layer, 1000);
-            peer.audio_layer_availability.observe(layer, 1000);
-        }
-        // Zero-loss real telemetry — the lossless-transport blindness (#1219).
-        peer.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
-            loss_per_sec: 0.0,
-            kf_per_sec: 0.0,
-        };
-        peer.last_screen_downlink = crate::decode::layer_chooser::DownlinkSample {
-            loss_per_sec: 0.0,
-            kf_per_sec: 0.0,
-        };
-        peer
     }
 
     /// CORE REGRESSION (#1219 Half 2): a relay-authored DOWNLINK_CONGESTION must
