@@ -534,6 +534,11 @@ impl MicrophoneEncoder {
         }
     }
 
+    /// Returns a clone of the user layer ceiling atomic for the health reporter.
+    pub fn shared_user_layer_ceiling(&self) -> Rc<AtomicU32> {
+        self.shared_user_layer_ceiling.clone()
+    }
+
     /// Replace the internal CONGESTION audio layer-ceiling atom with an
     /// externally-owned one (issue #621).
     ///
@@ -1283,6 +1288,11 @@ impl MicrophoneEncoder {
                 );
                 if next != current {
                     recovery_ceiling.store(next, Ordering::Relaxed);
+                    log::info!(
+                        "MicrophoneEncoder: congestion ceiling {} -> {} (recovery)",
+                        current,
+                        next
+                    );
                 }
                 last_seen_ceiling.set(next_seen);
                 last_congestion_ms.set(next_cut);

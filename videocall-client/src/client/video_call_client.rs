@@ -2341,7 +2341,6 @@ impl VideoCallClient {
 
     /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &self,
         queue_depth_report: Rc<AtomicU32>,
@@ -2360,6 +2359,7 @@ impl VideoCallClient {
         active_screen_layers: Rc<AtomicU32>,
         effective_audio_layers: u32,
         audio_congestion_ceiling: Arc<AtomicU32>,
+        audio_user_layer_ceiling: Rc<AtomicU32>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -2380,6 +2380,7 @@ impl VideoCallClient {
                         active_screen_layers,
                         effective_audio_layers,
                         audio_congestion_ceiling,
+                        audio_user_layer_ceiling,
                     );
                 }
             }
@@ -3005,8 +3006,15 @@ impl Inner {
         // video/screen flags use `Release` only to pair with the `swap(false)`
         // `AcqRel` consume in their AQ loops; the audio ceiling has no such
         // consume, so do not "upgrade" this to `Release`.
-        self.audio_congestion_layer_ceiling
-            .store(1, Ordering::Relaxed);
+        let prev = self
+            .audio_congestion_layer_ceiling
+            .swap(1, Ordering::Relaxed);
+        if prev != 1 {
+            log::info!(
+                "MicrophoneEncoder: congestion ceiling cut to 1 layer (was {})",
+                prev
+            );
+        }
     }
 
     /// Returns the [`PeerStatus`] of the (possibly newly-created) peer so the

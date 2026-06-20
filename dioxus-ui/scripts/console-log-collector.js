@@ -1,12 +1,172 @@
 // Console Log Collector — captures browser console output and uploads periodically.
 // Reads window.__APP_CONFIG.consoleLogUploadEnabled; does nothing if falsy.
 // See docs/2026-04-13-console-log-collection-proposal.md for full design.
+//
+// IMPORTANT: The client metadata section below (GPU, network, battery, UA) is
+// independent of console-log upload because the WASM health reporter reads
+// window.__videocall_client_metadata directly. Operators can disable it with
+// hardwareMetricsEnabled=false.
 (function () {
   "use strict";
 
   var config = (window.__APP_CONFIG || {});
+  // Health telemetry is independent of console-log upload, but operators can
+  // disable hardware/network/battery collection explicitly. Default-on keeps
+  // existing production diagnostics and the vanilla local stack useful.
+  var hardwareMetricsEnabled = config.hardwareMetricsEnabled !== "false"
+    && config.hardwareMetricsEnabled !== false
+    && config.hardwareMetricsEnabled !== 0;
+
+  // ===========================================================================
+  // CLIENT METADATA (independent of log upload — feeds health_reporter.rs)
+  // ===========================================================================
+
+  var highEntropyPlatform = null;
+  var highEntropyArchitecture = null;
+  var highEntropyModel = null;
+  var highEntropyMobile = null;
+
+  if (hardwareMetricsEnabled && navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === "function") {
+    try {
+      navigator.userAgentData.getHighEntropyValues(["platform", "platformVersion", "architecture", "model"])
+        .then(function (ua) {
+          var pv = ua.platformVersion || "";
+          var major = parseInt(pv.split(".")[0], 10);
+          if (ua.platform === "Windows" && !isNaN(major)) {
+            highEntropyPlatform = major >= 13 ? "Windows 11" : "Windows 10";
+            highEntropyPlatform += " (platformVersion=" + pv + ")";
+          } else if (ua.platform) {
+            highEntropyPlatform = ua.platform + " " + pv;
+          }
+          if (ua.architecture) {
+            highEntropyArchitecture = ua.architecture;
+          }
+          highEntropyModel = ua.model || "";
+          highEntropyMobile = (ua.mobile === true);
+          updateClientMetadata();
+        })
+        .catch(function () {});
+    } catch (_) {}
+  }
+
+  // TELEM-1: GPU renderer detection
+  var gpuRenderer = null;
+  if (hardwareMetricsEnabled) {
+    try {
+      var _c = document.createElement("canvas");
+      var _gl = _c.getContext("webgl") || _c.getContext("experimental-webgl");
+      if (_gl) {
+        var _ext = _gl.getExtension("WEBGL_debug_renderer_info");
+        if (_ext) {
+          gpuRenderer = _gl.getParameter(_ext.UNMASKED_RENDERER_WEBGL);
+        }
+      }
+    } catch (_) {}
+  }
+
+  // TELEM-4: Network information (live — updated on change events)
+  var networkInfo = null;
+  function readNetworkInfo() {
+    if (hardwareMetricsEnabled && navigator.connection) {
+      networkInfo = {
+        effectiveType: navigator.connection.effectiveType || null,
+        downlink: navigator.connection.downlink || null,
+        rtt: navigator.connection.rtt || null,
+        saveData: navigator.connection.saveData || false,
+        type: navigator.connection.type || null,
+        downlinkMax: navigator.connection.downlinkMax || null,
+      };
+    }
+  }
+  readNetworkInfo();
+  if (hardwareMetricsEnabled && navigator.connection && navigator.connection.addEventListener) {
+    navigator.connection.addEventListener("change", function () {
+      readNetworkInfo();
+      updateClientMetadata();
+    });
+  }
+
+  // TELEM-5: Battery status (async, live — updated on change events)
+  var batteryInfo = null;
+  if (hardwareMetricsEnabled && navigator.getBattery) {
+    try {
+      navigator.getBattery().then(function (battery) {
+        batteryInfo = { charging: battery.charging, level: battery.level };
+        updateClientMetadata();
+        if (battery.addEventListener) {
+          battery.addEventListener("chargingchange", function () {
+            batteryInfo.charging = battery.charging;
+            updateClientMetadata();
+          });
+          battery.addEventListener("levelchange", function () {
+            batteryInfo.level = battery.level;
+            updateClientMetadata();
+          });
+        }
+      }).catch(function () {});
+    } catch (_) {}
+  }
+
+  // Shared helper: (re)write window.__videocall_client_metadata from current state.
+  // Called from async callbacks (getHighEntropyValues, getBattery, connection change)
+  // and from writePreamble().
+  function updateClientMetadata() {
+    if (!hardwareMetricsEnabled) {
+      return;
+    }
+    var nav = navigator || {};
+    var osStr = highEntropyPlatform
+      || (nav.userAgentData && nav.userAgentData.platform)
+      || nav.platform
+      || "";
+    var uaStr = (typeof nav.userAgent === "string") ? nav.userAgent : "";
+    var maxTouch = (typeof nav.maxTouchPoints === "number") ? nav.maxTouchPoints : 0;
+    var TABLET_RE = /ipad|tablet|sm-t|nexus 7|nexus 9/i;
+    var isIpadDesktopUA = (maxTouch > 1 && /Macintosh/.test(uaStr));
+    var deviceType = "";
+    if (highEntropyMobile === true) {
+      deviceType = "mobile";
+      if (TABLET_RE.test(highEntropyModel || "") || TABLET_RE.test(uaStr) || isIpadDesktopUA) {
+        deviceType = "tablet";
+      }
+    } else if (highEntropyMobile === false) {
+      deviceType = "desktop";
+    } else {
+      if (isIpadDesktopUA || /iPad/.test(uaStr)) {
+        deviceType = "tablet";
+      } else if (/Mobi|Android|iPhone/i.test(uaStr)) {
+        deviceType = "mobile";
+      } else {
+        deviceType = "desktop";
+      }
+    }
+    var deviceMemoryGb = (typeof nav.deviceMemory === "number") ? nav.deviceMemory : undefined;
+    window.__videocall_client_metadata = {
+      architecture: highEntropyArchitecture || "",
+      gpu: gpuRenderer || "",
+      network_effective_type: networkInfo ? (networkInfo.effectiveType || "") : "",
+      network_downlink: networkInfo ? (networkInfo.downlink || 0) : 0,
+      network_rtt: networkInfo ? (networkInfo.rtt || 0) : 0,
+      network_type: networkInfo ? (networkInfo.type || "") : "",
+      network_downlink_max: networkInfo ? (networkInfo.downlinkMax || 0) : 0,
+      battery_charging: batteryInfo ? batteryInfo.charging : null,
+      battery_level: batteryInfo ? batteryInfo.level : null,
+      os: osStr,
+      device_type: deviceType,
+      device_memory_gb: deviceMemoryGb
+    };
+  }
+
+  // Write initial metadata synchronously (before any async callbacks resolve)
+  if (hardwareMetricsEnabled) {
+    updateClientMetadata();
+  }
+
+  // ===========================================================================
+  // CONSOLE LOG CAPTURE (gated on consoleLogUploadEnabled)
+  // ===========================================================================
+
   if (config.consoleLogUploadEnabled !== "true") {
-    // Feature disabled — expose a no-op API so WASM calls do not throw.
     window.__consoleLogCollector = {
       setContext: function () {},
       setAuthToken: function () {},
@@ -38,131 +198,6 @@
   var uploadInFlight = false;
   var nextSeq = 0;
   var nextChunkSeq = 1;
-
-  var highEntropyPlatform = null;
-  var highEntropyArchitecture = null;
-  var highEntropyModel = null;
-  var highEntropyMobile = null;
-
-  if (navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === "function") {
-    try {
-      navigator.userAgentData.getHighEntropyValues(["platform", "platformVersion", "architecture", "model"])
-        .then(function (ua) {
-          var pv = ua.platformVersion || "";
-          var major = parseInt(pv.split(".")[0], 10);
-          if (ua.platform === "Windows" && !isNaN(major)) {
-            highEntropyPlatform = major >= 13 ? "Windows 11" : "Windows 10";
-            highEntropyPlatform += " (platformVersion=" + pv + ")";
-          } else if (ua.platform) {
-            highEntropyPlatform = ua.platform + " " + pv;
-          }
-          if (ua.architecture) {
-            highEntropyArchitecture = ua.architecture;
-          }
-          highEntropyModel = ua.model || "";
-          highEntropyMobile = (ua.mobile === true);
-          updateClientMetadata();
-        })
-        .catch(function () {});
-    } catch (_) {}
-  }
-
-  // TELEM-1: GPU renderer detection
-  var gpuRenderer = null;
-  try {
-    var _c = document.createElement("canvas");
-    var _gl = _c.getContext("webgl") || _c.getContext("experimental-webgl");
-    if (_gl) {
-      var _ext = _gl.getExtension("WEBGL_debug_renderer_info");
-      if (_ext) {
-        gpuRenderer = _gl.getParameter(_ext.UNMASKED_RENDERER_WEBGL);
-      }
-    }
-  } catch (_) {}
-
-  // TELEM-4: Network information
-  var networkInfo = null;
-  if (navigator.connection) {
-    networkInfo = {
-      effectiveType: navigator.connection.effectiveType || null,
-      downlink: navigator.connection.downlink || null,
-      rtt: navigator.connection.rtt || null,
-      saveData: navigator.connection.saveData || false,
-      type: navigator.connection.type || null,
-      downlinkMax: navigator.connection.downlinkMax || null,
-    };
-  }
-
-  // TELEM-5: Battery status (async)
-  var batteryInfo = null;
-  if (navigator.getBattery) {
-    try {
-      navigator.getBattery().then(function (battery) {
-        batteryInfo = { charging: battery.charging, level: battery.level };
-        updateClientMetadata();
-      }).catch(function () {});
-    } catch (_) {}
-  }
-
-  // Shared helper: (re)write window.__videocall_client_metadata from current state.
-  // Called from async callbacks (getHighEntropyValues, getBattery) and from writePreamble().
-  function updateClientMetadata() {
-    // Issue #1482: peer hardware metrics. Computed inline from live navigator.*
-    // plus the async-filled high-entropy module vars. Every navigator access is
-    // typeof/&&-guarded so this function can NEVER throw — a throw here would
-    // wipe out architecture/gpu/network/battery from the metadata object too.
-    var nav = navigator || {};
-    // os: highEntropyPlatform is ALREADY OS+version (e.g. "macOS 14.5"). The
-    // non-Chromium fallbacks (userAgentData.platform, navigator.platform) are
-    // platform-only with no version. "" => None on the Rust side.
-    var osStr = highEntropyPlatform
-      || (nav.userAgentData && nav.userAgentData.platform)
-      || nav.platform
-      || "";
-    // device_type: "desktop" | "mobile" | "tablet". When userAgentData
-    // high-entropy resolved, highEntropyMobile is a bool; otherwise (null,
-    // Firefox/Safari) fall back to coarse UA sniffing.
-    var uaStr = (typeof nav.userAgent === "string") ? nav.userAgent : "";
-    var maxTouch = (typeof nav.maxTouchPoints === "number") ? nav.maxTouchPoints : 0;
-    var TABLET_RE = /ipad|tablet|sm-t|nexus 7|nexus 9/i;
-    var isIpadDesktopUA = (maxTouch > 1 && /Macintosh/.test(uaStr));
-    var deviceType = "";
-    if (highEntropyMobile === true) {
-      deviceType = "mobile";
-      if (TABLET_RE.test(highEntropyModel || "") || TABLET_RE.test(uaStr) || isIpadDesktopUA) {
-        deviceType = "tablet";
-      }
-    } else if (highEntropyMobile === false) {
-      deviceType = "desktop";
-    } else {
-      // highEntropyMobile === null: userAgentData high-entropy unsupported
-      // (Firefox/Safari). Check iPad/tablet BEFORE the mobile regex.
-      if (isIpadDesktopUA || /iPad/.test(uaStr)) {
-        deviceType = "tablet";
-      } else if (/Mobi|Android|iPhone/i.test(uaStr)) {
-        deviceType = "mobile";
-      } else {
-        deviceType = "desktop";
-      }
-    }
-    // device_memory_gb: NUMERIC navigator.deviceMemory. Unsupported => undefined
-    // so the key is dropped from the JSON view and read as None on the Rust side.
-    var deviceMemoryGb = (typeof nav.deviceMemory === "number") ? nav.deviceMemory : undefined;
-    window.__videocall_client_metadata = {
-      architecture: highEntropyArchitecture || "",
-      gpu: gpuRenderer || "",
-      network_effective_type: networkInfo ? (networkInfo.effectiveType || "") : "",
-      network_downlink: networkInfo ? (networkInfo.downlink || 0) : 0,
-      network_rtt: networkInfo ? (networkInfo.rtt || 0) : 0,
-      network_type: networkInfo ? (networkInfo.type || "") : "",
-      network_downlink_max: networkInfo ? (networkInfo.downlinkMax || 0) : 0,
-      battery_charging: batteryInfo ? batteryInfo.charging : null,
-      battery_level: batteryInfo ? batteryInfo.level : null,
-      os: osStr,
-      device_type: deviceType,
-      device_memory_gb: deviceMemoryGb
-    };
-  }
 
   // ---------------------------------------------------------------------------
   // PII / secret scrubbing (best-effort, pattern-based)

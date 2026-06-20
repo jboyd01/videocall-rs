@@ -391,6 +391,12 @@ message HealthPacket {
   // a restrictive Windows power plan. Derived client-side from two existing
   // metrics (no new browser API). Absent when either input is unavailable.
   optional bool client_cpu_throttled = 100; // (#1556)
+
+  // Actual number of audio simulcast layers currently published after applying
+  // both the congestion ceiling and the user-selected send ceiling. Kept
+  // separate from audio_congestion_ceiling so a manual user cap is never
+  // attributed to congestion in telemetry.
+  optional uint32 active_audio_layers = 101; // (#1561)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

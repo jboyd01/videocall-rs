@@ -991,11 +991,12 @@ lazy_static! {
     .expect("Failed to create encoder_active_layers metric");
 
     /// Audio congestion ceiling: the congestion-driven dynamic layer cap (#1561).
-    /// Distinct from effective (configured max): this is the runtime cap applied
-    /// under congestion. MAX (u32::MAX or > 3) means uncapped.
+    /// Distinct from active layers: this is only the runtime cap applied under
+    /// congestion. In the uncapped state the exporter reports the effective
+    /// ladder depth so dashboards can compare the two without a sentinel value.
     pub static ref AUDIO_CONGESTION_CEILING: GaugeVec = register_gauge_vec!(
         "videocall_audio_congestion_ceiling",
-        "Audio congestion-driven layer ceiling (1-3 = capped, >3 = uncapped); absent when audio layers not active",
+        "Audio congestion-driven layer ceiling; equals effective audio layers when uncapped and is lower while congestion shedding is active",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create audio_congestion_ceiling metric");

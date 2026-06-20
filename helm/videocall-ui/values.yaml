@@ -61,6 +61,8 @@ runtimeConfig:
   screenBitrateKbps: 1000
   vadThreshold: 0.02
   consoleLogUploadEnabled: "false"
+  # Independent operator control for client hardware/network/battery telemetry.
+  hardwareMetricsEnabled: "true"
   imageTag: "latest"
 
 ingress:
