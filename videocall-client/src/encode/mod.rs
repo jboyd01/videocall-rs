@@ -107,10 +107,12 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
 /// Factory function to create the appropriate microphone encoder based on platform detection.
 ///
-/// `shared_audio_tier_bitrate` and `shared_audio_tier_fec` are optional shared
-/// atomics from the `CameraEncoder`. When provided, the microphone encoder
-/// reads the audio quality tier from the camera encoder's quality manager
-/// instead of creating its own `EncoderBitrateController`.
+/// `shared_audio_tier_bitrate`, `shared_audio_tier_fec`, and
+/// `shared_audio_tier_index` are optional shared atomics from the
+/// `CameraEncoder`. When provided, the microphone encoder reads the audio
+/// quality tier from the camera encoder's quality manager instead of creating
+/// its own `EncoderBitrateController`. `shared_audio_tier_index` (issue #1567)
+/// additionally drives the live Opus FEC ctl-reconfig on a mid-call tier change.
 #[allow(clippy::too_many_arguments)]
 pub fn create_microphone_encoder(
     client: VideoCallClient,
@@ -120,6 +122,7 @@ pub fn create_microphone_encoder(
     vad_threshold: Option<f32>,
     shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
     shared_audio_tier_fec: Option<Rc<AtomicBool>>,
+    shared_audio_tier_index: Option<Rc<AtomicU32>>,
     max_layers: u32,
 ) -> Box<dyn MicrophoneEncoderTrait> {
     Box::new(MicrophoneEncoder::new(
@@ -130,6 +133,7 @@ pub fn create_microphone_encoder(
         vad_threshold,
         shared_audio_tier_bitrate,
         shared_audio_tier_fec,
+        shared_audio_tier_index,
         max_layers,
     ))
 }
