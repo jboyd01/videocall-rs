@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Display, sync::Arc};
-use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, TransportType};
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
@@ -1564,7 +1564,14 @@ impl Peer {
                 ),
                 metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
                 metric!("audio_level", self.audio_level as f64),
-                metric!("peer_transport", transport_str),
+                // Zero-alloc per emit: `transport_str` is a `&'static str` from
+                // a literal match, so route it through the borrowing path
+                // (`Cow::Borrowed`) instead of the allocating `From<&str>`.
+                // This is the ~2 Hz/peer hot path from issue #1421.
+                Metric {
+                    name: "peer_transport",
+                    value: MetricValue::text_static(transport_str),
+                },
             ],
         };
         let _ = global_sender().try_broadcast(evt);

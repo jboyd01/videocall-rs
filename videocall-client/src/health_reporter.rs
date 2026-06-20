@@ -635,12 +635,12 @@ impl HealthReporter {
                                 match m.name {
                                     "active_server_url" => {
                                         if let MetricValue::Text(v) = &m.value {
-                                            *url_rc.borrow_mut() = Some(v.clone());
+                                            *url_rc.borrow_mut() = Some(v.to_string());
                                         }
                                     }
                                     "active_server_type" => {
                                         if let MetricValue::Text(v) = &m.value {
-                                            *typ_rc.borrow_mut() = Some(v.clone());
+                                            *typ_rc.borrow_mut() = Some(v.to_string());
                                         }
                                     }
                                     "active_server_rtt" => {
@@ -740,12 +740,12 @@ impl HealthReporter {
             match metric.name {
                 "from_peer" => {
                     if let MetricValue::Text(s) = &metric.value {
-                        reporting_peer = Some(s.clone());
+                        reporting_peer = Some(s.to_string());
                     }
                 }
                 "to_peer" => {
                     if let MetricValue::Text(s) = &metric.value {
-                        target_peer = Some(s.clone());
+                        target_peer = Some(s.to_string());
                     }
                 }
                 _ => {}

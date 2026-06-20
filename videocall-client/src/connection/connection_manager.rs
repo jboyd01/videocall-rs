@@ -41,7 +41,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric};
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -3562,7 +3562,10 @@ impl ConnectionManager {
             } => {
                 let elapsed = monotonic_now_ms() - start_time;
                 let progress = (elapsed / *duration_ms as f64).min(1.0) as f32;
-                metrics.push(metric!("election_state", "testing"));
+                metrics.push(Metric {
+                    name: "election_state",
+                    value: MetricValue::text_static("testing"),
+                });
                 metrics.push(metric!("election_progress", progress as f64));
                 metrics.push(metric!("servers_total", self.connections.len() as u64));
 
@@ -3573,7 +3576,10 @@ impl ConnectionManager {
                 connection_id,
                 elected_at,
             } => {
-                metrics.push(metric!("election_state", "elected"));
+                metrics.push(Metric {
+                    name: "election_state",
+                    value: MetricValue::text_static("elected"),
+                });
                 metrics.push(metric!("active_connection_id", connection_id.as_str()));
                 metrics.push(metric!("elected_at", *elected_at));
 
@@ -3609,7 +3615,10 @@ impl ConnectionManager {
                 }
             }
             ElectionState::Failed { reason, failed_at } => {
-                metrics.push(metric!("election_state", "failed"));
+                metrics.push(Metric {
+                    name: "election_state",
+                    value: MetricValue::text_static("failed"),
+                });
                 metrics.push(metric!("failure_reason", reason.as_str()));
                 metrics.push(metric!("failed_at", *failed_at));
             }
@@ -3786,15 +3795,20 @@ impl ConnectionManager {
             let redacted_server_url = url_redact::redact_for_diag(measurement.url.as_str());
             let server_metrics = vec![
                 metric!("server_url", redacted_server_url.as_str()),
-                metric!(
-                    "server_type",
-                    if measurement.is_webtransport {
+                // `server_type` / `server_status` are `&'static str` literals,
+                // so route them through the zero-alloc borrowing path (#1421).
+                Metric {
+                    name: "server_type",
+                    value: MetricValue::text_static(if measurement.is_webtransport {
                         "webtransport"
                     } else {
                         "websocket"
-                    }
-                ),
-                metric!("server_status", status),
+                    }),
+                },
+                Metric {
+                    name: "server_status",
+                    value: MetricValue::text_static(status),
+                },
                 metric!("server_active", measurement.active as u64),
                 metric!("server_connected", connected as u64),
                 metric!("measurement_count", measurement.measurements.len() as u64),
@@ -8989,8 +9003,6 @@ mod tests {
     // -------------------------------------------------------------------
     #[test]
     fn report_diagnostics_does_not_emit_token_in_active_server_url() {
-        use videocall_diagnostics::MetricValue;
-
         // Build a manager and seed an Elected state with an `rtt_measurements`
         // entry whose URL embeds a JWT and instance_id — exactly what the live
         // path produces.
@@ -9057,8 +9069,6 @@ mod tests {
     // -------------------------------------------------------------------
     #[test]
     fn report_diagnostics_does_not_emit_token_in_per_server_url() {
-        use videocall_diagnostics::MetricValue;
-
         // Mirror the live path: an `rtt_measurements` entry whose URL embeds
         // the JWT exactly as `append_instance_id` produces.
         let mut mgr = make_test_manager();

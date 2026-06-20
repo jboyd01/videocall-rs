@@ -809,7 +809,7 @@ fn spawn_layer_switch_freshness_observer(inner: &Rc<RefCell<Inner>>) {
             let mut head_age_ms: Option<f64> = None;
             for m in &event.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(v)) => to_peer = Some(v.clone()),
+                    ("to_peer", MetricValue::Text(v)) => to_peer = Some(v.to_string()),
                     ("head_age_ms", MetricValue::F64(v)) => head_age_ms = Some(*v),
                     _ => {}
                 }
