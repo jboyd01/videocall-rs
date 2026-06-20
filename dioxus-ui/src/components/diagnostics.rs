@@ -81,8 +81,8 @@ fn update_reception(
     let mut kf = None;
     for m in &evt.metrics {
         match (m.name, &m.value) {
-            ("to_peer", MetricValue::Text(t)) => peer = Some(t.clone()),
-            ("media_type", MetricValue::Text(t)) => kind = Some(t.clone()),
+            ("to_peer", MetricValue::Text(t)) => peer = Some(t.to_string()),
+            ("media_type", MetricValue::Text(t)) => kind = Some(t.to_string()),
             ("fps_received", MetricValue::F64(v)) => fps = Some(*v),
             ("bitrate_kbps", MetricValue::F64(v)) => bitrate = Some(*v),
             ("video_seq_loss_per_sec", MetricValue::F64(v)) => loss = Some(*v),
@@ -305,7 +305,7 @@ impl ConnectionManagerState {
             match metric.name.as_str() {
                 "election_state" => {
                     if let MetricValue::Text(text) = &metric.value {
-                        state.election_state = text.clone();
+                        state.election_state = text.to_string();
                     }
                 }
                 "election_progress" => {
@@ -332,17 +332,17 @@ impl ConnectionManagerState {
                 }
                 "active_connection_id" => {
                     if let MetricValue::Text(id) = &metric.value {
-                        state.active_connection_id = Some(id.clone());
+                        state.active_connection_id = Some(id.to_string());
                     }
                 }
                 "active_server_url" => {
                     if let MetricValue::Text(url) = &metric.value {
-                        state.active_server_url = Some(url.clone());
+                        state.active_server_url = Some(url.to_string());
                     }
                 }
                 "active_server_type" => {
                     if let MetricValue::Text(server_type) = &metric.value {
-                        state.active_server_type = Some(server_type.clone());
+                        state.active_server_type = Some(server_type.to_string());
                     }
                 }
                 "active_server_rtt" => {
@@ -352,7 +352,7 @@ impl ConnectionManagerState {
                 }
                 "failure_reason" => {
                     if let MetricValue::Text(reason) = &metric.value {
-                        state.failure_reason = Some(reason.clone());
+                        state.failure_reason = Some(reason.to_string());
                     }
                 }
                 _ => {}
@@ -378,17 +378,17 @@ impl ConnectionManagerState {
             match metric.name.as_str() {
                 "server_url" => {
                     if let MetricValue::Text(url) = &metric.value {
-                        server.url = url.clone();
+                        server.url = url.to_string();
                     }
                 }
                 "server_type" => {
                     if let MetricValue::Text(st) = &metric.value {
-                        server.server_type = st.clone();
+                        server.server_type = st.to_string();
                     }
                 }
                 "server_status" => {
                     if let MetricValue::Text(status) = &metric.value {
-                        server.status = status.clone();
+                        server.status = status.to_string();
                     }
                 }
                 "server_rtt" => {
@@ -852,12 +852,12 @@ pub fn Diagnostics(
                             match m.name {
                                 "to_peer" => {
                                     if let MetricValue::Text(t) = &m.value {
-                                        peer_id = Some(t.clone());
+                                        peer_id = Some(t.to_string());
                                     }
                                 }
                                 "peer_transport" => {
                                     if let MetricValue::Text(t) = &m.value {
-                                        transport = Some(t.clone());
+                                        transport = Some(t.to_string());
                                     }
                                 }
                                 _ => {}
@@ -2044,9 +2044,9 @@ mod tests {
             metrics: vec![
                 m("fps_received", MetricValue::F64(30.0)),
                 m("bitrate_kbps", MetricValue::F64(850.0)),
-                m("media_type", MetricValue::Text("VIDEO".to_string())),
-                m("from_peer", MetricValue::Text("self-id".to_string())),
-                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("from_peer", MetricValue::Text("self-id".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
             ],
         };
         assert!(update_reception(&mut map, &evt), "keyed event must fold");
@@ -2089,8 +2089,8 @@ mod tests {
             metrics: vec![
                 m("fps_received", MetricValue::F64(30.0)),
                 m("bitrate_kbps", MetricValue::F64(850.0)),
-                m("media_type", MetricValue::Text("VIDEO".to_string())),
-                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
             ],
         };
         let loss = DiagEvent {
@@ -2098,8 +2098,8 @@ mod tests {
             stream_id: None,
             ts_ms: 1_500_000,
             metrics: vec![
-                m("media_type", MetricValue::Text("VIDEO".to_string())),
-                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
                 m("video_seq_loss_per_sec", MetricValue::F64(2.5)),
                 m("keyframe_requests_per_sec", MetricValue::F64(0.5)),
             ],
@@ -2141,8 +2141,8 @@ mod tests {
             metrics: vec![
                 m("fps_received", MetricValue::F64(30.0)),
                 m("bitrate_kbps", MetricValue::F64(850.0)),
-                m("media_type", MetricValue::Text("VIDEO".to_string())),
-                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
             ],
         };
         let mut map = BTreeMap::new();

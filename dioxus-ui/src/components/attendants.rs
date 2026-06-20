@@ -6392,7 +6392,7 @@ fn parse_peer_status_event(
     let mut screen = false;
     for m in &evt.metrics {
         match (m.name, &m.value) {
-            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
             ("audio_enabled", MetricValue::U64(v)) => audio = *v != 0,
             ("video_enabled", MetricValue::U64(v)) => video = *v != 0,
             ("screen_enabled", MetricValue::U64(v)) => screen = *v != 0,
@@ -6422,7 +6422,7 @@ fn parse_speaking_peer(evt: &videocall_diagnostics::DiagEvent) -> Option<String>
     let mut speaking: Option<bool> = None;
     for m in &evt.metrics {
         match (m.name, &m.value) {
-            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
             ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v),
             ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
             _ => {}
