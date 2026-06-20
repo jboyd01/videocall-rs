@@ -24,6 +24,7 @@ use crate::components::decode_budget::{
     BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
+use crate::components::decode_paused_pill::DecodePausedPill;
 use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
@@ -688,6 +689,15 @@ pub fn AttendantsComponent(
     // it with the live `total_tiles` on the first frame, after which the loop
     // seeds/tracks the cap up to it.
     let mut decode_budget_natural = use_signal(|| MIN_CAP);
+    // Shared "is the decode-budget banner ACTUALLY on screen right now" flag,
+    // owned here so the banner (writer) and the persistent paused pill (reader)
+    // — sibling children below — agree on a single source of truth. The banner
+    // publishes its TRUE effective visibility (`damper_visible && !dismissed &&
+    // avatar_count > 0`) into this; the pill reads it to stay exactly mutually
+    // exclusive with the banner, including after the user DISMISSES the banner
+    // while tiles are still paused (#1142 Gap 1) — a case the old shadow-damper
+    // proxy could not observe.
+    let banner_on_screen = use_signal(|| false);
     // Device-class decode-tile ceiling (issue #1286 / #1289). Computed ONCE per
     // mount (it depends only on the platform + core count, neither of which
     // changes within a session) and reused by BOTH `effective_cap` call sites
@@ -4272,7 +4282,17 @@ pub fn AttendantsComponent(
     // meeting so it fills the viewport. 2+ tiles keep the cap and the tile
     // size is driven by `--tile-w` / `--tile-h` (set above) — see the
     // `tile_count == 1` branch in `container_style`.
-    let container_class = format!("participants-{tile_count}");
+    // Append `has-screen-share` so CSS can re-anchor the decode-paused pill
+    // (issue 1142): in SS mode the controls dock is not the bottom anchor, so
+    // the pill moves to top:12px via `#grid-container.has-screen-share
+    // .decode-paused-pill`. `container_class` is consumed only at the
+    // `#grid-container` `class:` binding below — nothing keys off the exact
+    // string — so appending the modifier is safe.
+    let container_class = if has_screen_share {
+        format!("participants-{tile_count} has-screen-share")
+    } else {
+        format!("participants-{tile_count}")
+    };
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -4928,6 +4948,33 @@ pub fn AttendantsComponent(
                             avatar_tiles.len()
                         },
                         natural: total_tiles,
+                        on_screen: banner_on_screen,
+                    }
+
+                    // Persistent "N videos paused" pill (#1142 FINAL DESIGN).
+                    // Sibling of the banner. The banner is the onset alert
+                    // (heavily anti-flapped, backs off); the pill is the
+                    // persistent level signpost that holds the affordance for as
+                    // long as tiles are paused. The two never co-exist on screen:
+                    // the pill reads the banner's PUBLISHED on-screen state
+                    // (dismiss-aware) via the shared `banner_on_screen` signal and
+                    // suppresses itself while the banner is actually on screen — so
+                    // when the banner backs off, hides naturally, OR is dismissed
+                    // by the user, the pill takes over the signpost. No shadow
+                    // approximation of the damper. Co-existence is prevented
+                    // immediately (the pill's render gate reads the banner's
+                    // published state reactively, so a banner appearance
+                    // suppresses the pill on the same frame); the reverse takeover
+                    // when the banner hides has up to ~1 s latency from the pill's
+                    // 1 Hz poll — a brief gap, never an overlap.
+                    DecodePausedPill {
+                        avatar_count: if has_screen_share {
+                            ss_avatar_tiles.len()
+                        } else {
+                            avatar_tiles.len()
+                        },
+                        natural: total_tiles,
+                        banner_on_screen: banner_on_screen,
                     }
 
                     if has_screen_share {
