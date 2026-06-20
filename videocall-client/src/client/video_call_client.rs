@@ -458,6 +458,16 @@ struct Inner {
     /// self-targeted CONGESTION sets BOTH so both publishers step down. Like the
     /// split `force_camera_keyframe` / `force_screen_keyframe` flags above.
     screen_congestion_step_down_requested: Arc<AtomicBool>,
+    /// Rolling 1-second window start (wall-clock ms) for rate-capping the
+    /// self-targeted DOWNLINK_CONGESTION `warn!`. See `congestion_warn_admit`.
+    congestion_warn_window_start_ms: u64,
+    /// Count of self-targeted CONGESTION `warn!`s emitted in the current
+    /// rolling window. Reset when the window rolls over (see `congestion_warn_admit`).
+    congestion_warn_count_in_window: u32,
+    /// Observability: total self-targeted DOWNLINK_CONGESTION signals received
+    /// (warned OR muted) for the lifetime of this client. Exposed via
+    /// `VideoCallClient::client_congestion_signals_received_total`.
+    client_congestion_signals_received_total: u64,
     /// CONGESTION-driven AUDIO simulcast layer-ceiling (issue #621). Unlike the
     /// camera/screen `AtomicBool` step-down FLAGS above — which are consumed
     /// (`swap(false)`) by an encoder AQ loop — this is a layer-COUNT atom shared
@@ -1263,6 +1273,9 @@ impl VideoCallClient {
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 screen_congestion_step_down_requested: screen_congestion_step_down_requested
                     .clone(),
+                congestion_warn_window_start_ms: 0,
+                congestion_warn_count_in_window: 0,
+                client_congestion_signals_received_total: 0,
                 audio_congestion_layer_ceiling: audio_congestion_layer_ceiling.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
                 // Relay layer-union hint atoms (issue #1108, Stage 3). None until
@@ -2234,6 +2247,15 @@ impl VideoCallClient {
         self.inner.borrow().audio_congestion_layer_ceiling.clone()
     }
 
+    /// Returns the lifetime total of self-targeted DOWNLINK_CONGESTION signals
+    /// received by this client (warned OR muted — see issue #628). Observability
+    /// counterpart to the per-second `warn!` rate cap: muted signals still bump
+    /// this counter, so a signal storm stays measurable even when its logs are
+    /// de-amplified to `debug!`.
+    pub fn client_congestion_signals_received_total(&self) -> u64 {
+        self.inner.borrow().client_congestion_signals_received_total
+    }
+
     /// Returns a shared reference to the re-election completed signal.
     ///
     /// Pass this to `CameraEncoder` so that re-election events reach the
@@ -2784,6 +2806,38 @@ impl VideoCallClient {
 /// a hostile peer could otherwise push multi-MB strings that stick via the merge.
 fn clamp_label(s: Option<String>) -> Option<String> {
     s.map(|v| v.chars().take(64).collect())
+}
+
+/// Max self-targeted DOWNLINK_CONGESTION `warn!`s emitted per rolling 1-second
+/// window before the handler drops to `debug!` (issue #628). The congestion
+/// RESPONSE (seed + layer-preference publish) is unaffected — only log verbosity
+/// is capped, so a signal storm cannot stall the wasm console.
+const CONGESTION_WARN_MAX_PER_SEC: u32 = 3;
+
+/// Returns true if this self-targeted congestion signal should be `warn!`-logged
+/// (vs `debug!`), applying a per-second cap. Mutates the rolling window in place:
+/// if `now_ms` is >= 1000ms past `window_start_ms`, the window resets (start =
+/// now, count = 0). Admits (returns true and increments the count) only while the
+/// in-window count is below `max_per_sec`. Pure: no clock, no I/O — caller injects
+/// `now_ms`, so a host `#[test]` can drive it deterministically.
+fn congestion_warn_admit(
+    now_ms: u64,
+    window_start_ms: &mut u64,
+    count_in_window: &mut u32,
+    max_per_sec: u32,
+) -> bool {
+    // saturating_sub: tolerate a non-monotonic clock (now_ms < window_start_ms)
+    // without underflow — treat as "still in window".
+    if now_ms.saturating_sub(*window_start_ms) >= 1000 {
+        *window_start_ms = now_ms;
+        *count_in_window = 0;
+    }
+    if *count_in_window < max_per_sec {
+        *count_in_window += 1;
+        true
+    } else {
+        false
+    }
 }
 
 impl Inner {
@@ -3936,11 +3990,36 @@ impl Inner {
                         response.session_id, self.own_session_id,
                     );
                 } else {
-                    warn!(
-                        "Received DOWNLINK_CONGESTION signal from relay — downlink saturated; \
-                         stepping down receive layer preferences (#1219 Half 2)"
-                    );
                     let now_ms = js_sys::Date::now() as u64;
+                    // Observability: count EVERY self-targeted signal (warned or muted).
+                    self.client_congestion_signals_received_total += 1;
+                    // Rate-cap ONLY the log verbosity (issue #628). The congestion
+                    // RESPONSE below runs unconditionally on every self-targeted signal.
+                    let admit = congestion_warn_admit(
+                        now_ms,
+                        &mut self.congestion_warn_window_start_ms,
+                        &mut self.congestion_warn_count_in_window,
+                        CONGESTION_WARN_MAX_PER_SEC,
+                    );
+                    if admit {
+                        warn!(
+                            "Received DOWNLINK_CONGESTION signal from relay — downlink saturated; \
+                             stepping down receive layer preferences (#1219 Half 2)"
+                        );
+                    } else {
+                        // Storm de-amplification: dropped to debug! so the info isn't
+                        // lost — carry the per-window warned count (pinned at the cap on
+                        // this muted path) + the lifetime running total. The running
+                        // total is the real storm-magnitude signal, since when this
+                        // branch fires `congestion_warn_count_in_window` is always the cap.
+                        debug!(
+                            "DOWNLINK_CONGESTION signal muted (>{} warn!/s); {} warned this window (cap), {} total (#628)",
+                            CONGESTION_WARN_MAX_PER_SEC,
+                            self.congestion_warn_count_in_window,
+                            self.client_congestion_signals_received_total,
+                        );
+                    }
+                    // RESPONSE — unchanged, fires on EVERY self-targeted signal:
                     self.seed_local_congestion_and_publish(now_ms);
                 }
             }
@@ -5136,6 +5215,63 @@ mod self_peer_suppression_tests {
         assert!(
             suppresses_peer_creation_for_packet(&system, true),
             "system-user packets must be suppressed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod congestion_warn_admit_tests {
+    use super::{congestion_warn_admit, CONGESTION_WARN_MAX_PER_SEC};
+
+    #[test]
+    fn congestion_warn_admit_caps_per_second_and_resets_per_window() {
+        // 1000 signals all inside a single 100ms span (< 1s) => one window =>
+        // at most CONGESTION_WARN_MAX_PER_SEC admits (warns). Mutation guard:
+        // if the cap is removed (always-true), this count becomes 1000 and the
+        // assertion below fails.
+        let base: u64 = 10_000;
+        let mut start_ms: u64 = 0;
+        let mut count: u32 = 0;
+        let mut admits = 0u32;
+        // First call seeds the window (start_ms 0 -> base, since base-0 >= 1000),
+        // so all 1000 fall in one window after the seed.
+        for i in 0..1000u64 {
+            let now = base + (i % 100); // span = [base, base+99] => 100ms < 1s
+            if congestion_warn_admit(now, &mut start_ms, &mut count, CONGESTION_WARN_MAX_PER_SEC) {
+                admits += 1;
+            }
+        }
+        assert!(
+            admits <= CONGESTION_WARN_MAX_PER_SEC,
+            "single-window admits {} must be <= cap {}",
+            admits,
+            CONGESTION_WARN_MAX_PER_SEC
+        );
+        assert!(admits >= 1, "at least one signal must warn");
+
+        // Across a 3000ms span the window resets each second, so admits are
+        // bounded by ~3 windows * cap. Proves the window actually rolls over.
+        let mut start2: u64 = 0;
+        let mut count2: u32 = 0;
+        let mut admits2 = 0u32;
+        for i in 0..1000u64 {
+            let now = base + i * 3; // i in 0..1000 => span 0..2997ms => 3 full seconds
+            if congestion_warn_admit(now, &mut start2, &mut count2, CONGESTION_WARN_MAX_PER_SEC) {
+                admits2 += 1;
+            }
+        }
+        // 3000ms / 1000ms = 3 windows (plus the seed window) => <= 4*cap is a safe
+        // upper bound; the key point vs the single-window case is admits2 > cap.
+        assert!(
+            admits2 > CONGESTION_WARN_MAX_PER_SEC,
+            "multi-second admits {} must exceed single-window cap {} (window must reset)",
+            admits2,
+            CONGESTION_WARN_MAX_PER_SEC
+        );
+        assert!(
+            admits2 <= 4 * CONGESTION_WARN_MAX_PER_SEC,
+            "multi-second admits {} should be bounded by ~window count * cap",
+            admits2
         );
     }
 }
