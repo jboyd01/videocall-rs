@@ -731,6 +731,16 @@ impl ScreenEncoder {
         self.shared_tier_transitions.clone()
     }
 
+    /// Returns the ACTIVE screen simulcast layer-count atomic (#1561).
+    pub fn shared_active_layer_count(&self) -> Rc<AtomicU32> {
+        self.shared_active_layer_count.clone()
+    }
+
+    /// Returns the effective screen simulcast layer count (#1561).
+    pub fn effective_screen_layer_count(&self) -> u32 {
+        self.effective_layer_count()
+    }
+
     /// Set user-configurable SCREEN-SHARE quality tier bounds (issue #961
     /// follow-up). This is the public API the Dioxus "Screen Share Thresholds"
     /// slider calls. The arguments are **tier indices** into
@@ -919,6 +929,10 @@ impl ScreenEncoder {
         // screen encoder control loop — clone both sides' shared state.
         let quality_bounds = self.quality_bounds.clone();
         let n_layers = self.effective_layer_count() as usize;
+        log::info!(
+            "ScreenEncoder: effective simulcast layers = {}",
+            self.effective_layer_count()
+        );
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         // Issue #1229: the AQ loop must observe share start/stop edges so it can
         // (a) NOT drift the layer ramp up while idle and (b) re-arm cold start
@@ -1371,7 +1385,14 @@ impl ScreenEncoder {
                     // legacy behavior is byte-identical.
                     if encoder_control.is_simulcast() {
                         let active = encoder_control.active_layer_count() as u32;
-                        shared_active_layer_count.store(active, Ordering::Relaxed);
+                        let prev_active = shared_active_layer_count.swap(active, Ordering::Relaxed);
+                        if prev_active != active {
+                            log::info!(
+                                "ScreenEncoder: active layers {} -> {}",
+                                prev_active,
+                                active
+                            );
+                        }
                         let per_layer = encoder_control.layer_target_bitrates_kbps();
                         let atomics = shared_layer_bitrates_bps.borrow();
                         for (i, atomic) in atomics.iter().enumerate() {

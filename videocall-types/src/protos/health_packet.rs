@@ -1591,6 +1591,49 @@ pub struct HealthPacket {
     ///  Chromium only; absent on Firefox/Safari (which do not implement the API).
     // @@protoc_insertion_point(field:health_packet.HealthPacket.client_device_memory_gb)
     pub client_device_memory_gb: ::std::option::Option<f64>,
+    ///  ---- #1561: Send-side simulcast layer counts (SCREEN + AUDIO) -----------
+    ///  Mirrors effective_video_layers/active_video_layers (fields 75-76) for the
+    ///  screen and audio encoders. Enables "is the adaptive system actually
+    ///  shedding layers?" observability that was camera-only prior to this.
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.effective_screen_layers)
+    pub effective_screen_layers: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.active_screen_layers)
+    pub active_screen_layers: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.effective_audio_layers)
+    pub effective_audio_layers: ::std::option::Option<u32>,
+    ///  Audio congestion ceiling: the congestion-driven layer cap (1-3 or
+    ///  MAX=uncapped). Distinct from effective: effective is the configured
+    ///  maximum, ceiling is the congestion-driven dynamic cap.
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.audio_congestion_ceiling)
+    pub audio_congestion_ceiling: ::std::option::Option<u32>,
+    ///  ---- #1561: Receiver-side layer selection per-peer per-kind ---------------
+    ///  Maps peer session_id (string) → currently-chosen layer index (0-based).
+    ///  Only populated for peers where the chooser is CONSTRAINING below the top
+    ///  layer (same rule as LAYER_PREFERENCE emission: no entry when receiving the
+    ///  top layer, which is the common unconstrained case). Keyed by session_id as
+    ///  decimal string (matching peer_stats).
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.received_video_layer)
+    pub received_video_layer: ::std::collections::HashMap<::std::string::String, u32>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.received_screen_layer)
+    pub received_screen_layer: ::std::collections::HashMap<::std::string::String, u32>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.received_audio_layer)
+    pub received_audio_layer: ::std::collections::HashMap<::std::string::String, u32>,
+    ///  ---- #1556: Connection medium and power state diagnostics ----------------
+    ///  navigator.connection.type: "wifi"|"ethernet"|"cellular"|"bluetooth"|
+    ///  "none"|"unknown". The actual MEDIUM, not the throughput estimate that
+    ///  effectiveType provides. Chrome/Edge only; absent on Firefox/Safari.
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_network_type)
+    pub client_network_type: ::std::option::Option<::std::string::String>,
+    ///  navigator.connection.downlinkMax: max downlink speed of the connection
+    ///  medium in Mbps (e.g. wifi=54, ethernet=1000). 0 or absent when unknown.
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_network_downlink_max)
+    pub client_network_downlink_max: ::std::option::Option<f64>,
+    ///  Computed throttle flag: true when capability_score / hardware_concurrency
+    ///  is anomalously low (< 150), indicating CPU throttle, thermal throttle, or
+    ///  a restrictive Windows power plan. Derived client-side from two existing
+    ///  metrics (no new browser API). Absent when either input is unavailable.
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_cpu_throttled)
+    pub client_cpu_throttled: ::std::option::Option<bool>,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.HealthPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1608,7 +1651,7 @@ impl HealthPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(83);
+        let mut fields = ::std::vec::Vec::with_capacity(93);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "session_id",
@@ -2025,6 +2068,56 @@ impl HealthPacket {
             |m: &HealthPacket| { &m.client_device_memory_gb },
             |m: &mut HealthPacket| { &mut m.client_device_memory_gb },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "effective_screen_layers",
+            |m: &HealthPacket| { &m.effective_screen_layers },
+            |m: &mut HealthPacket| { &mut m.effective_screen_layers },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "active_screen_layers",
+            |m: &HealthPacket| { &m.active_screen_layers },
+            |m: &mut HealthPacket| { &mut m.active_screen_layers },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "effective_audio_layers",
+            |m: &HealthPacket| { &m.effective_audio_layers },
+            |m: &mut HealthPacket| { &mut m.effective_audio_layers },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "audio_congestion_ceiling",
+            |m: &HealthPacket| { &m.audio_congestion_ceiling },
+            |m: &mut HealthPacket| { &mut m.audio_congestion_ceiling },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_map_simpler_accessor_new::<_, _>(
+            "received_video_layer",
+            |m: &HealthPacket| { &m.received_video_layer },
+            |m: &mut HealthPacket| { &mut m.received_video_layer },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_map_simpler_accessor_new::<_, _>(
+            "received_screen_layer",
+            |m: &HealthPacket| { &m.received_screen_layer },
+            |m: &mut HealthPacket| { &mut m.received_screen_layer },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_map_simpler_accessor_new::<_, _>(
+            "received_audio_layer",
+            |m: &HealthPacket| { &m.received_audio_layer },
+            |m: &mut HealthPacket| { &mut m.received_audio_layer },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_network_type",
+            |m: &HealthPacket| { &m.client_network_type },
+            |m: &mut HealthPacket| { &mut m.client_network_type },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_network_downlink_max",
+            |m: &HealthPacket| { &m.client_network_downlink_max },
+            |m: &mut HealthPacket| { &mut m.client_network_downlink_max },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_cpu_throttled",
+            |m: &HealthPacket| { &m.client_cpu_throttled },
+            |m: &mut HealthPacket| { &mut m.client_cpu_throttled },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HealthPacket>(
             "HealthPacket",
             fields,
@@ -2307,6 +2400,72 @@ impl ::protobuf::Message for HealthPacket {
                 721 => {
                     self.client_device_memory_gb = ::std::option::Option::Some(is.read_double()?);
                 },
+                728 => {
+                    self.effective_screen_layers = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                736 => {
+                    self.active_screen_layers = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                744 => {
+                    self.effective_audio_layers = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                752 => {
+                    self.audio_congestion_ceiling = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                762 => {
+                    let len = is.read_raw_varint32()?;
+                    let old_limit = is.push_limit(len as u64)?;
+                    let mut key = ::std::default::Default::default();
+                    let mut value = ::std::default::Default::default();
+                    while let Some(tag) = is.read_raw_tag_or_eof()? {
+                        match tag {
+                            10 => key = is.read_string()?,
+                            16 => value = is.read_uint32()?,
+                            _ => ::protobuf::rt::skip_field_for_tag(tag, is)?,
+                        };
+                    }
+                    is.pop_limit(old_limit);
+                    self.received_video_layer.insert(key, value);
+                },
+                770 => {
+                    let len = is.read_raw_varint32()?;
+                    let old_limit = is.push_limit(len as u64)?;
+                    let mut key = ::std::default::Default::default();
+                    let mut value = ::std::default::Default::default();
+                    while let Some(tag) = is.read_raw_tag_or_eof()? {
+                        match tag {
+                            10 => key = is.read_string()?,
+                            16 => value = is.read_uint32()?,
+                            _ => ::protobuf::rt::skip_field_for_tag(tag, is)?,
+                        };
+                    }
+                    is.pop_limit(old_limit);
+                    self.received_screen_layer.insert(key, value);
+                },
+                778 => {
+                    let len = is.read_raw_varint32()?;
+                    let old_limit = is.push_limit(len as u64)?;
+                    let mut key = ::std::default::Default::default();
+                    let mut value = ::std::default::Default::default();
+                    while let Some(tag) = is.read_raw_tag_or_eof()? {
+                        match tag {
+                            10 => key = is.read_string()?,
+                            16 => value = is.read_uint32()?,
+                            _ => ::protobuf::rt::skip_field_for_tag(tag, is)?,
+                        };
+                    }
+                    is.pop_limit(old_limit);
+                    self.received_audio_layer.insert(key, value);
+                },
+                786 => {
+                    self.client_network_type = ::std::option::Option::Some(is.read_string()?);
+                },
+                793 => {
+                    self.client_network_downlink_max = ::std::option::Option::Some(is.read_double()?);
+                },
+                800 => {
+                    self.client_cpu_throttled = ::std::option::Option::Some(is.read_bool()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -2573,6 +2732,45 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.client_device_memory_gb {
             my_size += 2 + 8;
         }
+        if let Some(v) = self.effective_screen_layers {
+            my_size += ::protobuf::rt::uint32_size(91, v);
+        }
+        if let Some(v) = self.active_screen_layers {
+            my_size += ::protobuf::rt::uint32_size(92, v);
+        }
+        if let Some(v) = self.effective_audio_layers {
+            my_size += ::protobuf::rt::uint32_size(93, v);
+        }
+        if let Some(v) = self.audio_congestion_ceiling {
+            my_size += ::protobuf::rt::uint32_size(94, v);
+        }
+        for (k, v) in &self.received_video_layer {
+            let mut entry_size = 0;
+            entry_size += ::protobuf::rt::string_size(1, &k);
+            entry_size += ::protobuf::rt::uint32_size(2, *v);
+            my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(entry_size) + entry_size
+        };
+        for (k, v) in &self.received_screen_layer {
+            let mut entry_size = 0;
+            entry_size += ::protobuf::rt::string_size(1, &k);
+            entry_size += ::protobuf::rt::uint32_size(2, *v);
+            my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(entry_size) + entry_size
+        };
+        for (k, v) in &self.received_audio_layer {
+            let mut entry_size = 0;
+            entry_size += ::protobuf::rt::string_size(1, &k);
+            entry_size += ::protobuf::rt::uint32_size(2, *v);
+            my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(entry_size) + entry_size
+        };
+        if let Some(v) = self.client_network_type.as_ref() {
+            my_size += ::protobuf::rt::string_size(98, &v);
+        }
+        if let Some(v) = self.client_network_downlink_max {
+            my_size += 2 + 8;
+        }
+        if let Some(v) = self.client_cpu_throttled {
+            my_size += 2 + 1;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -2833,6 +3031,54 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.client_device_memory_gb {
             os.write_double(90, v)?;
         }
+        if let Some(v) = self.effective_screen_layers {
+            os.write_uint32(91, v)?;
+        }
+        if let Some(v) = self.active_screen_layers {
+            os.write_uint32(92, v)?;
+        }
+        if let Some(v) = self.effective_audio_layers {
+            os.write_uint32(93, v)?;
+        }
+        if let Some(v) = self.audio_congestion_ceiling {
+            os.write_uint32(94, v)?;
+        }
+        for (k, v) in &self.received_video_layer {
+            let mut entry_size = 0;
+            entry_size += ::protobuf::rt::string_size(1, &k);
+            entry_size += ::protobuf::rt::uint32_size(2, *v);
+            os.write_raw_varint32(762)?; // Tag.
+            os.write_raw_varint32(entry_size as u32)?;
+            os.write_string(1, &k)?;
+            os.write_uint32(2, *v)?;
+        };
+        for (k, v) in &self.received_screen_layer {
+            let mut entry_size = 0;
+            entry_size += ::protobuf::rt::string_size(1, &k);
+            entry_size += ::protobuf::rt::uint32_size(2, *v);
+            os.write_raw_varint32(770)?; // Tag.
+            os.write_raw_varint32(entry_size as u32)?;
+            os.write_string(1, &k)?;
+            os.write_uint32(2, *v)?;
+        };
+        for (k, v) in &self.received_audio_layer {
+            let mut entry_size = 0;
+            entry_size += ::protobuf::rt::string_size(1, &k);
+            entry_size += ::protobuf::rt::uint32_size(2, *v);
+            os.write_raw_varint32(778)?; // Tag.
+            os.write_raw_varint32(entry_size as u32)?;
+            os.write_string(1, &k)?;
+            os.write_uint32(2, *v)?;
+        };
+        if let Some(v) = self.client_network_type.as_ref() {
+            os.write_string(98, v)?;
+        }
+        if let Some(v) = self.client_network_downlink_max {
+            os.write_double(99, v)?;
+        }
+        if let Some(v) = self.client_cpu_throttled {
+            os.write_bool(100, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -2933,6 +3179,16 @@ impl ::protobuf::Message for HealthPacket {
         self.client_device_type = ::std::option::Option::None;
         self.client_main_thread_load = ::std::option::Option::None;
         self.client_device_memory_gb = ::std::option::Option::None;
+        self.effective_screen_layers = ::std::option::Option::None;
+        self.active_screen_layers = ::std::option::Option::None;
+        self.effective_audio_layers = ::std::option::Option::None;
+        self.audio_congestion_ceiling = ::std::option::Option::None;
+        self.received_video_layer.clear();
+        self.received_screen_layer.clear();
+        self.received_audio_layer.clear();
+        self.client_network_type = ::std::option::Option::None;
+        self.client_network_downlink_max = ::std::option::Option::None;
+        self.client_cpu_throttled = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -3636,7 +3892,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x18\n\x16_avg_decode_latency_msB\x16\n\x14_audio_quality_scoreB\x16\n\
     \x14_video_quality_scoreB\x15\n\x13_call_quality_scoreB\x17\n\x15_decode\
     r_errors_totalB\x19\n\x17_video_seq_loss_per_secB\x1c\n\x1a_keyframe_req\
-    uests_per_sec\"\x969\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\
+    uests_per_sec\"\x80B\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\
     \x01(\tR\tsessionId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tmeetingId\
     \x12*\n\x11reporting_user_id\x18\x03\x20\x01(\x0cR\x0freportingUserId\
     \x12!\n\x0ctimestamp_ms\x18\x04\x20\x01(\x04R\x0btimestampMs\x126\n\x17r\
@@ -3742,60 +3998,83 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x88\x01\x01\x121\n\x12client_device_type\x18X\x20\x01(\tHAR\x10clientDe\
     viceType\x88\x01\x01\x12:\n\x17client_main_thread_load\x18Y\x20\x01(\x01\
     HBR\x14clientMainThreadLoad\x88\x01\x01\x12:\n\x17client_device_memory_g\
-    b\x18Z\x20\x01(\x01HCR\x14clientDeviceMemoryGb\x88\x01\x01\x1aV\n\x0ePee\
-    rStatsEntry\x12\x10\n\x03key\x18\x01\x20\x01(\tR\x03key\x12.\n\x05value\
-    \x18\x02\x20\x01(\x0b2\x18.health_packet.PeerStatsR\x05value:\x028\x01B\
-    \x14\n\x12_memory_used_bytesB\x15\n\x13_memory_total_bytesB\x18\n\x16_av\
-    g_encode_latency_msB\x13\n\x11_send_queue_bytesB\x1b\n\x19_packets_recei\
-    ved_per_secB\x17\n\x15_packets_sent_per_secB\x0f\n\r_display_nameB\x16\n\
-    \x14_adaptive_video_tierB\x16\n\x14_adaptive_audio_tierB\x17\n\x15_datag\
-    ram_drops_totalB\x1f\n\x1d_keyframe_requests_sent_totalB\x18\n\x16_webso\
-    cket_drops_totalB\x17\n\x15_adaptive_screen_tierB\x18\n\x16_screen_shari\
-    ng_activeB\x15\n\x13_encoder_output_fpsB\x1e\n\x1c_encoder_target_bitrat\
-    e_kbpsB\x17\n\x15_crash_ceiling_activeB\x1b\n\x19_crash_ceiling_tier_ind\
-    exB\x19\n\x17_crash_ceiling_decay_msB\x1a\n\x18_step_up_blocked_ceilingB\
-    \x1b\n\x19_step_up_blocked_slowdownB\x1f\n\x1d_step_up_blocked_screen_sh\
-    areB%\n#_camera_encoder_errors_closed_codecB&\n$_camera_encoder_errors_v\
-    px_mem_allocB(\n&_camera_encoder_errors_configure_fatalB\x20\n\x1e_camer\
-    a_encoder_errors_genericB%\n#_camera_encoder_frames_submitted_okB%\n#_sc\
-    reen_encoder_errors_closed_codecB&\n$_screen_encoder_errors_vpx_mem_allo\
-    cB(\n&_screen_encoder_errors_configure_fatalB\x20\n\x1e_screen_encoder_e\
-    rrors_genericB%\n#_screen_encoder_frames_submitted_okB&\n$_connection_ha\
-    ndshake_failures_totalB!\n\x1f_connection_session_drops_totalB\x0f\n\r_c\
-    lient_coresB\x16\n\x14_client_architectureB\x14\n\x12_client_gpu_familyB\
-    \x20\n\x1e_client_network_effective_typeB\x1a\n\x18_client_network_downl\
-    inkB\x15\n\x13_client_network_rttB\x1a\n\x18_client_battery_chargingB\
-    \x17\n\x15_client_battery_levelB\x1a\n\x18_client_capability_scoreB\r\n\
-    \x0b_render_fpsB\x17\n\x15_encoder_p75_peer_fpsB\x10\n\x0e_decode_budget\
-    B\x14\n\x12_wasm_memory_bytesB\x15\n\x13_agent_memory_bytesB\x1d\n\x1b_r\
-    eelection_proceeded_totalB\x1b\n\x19_reelection_aborted_totalB\x1d\n\x1b\
-    _reelection_preserved_totalB\x1a\n\x18_reelection_failed_totalB\x19\n\
-    \x17_effective_video_layersB\x16\n\x14_active_video_layersB'\n%_camera_e\
-    ncoder_restarts_closed_codecB!\n\x1f_camera_encoder_restarts_memoryB$\n\
-    \"_camera_encoder_restarts_configureB\x20\n\x1e_camera_encoder_restarts_\
-    otherB'\n%_screen_encoder_restarts_closed_codecB!\n\x1f_screen_encoder_r\
-    estarts_memoryB$\n\"_screen_encoder_restarts_configureB\x20\n\x1e_screen\
-    _encoder_restarts_otherB\x1a\n\x18_rtt_probe_dropped_totalB%\n#_rtt_prob\
-    e_stale_suppressions_totalB\x0c\n\n_client_osB\x15\n\x13_client_device_t\
-    ypeB\x1a\n\x18_client_main_thread_loadB\x1a\n\x18_client_device_memory_g\
-    bJ\x04\x08\x19\x10\x1aJ\x04\x08\x1a\x10\x1bJ\x04\x08\x1f\x10\x20J\x04\
-    \x08!\x10\"J\x04\x08\"\x10#J\x04\x08#\x10$J\x04\x08$\x10%R\x11encoder_fp\
-    s_ratioR\x16encoder_worst_peer_fpsR\x15encoder_bitrate_ratioR\x13join_ba\
-    ndwidth_kbpsR\x0bjoin_rtt_msR\x0ejoin_jitter_msR\x14join_packet_loss_pct\
-    \"\xe3\x02\n\x0cDecodeBudget\x12#\n\reffective_cap\x18\x01\x20\x01(\rR\
-    \x0ceffectiveCap\x12\x18\n\x07natural\x18\x02\x20\x01(\rR\x07natural\x12\
-    \x1c\n\tpressured\x18\x03\x20\x01(\x08R\tpressured\x12M\n\roverride_mode\
-    \x18\x04\x20\x01(\x0e2(.health_packet.DecodeBudget.OverrideModeR\x0cover\
-    rideMode\x12(\n\x10override_fixed_n\x18\x05\x20\x01(\rR\x0eoverrideFixed\
-    N\x12\x1d\n\nactive_set\x18\x06\x20\x01(\rR\tactiveSet\"^\n\x0cOverrideM\
-    ode\x12\x1d\n\x19OVERRIDE_MODE_UNSPECIFIED\x10\0\x12\x16\n\x12OVERRIDE_M\
-    ODE_AUTO\x10\x01\x12\x17\n\x13OVERRIDE_MODE_FIXED\x10\x02\"\x96\x01\n\
-    \x0eTierTransition\x12\x1c\n\tdirection\x18\x01\x20\x01(\tR\tdirection\
+    b\x18Z\x20\x01(\x01HCR\x14clientDeviceMemoryGb\x88\x01\x01\x12;\n\x17eff\
+    ective_screen_layers\x18[\x20\x01(\rHDR\x15effectiveScreenLayers\x88\x01\
+    \x01\x125\n\x14active_screen_layers\x18\\\x20\x01(\rHER\x12activeScreenL\
+    ayers\x88\x01\x01\x129\n\x16effective_audio_layers\x18]\x20\x01(\rHFR\
+    \x14effectiveAudioLayers\x88\x01\x01\x12=\n\x18audio_congestion_ceiling\
+    \x18^\x20\x01(\rHGR\x16audioCongestionCeiling\x88\x01\x01\x12e\n\x14rece\
+    ived_video_layer\x18_\x20\x03(\x0b23.health_packet.HealthPacket.Received\
+    VideoLayerEntryR\x12receivedVideoLayer\x12h\n\x15received_screen_layer\
+    \x18`\x20\x03(\x0b24.health_packet.HealthPacket.ReceivedScreenLayerEntry\
+    R\x13receivedScreenLayer\x12e\n\x14received_audio_layer\x18a\x20\x03(\
+    \x0b23.health_packet.HealthPacket.ReceivedAudioLayerEntryR\x12receivedAu\
+    dioLayer\x123\n\x13client_network_type\x18b\x20\x01(\tHHR\x11clientNetwo\
+    rkType\x88\x01\x01\x12B\n\x1bclient_network_downlink_max\x18c\x20\x01(\
+    \x01HIR\x18clientNetworkDownlinkMax\x88\x01\x01\x125\n\x14client_cpu_thr\
+    ottled\x18d\x20\x01(\x08HJR\x12clientCpuThrottled\x88\x01\x01\x1aV\n\x0e\
+    PeerStatsEntry\x12\x10\n\x03key\x18\x01\x20\x01(\tR\x03key\x12.\n\x05val\
+    ue\x18\x02\x20\x01(\x0b2\x18.health_packet.PeerStatsR\x05value:\x028\x01\
+    \x1aE\n\x17ReceivedVideoLayerEntry\x12\x10\n\x03key\x18\x01\x20\x01(\tR\
+    \x03key\x12\x14\n\x05value\x18\x02\x20\x01(\rR\x05value:\x028\x01\x1aF\n\
+    \x18ReceivedScreenLayerEntry\x12\x10\n\x03key\x18\x01\x20\x01(\tR\x03key\
+    \x12\x14\n\x05value\x18\x02\x20\x01(\rR\x05value:\x028\x01\x1aE\n\x17Rec\
+    eivedAudioLayerEntry\x12\x10\n\x03key\x18\x01\x20\x01(\tR\x03key\x12\x14\
+    \n\x05value\x18\x02\x20\x01(\rR\x05value:\x028\x01B\x14\n\x12_memory_use\
+    d_bytesB\x15\n\x13_memory_total_bytesB\x18\n\x16_avg_encode_latency_msB\
+    \x13\n\x11_send_queue_bytesB\x1b\n\x19_packets_received_per_secB\x17\n\
+    \x15_packets_sent_per_secB\x0f\n\r_display_nameB\x16\n\x14_adaptive_vide\
+    o_tierB\x16\n\x14_adaptive_audio_tierB\x17\n\x15_datagram_drops_totalB\
+    \x1f\n\x1d_keyframe_requests_sent_totalB\x18\n\x16_websocket_drops_total\
+    B\x17\n\x15_adaptive_screen_tierB\x18\n\x16_screen_sharing_activeB\x15\n\
+    \x13_encoder_output_fpsB\x1e\n\x1c_encoder_target_bitrate_kbpsB\x17\n\
+    \x15_crash_ceiling_activeB\x1b\n\x19_crash_ceiling_tier_indexB\x19\n\x17\
+    _crash_ceiling_decay_msB\x1a\n\x18_step_up_blocked_ceilingB\x1b\n\x19_st\
+    ep_up_blocked_slowdownB\x1f\n\x1d_step_up_blocked_screen_shareB%\n#_came\
+    ra_encoder_errors_closed_codecB&\n$_camera_encoder_errors_vpx_mem_allocB\
+    (\n&_camera_encoder_errors_configure_fatalB\x20\n\x1e_camera_encoder_err\
+    ors_genericB%\n#_camera_encoder_frames_submitted_okB%\n#_screen_encoder_\
+    errors_closed_codecB&\n$_screen_encoder_errors_vpx_mem_allocB(\n&_screen\
+    _encoder_errors_configure_fatalB\x20\n\x1e_screen_encoder_errors_generic\
+    B%\n#_screen_encoder_frames_submitted_okB&\n$_connection_handshake_failu\
+    res_totalB!\n\x1f_connection_session_drops_totalB\x0f\n\r_client_coresB\
+    \x16\n\x14_client_architectureB\x14\n\x12_client_gpu_familyB\x20\n\x1e_c\
+    lient_network_effective_typeB\x1a\n\x18_client_network_downlinkB\x15\n\
+    \x13_client_network_rttB\x1a\n\x18_client_battery_chargingB\x17\n\x15_cl\
+    ient_battery_levelB\x1a\n\x18_client_capability_scoreB\r\n\x0b_render_fp\
+    sB\x17\n\x15_encoder_p75_peer_fpsB\x10\n\x0e_decode_budgetB\x14\n\x12_wa\
+    sm_memory_bytesB\x15\n\x13_agent_memory_bytesB\x1d\n\x1b_reelection_proc\
+    eeded_totalB\x1b\n\x19_reelection_aborted_totalB\x1d\n\x1b_reelection_pr\
+    eserved_totalB\x1a\n\x18_reelection_failed_totalB\x19\n\x17_effective_vi\
+    deo_layersB\x16\n\x14_active_video_layersB'\n%_camera_encoder_restarts_c\
+    losed_codecB!\n\x1f_camera_encoder_restarts_memoryB$\n\"_camera_encoder_\
+    restarts_configureB\x20\n\x1e_camera_encoder_restarts_otherB'\n%_screen_\
+    encoder_restarts_closed_codecB!\n\x1f_screen_encoder_restarts_memoryB$\n\
+    \"_screen_encoder_restarts_configureB\x20\n\x1e_screen_encoder_restarts_\
+    otherB\x1a\n\x18_rtt_probe_dropped_totalB%\n#_rtt_probe_stale_suppressio\
+    ns_totalB\x0c\n\n_client_osB\x15\n\x13_client_device_typeB\x1a\n\x18_cli\
+    ent_main_thread_loadB\x1a\n\x18_client_device_memory_gbB\x1a\n\x18_effec\
+    tive_screen_layersB\x17\n\x15_active_screen_layersB\x19\n\x17_effective_\
+    audio_layersB\x1b\n\x19_audio_congestion_ceilingB\x16\n\x14_client_netwo\
+    rk_typeB\x1e\n\x1c_client_network_downlink_maxB\x17\n\x15_client_cpu_thr\
+    ottledJ\x04\x08\x19\x10\x1aJ\x04\x08\x1a\x10\x1bJ\x04\x08\x1f\x10\x20J\
+    \x04\x08!\x10\"J\x04\x08\"\x10#J\x04\x08#\x10$J\x04\x08$\x10%R\x11encode\
+    r_fps_ratioR\x16encoder_worst_peer_fpsR\x15encoder_bitrate_ratioR\x13joi\
+    n_bandwidth_kbpsR\x0bjoin_rtt_msR\x0ejoin_jitter_msR\x14join_packet_loss\
+    _pct\"\xe3\x02\n\x0cDecodeBudget\x12#\n\reffective_cap\x18\x01\x20\x01(\
+    \rR\x0ceffectiveCap\x12\x18\n\x07natural\x18\x02\x20\x01(\rR\x07natural\
+    \x12\x1c\n\tpressured\x18\x03\x20\x01(\x08R\tpressured\x12M\n\roverride_\
+    mode\x18\x04\x20\x01(\x0e2(.health_packet.DecodeBudget.OverrideModeR\x0c\
+    overrideMode\x12(\n\x10override_fixed_n\x18\x05\x20\x01(\rR\x0eoverrideF\
+    ixedN\x12\x1d\n\nactive_set\x18\x06\x20\x01(\rR\tactiveSet\"^\n\x0cOverr\
+    ideMode\x12\x1d\n\x19OVERRIDE_MODE_UNSPECIFIED\x10\0\x12\x16\n\x12OVERRI\
+    DE_MODE_AUTO\x10\x01\x12\x17\n\x13OVERRIDE_MODE_FIXED\x10\x02\"\x96\x01\
+    \n\x0eTierTransition\x12\x1c\n\tdirection\x18\x01\x20\x01(\tR\tdirection\
     \x12\x16\n\x06stream\x18\x02\x20\x01(\tR\x06stream\x12\x1b\n\tfrom_tier\
     \x18\x03\x20\x01(\tR\x08fromTier\x12\x17\n\x07to_tier\x18\x04\x20\x01(\t\
     R\x06toTier\x12\x18\n\x07trigger\x18\x05\x20\x01(\tR\x07trigger\":\n\tTi\
     erDwell\x12\x12\n\x04tier\x18\x01\x20\x01(\tR\x04tier\x12\x19\n\x08dwell\
-    _ms\x18\x02\x20\x01(\x01R\x07dwellMsJ\x85\xc5\x01\n\x07\x12\x05\0\0\x8e\
+    _ms\x18\x02\x20\x01(\x01R\x07dwellMsJ\x99\xd8\x01\n\x07\x12\x05\0\0\xb2\
     \x03\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\
     \x16\n\n\n\x02\x04\0\x12\x04\x04\0\x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\
     \x04\x08\x1e\n\x0b\n\x04\x04\0\x02\0\x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\
@@ -4007,8 +4286,8 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x20read\x20100/100\n\x20during\x20a\x20keyframe\x20storm.\n\n\x0c\n\x05\
     \x04\x04\x02\x0f\x04\x12\x03|\x02\n\n\x0c\n\x05\x04\x04\x02\x0f\x05\x12\
     \x03|\x0b\x11\n\x0c\n\x05\x04\x04\x02\x0f\x01\x12\x03|\x12+\n\x0c\n\x05\
-    \x04\x04\x02\x0f\x03\x12\x03|.0\n\x0b\n\x02\x04\x05\x12\x05\x7f\0\xe5\
-    \x02\x01\n\n\n\x03\x04\x05\x01\x12\x03\x7f\x08\x14\n\x0c\n\x04\x04\x05\
+    \x04\x04\x02\x0f\x03\x12\x03|.0\n\x0b\n\x02\x04\x05\x12\x05\x7f\0\x89\
+    \x03\x01\n\n\n\x03\x04\x05\x01\x12\x03\x7f\x08\x14\n\x0c\n\x04\x04\x05\
     \x02\0\x12\x04\x80\x01\x02\x18\n\r\n\x05\x04\x05\x02\0\x05\x12\x04\x80\
     \x01\x02\x08\n\r\n\x05\x04\x05\x02\0\x01\x12\x04\x80\x01\t\x13\n\r\n\x05\
     \x04\x05\x02\0\x03\x12\x04\x80\x01\x16\x17\n\x0c\n\x04\x04\x05\x02\x01\
@@ -4506,86 +4785,153 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x20Firefox/Safari\x20(which\x20do\x20not\x20implement\x20the\x20API).\n\
     \"\t\x20(#1482)\n\n\r\n\x05\x04\x05\x02R\x04\x12\x04\xe4\x02\x02\n\n\r\n\
     \x05\x04\x05\x02R\x05\x12\x04\xe4\x02\x0b\x11\n\r\n\x05\x04\x05\x02R\x01\
-    \x12\x04\xe4\x02\x12)\n\r\n\x05\x04\x05\x02R\x03\x12\x04\xe4\x02,.\n\xf0\
-    \x01\n\x02\x04\x06\x12\x06\xeb\x02\0\x81\x03\x01\x1a\xe1\x01\x20Receiver\
-    -side\x20adaptive\x20decode-budget\x20state\x20(#987).\x20Mirrors\x20the\
-    \n\x20AdaptiveQuality\x20tier\x20fields\x20on\x20HealthPacket:\x20a\x20p\
-    eriodic\x20snapshot\x20of\x20the\n\x20current\x20decision\x20the\x20loca\
-    l\x20controller\x20has\x20reached\x20for\x20how\x20many\x20video\x20tile\
-    s\n\x20to\x20decode.\n\n\x0b\n\x03\x04\x06\x01\x12\x04\xeb\x02\x08\x14\n\
-    E\n\x04\x04\x06\x02\0\x12\x04\xec\x02\x02\x1b\"7\x20Current\x20effective\
-    \x20cap\x20on\x20simultaneously\x20decoded\x20tiles\n\n\r\n\x05\x04\x06\
-    \x02\0\x05\x12\x04\xec\x02\x02\x08\n\r\n\x05\x04\x06\x02\0\x01\x12\x04\
-    \xec\x02\t\x16\n\r\n\x05\x04\x06\x02\0\x03\x12\x04\xec\x02\x19\x1a\nF\n\
-    \x04\x04\x06\x02\x01\x12\x04\xed\x02\x02\x15\"8\x20Natural/unconstrained\
-    \x20tile\x20count\x20the\x20layout\x20would\x20show\n\n\r\n\x05\x04\x06\
-    \x02\x01\x05\x12\x04\xed\x02\x02\x08\n\r\n\x05\x04\x06\x02\x01\x01\x12\
-    \x04\xed\x02\t\x10\n\r\n\x05\x04\x06\x02\x01\x03\x12\x04\xed\x02\x13\x14\
-    \n;\n\x04\x04\x06\x02\x02\x12\x04\xee\x02\x02\x15\"-\x20Pressured\x20lat\
-    ch\x20engaged\x20(loop\x20owns\x20the\x20cap)\n\n\r\n\x05\x04\x06\x02\
-    \x02\x05\x12\x04\xee\x02\x02\x06\n\r\n\x05\x04\x06\x02\x02\x01\x12\x04\
-    \xee\x02\x07\x10\n\r\n\x05\x04\x06\x02\x02\x03\x12\x04\xee\x02\x13\x14\n\
-    \x1d\n\x04\x04\x06\x02\x03\x12\x04\xef\x02\x02!\"\x0f\x20Auto\x20vs\x20F\
-    ixed\n\n\r\n\x05\x04\x06\x02\x03\x06\x12\x04\xef\x02\x02\x0e\n\r\n\x05\
-    \x04\x06\x02\x03\x01\x12\x04\xef\x02\x0f\x1c\n\r\n\x05\x04\x06\x02\x03\
-    \x03\x12\x04\xef\x02\x1f\x20\n]\n\x04\x04\x06\x02\x04\x12\x04\xf1\x02\
-    \x02\x1e\x1aO\x20Set\x20only\x20when\x20override_mode\x20==\x20OVERRIDE_\
-    MODE_FIXED:\x20the\x20user's\x20hard\x20tile\x20cap.\n\n\r\n\x05\x04\x06\
-    \x02\x04\x05\x12\x04\xf1\x02\x02\x08\n\r\n\x05\x04\x06\x02\x04\x01\x12\
-    \x04\xf1\x02\t\x19\n\r\n\x05\x04\x06\x02\x04\x03\x12\x04\xf1\x02\x1c\x1d\
-    \n\xa4\x03\n\x04\x04\x06\x02\x05\x12\x04\xf9\x02\x02\x18\x1a\x95\x03\x20\
-    Tiles\x20actually\x20being\x20decoded\x20right\x20now\x20=\x20min(effect\
-    ive_cap,\x20natural)\n\x20(#1143).\x20`effective_cap`\x20is\x20the\x20BU\
-    DGET\x20ceiling\x20and\x20`natural`\x20is\x20what\x20the\n\x20layout\x20\
-    WOULD\x20show\x20unconstrained;\x20neither\x20alone\x20answers\x20\"how\
-    \x20many\x20videos\x20is\n\x20this\x20client\x20actually\x20decoding?\"\
-    \x20when\x20the\x20layout\x20has\x20fewer\x20tiles\x20than\x20the\n\x20c\
-    ap\x20allows.\x20This\x20is\x20that\x20number\x20\xe2\x80\x94\x20the\x20\
-    per-client\x20\"videos\x20showing\"\x20signal\x20the\n\x20observability\
-    \x20issue\x20asks\x20for.\n\n\r\n\x05\x04\x06\x02\x05\x05\x12\x04\xf9\
-    \x02\x02\x08\n\r\n\x05\x04\x06\x02\x05\x01\x12\x04\xf9\x02\t\x13\n\r\n\
-    \x05\x04\x06\x02\x05\x03\x12\x04\xf9\x02\x16\x17\n:\n\x04\x04\x06\x04\0\
-    \x12\x06\xfc\x02\x02\x80\x03\x03\x1a*\x20Manual\x20override\x20mode\x20f\
-    or\x20the\x20controller.\n\n\r\n\x05\x04\x06\x04\0\x01\x12\x04\xfc\x02\
-    \x07\x13\n,\n\x06\x04\x06\x04\0\x02\0\x12\x04\xfd\x02\x04\"\"\x1c\x20Tre\
-    ated\x20as\x20Auto\x20by\x20readers\n\n\x0f\n\x07\x04\x06\x04\0\x02\0\
-    \x01\x12\x04\xfd\x02\x04\x1d\n\x0f\n\x07\x04\x06\x04\0\x02\0\x02\x12\x04\
-    \xfd\x02\x20!\n/\n\x06\x04\x06\x04\0\x02\x01\x12\x04\xfe\x02\x04\x1b\"\
-    \x1f\x20Adaptive\x20loop\x20decides\x20the\x20cap\n\n\x0f\n\x07\x04\x06\
-    \x04\0\x02\x01\x01\x12\x04\xfe\x02\x04\x16\n\x0f\n\x07\x04\x06\x04\0\x02\
-    \x01\x02\x12\x04\xfe\x02\x19\x1a\nA\n\x06\x04\x06\x04\0\x02\x02\x12\x04\
-    \xff\x02\x04\x1c\"1\x20User\x20hard-pinned\x20the\x20cap\x20(see\x20over\
-    ride_fixed_n)\n\n\x0f\n\x07\x04\x06\x04\0\x02\x02\x01\x12\x04\xff\x02\
-    \x04\x17\n\x0f\n\x07\x04\x06\x04\0\x02\x02\x02\x12\x04\xff\x02\x1a\x1b\n\
-    \x0c\n\x02\x04\x07\x12\x06\x83\x03\0\x89\x03\x01\n\x0b\n\x03\x04\x07\x01\
-    \x12\x04\x83\x03\x08\x16\n\x1e\n\x04\x04\x07\x02\0\x12\x04\x84\x03\x02\
-    \x17\"\x10\x20\"up\"\x20or\x20\"down\"\n\n\r\n\x05\x04\x07\x02\0\x05\x12\
-    \x04\x84\x03\x02\x08\n\r\n\x05\x04\x07\x02\0\x01\x12\x04\x84\x03\t\x12\n\
-    \r\n\x05\x04\x07\x02\0\x03\x12\x04\x84\x03\x15\x16\n*\n\x04\x04\x07\x02\
-    \x01\x12\x04\x85\x03\x02\x14\"\x1c\x20\"video\",\x20\"audio\",\x20\"scre\
-    en\"\n\n\r\n\x05\x04\x07\x02\x01\x05\x12\x04\x85\x03\x02\x08\n\r\n\x05\
-    \x04\x07\x02\x01\x01\x12\x04\x85\x03\t\x0f\n\r\n\x05\x04\x07\x02\x01\x03\
-    \x12\x04\x85\x03\x12\x13\n9\n\x04\x04\x07\x02\x02\x12\x04\x86\x03\x02\
-    \x17\"+\x20tier\x20label\x20e.g.\x20\"hd_1080p\",\x20\"medium_480p\"\n\n\
-    \r\n\x05\x04\x07\x02\x02\x05\x12\x04\x86\x03\x02\x08\n\r\n\x05\x04\x07\
-    \x02\x02\x01\x12\x04\x86\x03\t\x12\n\r\n\x05\x04\x07\x02\x02\x03\x12\x04\
-    \x86\x03\x15\x16\n\x1a\n\x04\x04\x07\x02\x03\x12\x04\x87\x03\x02\x15\"\
-    \x0c\x20tier\x20label\n\n\r\n\x05\x04\x07\x02\x03\x05\x12\x04\x87\x03\
-    \x02\x08\n\r\n\x05\x04\x07\x02\x03\x01\x12\x04\x87\x03\t\x10\n\r\n\x05\
-    \x04\x07\x02\x03\x03\x12\x04\x87\x03\x13\x14\n>\n\x04\x04\x07\x02\x04\
-    \x12\x04\x88\x03\x02\x15\"0\x20\"fps\",\x20\"bitrate\",\x20\"congestion\
-    \",\x20\"coordination\"\n\n\r\n\x05\x04\x07\x02\x04\x05\x12\x04\x88\x03\
-    \x02\x08\n\r\n\x05\x04\x07\x02\x04\x01\x12\x04\x88\x03\t\x10\n\r\n\x05\
-    \x04\x07\x02\x04\x03\x12\x04\x88\x03\x13\x14\n\x0c\n\x02\x04\x08\x12\x06\
-    \x8b\x03\0\x8e\x03\x01\n\x0b\n\x03\x04\x08\x01\x12\x04\x8b\x03\x08\x11\n\
-    ,\n\x04\x04\x08\x02\0\x12\x04\x8c\x03\x02\x12\"\x1e\x20Tier\x20label\x20\
-    (e.g.\x20\"hd_1080p\")\n\n\r\n\x05\x04\x08\x02\0\x05\x12\x04\x8c\x03\x02\
-    \x08\n\r\n\x05\x04\x08\x02\0\x01\x12\x04\x8c\x03\t\r\n\r\n\x05\x04\x08\
-    \x02\0\x03\x12\x04\x8c\x03\x10\x11\n<\n\x04\x04\x08\x02\x01\x12\x04\x8d\
-    \x03\x02\x16\".\x20Time\x20spent\x20in\x20this\x20tier\x20before\x20tran\
-    sitioning\n\n\r\n\x05\x04\x08\x02\x01\x05\x12\x04\x8d\x03\x02\x08\n\r\n\
-    \x05\x04\x08\x02\x01\x01\x12\x04\x8d\x03\t\x11\n\r\n\x05\x04\x08\x02\x01\
-    \x03\x12\x04\x8d\x03\x14\x15b\x06proto3\
+    \x12\x04\xe4\x02\x12)\n\r\n\x05\x04\x05\x02R\x03\x12\x04\xe4\x02,.\n\xba\
+    \x02\n\x04\x04\x05\x02S\x12\x04\xea\x02\x02/\x1a\xa0\x02\x20----\x20#156\
+    1:\x20Send-side\x20simulcast\x20layer\x20counts\x20(SCREEN\x20+\x20AUDIO\
+    )\x20-----------\n\x20Mirrors\x20effective_video_layers/active_video_lay\
+    ers\x20(fields\x2075-76)\x20for\x20the\n\x20screen\x20and\x20audio\x20en\
+    coders.\x20Enables\x20\"is\x20the\x20adaptive\x20system\x20actually\n\
+    \x20shedding\x20layers?\"\x20observability\x20that\x20was\x20camera-only\
+    \x20prior\x20to\x20this.\n\"\t\x20(#1561)\n\n\r\n\x05\x04\x05\x02S\x04\
+    \x12\x04\xea\x02\x02\n\n\r\n\x05\x04\x05\x02S\x05\x12\x04\xea\x02\x0b\
+    \x11\n\r\n\x05\x04\x05\x02S\x01\x12\x04\xea\x02\x12)\n\r\n\x05\x04\x05\
+    \x02S\x03\x12\x04\xea\x02,.\n\x17\n\x04\x04\x05\x02T\x12\x04\xeb\x02\x02\
+    ,\"\t\x20(#1561)\n\n\r\n\x05\x04\x05\x02T\x04\x12\x04\xeb\x02\x02\n\n\r\
+    \n\x05\x04\x05\x02T\x05\x12\x04\xeb\x02\x0b\x11\n\r\n\x05\x04\x05\x02T\
+    \x01\x12\x04\xeb\x02\x12&\n\r\n\x05\x04\x05\x02T\x03\x12\x04\xeb\x02)+\n\
+    \x17\n\x04\x04\x05\x02U\x12\x04\xec\x02\x02.\"\t\x20(#1561)\n\n\r\n\x05\
+    \x04\x05\x02U\x04\x12\x04\xec\x02\x02\n\n\r\n\x05\x04\x05\x02U\x05\x12\
+    \x04\xec\x02\x0b\x11\n\r\n\x05\x04\x05\x02U\x01\x12\x04\xec\x02\x12(\n\r\
+    \n\x05\x04\x05\x02U\x03\x12\x04\xec\x02+-\n\xda\x01\n\x04\x04\x05\x02V\
+    \x12\x04\xf0\x02\x020\x1a\xc0\x01\x20Audio\x20congestion\x20ceiling:\x20\
+    the\x20congestion-driven\x20layer\x20cap\x20(1-3\x20or\n\x20MAX=uncapped\
+    ).\x20Distinct\x20from\x20effective:\x20effective\x20is\x20the\x20config\
+    ured\n\x20maximum,\x20ceiling\x20is\x20the\x20congestion-driven\x20dynam\
+    ic\x20cap.\n\"\t\x20(#1561)\n\n\r\n\x05\x04\x05\x02V\x04\x12\x04\xf0\x02\
+    \x02\n\n\r\n\x05\x04\x05\x02V\x05\x12\x04\xf0\x02\x0b\x11\n\r\n\x05\x04\
+    \x05\x02V\x01\x12\x04\xf0\x02\x12*\n\r\n\x05\x04\x05\x02V\x03\x12\x04\
+    \xf0\x02-/\n\xbb\x03\n\x04\x04\x05\x02W\x12\x04\xf8\x02\x020\x1a\xa1\x03\
+    \x20----\x20#1561:\x20Receiver-side\x20layer\x20selection\x20per-peer\
+    \x20per-kind\x20---------------\n\x20Maps\x20peer\x20session_id\x20(stri\
+    ng)\x20\xe2\x86\x92\x20currently-chosen\x20layer\x20index\x20(0-based).\
+    \n\x20Only\x20populated\x20for\x20peers\x20where\x20the\x20chooser\x20is\
+    \x20CONSTRAINING\x20below\x20the\x20top\n\x20layer\x20(same\x20rule\x20a\
+    s\x20LAYER_PREFERENCE\x20emission:\x20no\x20entry\x20when\x20receiving\
+    \x20the\n\x20top\x20layer,\x20which\x20is\x20the\x20common\x20unconstrai\
+    ned\x20case).\x20Keyed\x20by\x20session_id\x20as\n\x20decimal\x20string\
+    \x20(matching\x20peer_stats).\n\"\t\x20(#1561)\n\n\r\n\x05\x04\x05\x02W\
+    \x06\x12\x04\xf8\x02\x02\x15\n\r\n\x05\x04\x05\x02W\x01\x12\x04\xf8\x02\
+    \x16*\n\r\n\x05\x04\x05\x02W\x03\x12\x04\xf8\x02-/\n\x17\n\x04\x04\x05\
+    \x02X\x12\x04\xf9\x02\x021\"\t\x20(#1561)\n\n\r\n\x05\x04\x05\x02X\x06\
+    \x12\x04\xf9\x02\x02\x15\n\r\n\x05\x04\x05\x02X\x01\x12\x04\xf9\x02\x16+\
+    \n\r\n\x05\x04\x05\x02X\x03\x12\x04\xf9\x02.0\n\x17\n\x04\x04\x05\x02Y\
+    \x12\x04\xfa\x02\x020\"\t\x20(#1561)\n\n\r\n\x05\x04\x05\x02Y\x06\x12\
+    \x04\xfa\x02\x02\x15\n\r\n\x05\x04\x05\x02Y\x01\x12\x04\xfa\x02\x16*\n\r\
+    \n\x05\x04\x05\x02Y\x03\x12\x04\xfa\x02-/\n\xb8\x02\n\x04\x04\x05\x02Z\
+    \x12\x04\x80\x03\x02+\x1a\x9e\x02\x20----\x20#1556:\x20Connection\x20med\
+    ium\x20and\x20power\x20state\x20diagnostics\x20----------------\n\x20nav\
+    igator.connection.type:\x20\"wifi\"|\"ethernet\"|\"cellular\"|\"bluetoot\
+    h\"|\n\x20\"none\"|\"unknown\".\x20The\x20actual\x20MEDIUM,\x20not\x20th\
+    e\x20throughput\x20estimate\x20that\n\x20effectiveType\x20provides.\x20C\
+    hrome/Edge\x20only;\x20absent\x20on\x20Firefox/Safari.\n\"\t\x20(#1556)\
+    \n\n\r\n\x05\x04\x05\x02Z\x04\x12\x04\x80\x03\x02\n\n\r\n\x05\x04\x05\
+    \x02Z\x05\x12\x04\x80\x03\x0b\x11\n\r\n\x05\x04\x05\x02Z\x01\x12\x04\x80\
+    \x03\x12%\n\r\n\x05\x04\x05\x02Z\x03\x12\x04\x80\x03(*\n\xab\x01\n\x04\
+    \x04\x05\x02[\x12\x04\x83\x03\x023\x1a\x91\x01\x20navigator.connection.d\
+    ownlinkMax:\x20max\x20downlink\x20speed\x20of\x20the\x20connection\n\x20\
+    medium\x20in\x20Mbps\x20(e.g.\x20wifi=54,\x20ethernet=1000).\x200\x20or\
+    \x20absent\x20when\x20unknown.\n\"\t\x20(#1556)\n\n\r\n\x05\x04\x05\x02[\
+    \x04\x12\x04\x83\x03\x02\n\n\r\n\x05\x04\x05\x02[\x05\x12\x04\x83\x03\
+    \x0b\x11\n\r\n\x05\x04\x05\x02[\x01\x12\x04\x83\x03\x12-\n\r\n\x05\x04\
+    \x05\x02[\x03\x12\x04\x83\x0302\n\xc1\x02\n\x04\x04\x05\x02\\\x12\x04\
+    \x88\x03\x02+\x1a\xa7\x02\x20Computed\x20throttle\x20flag:\x20true\x20wh\
+    en\x20capability_score\x20/\x20hardware_concurrency\n\x20is\x20anomalous\
+    ly\x20low\x20(<\x20150),\x20indicating\x20CPU\x20throttle,\x20thermal\
+    \x20throttle,\x20or\n\x20a\x20restrictive\x20Windows\x20power\x20plan.\
+    \x20Derived\x20client-side\x20from\x20two\x20existing\n\x20metrics\x20(n\
+    o\x20new\x20browser\x20API).\x20Absent\x20when\x20either\x20input\x20is\
+    \x20unavailable.\n\"\t\x20(#1556)\n\n\r\n\x05\x04\x05\x02\\\x04\x12\x04\
+    \x88\x03\x02\n\n\r\n\x05\x04\x05\x02\\\x05\x12\x04\x88\x03\x0b\x0f\n\r\n\
+    \x05\x04\x05\x02\\\x01\x12\x04\x88\x03\x10$\n\r\n\x05\x04\x05\x02\\\x03\
+    \x12\x04\x88\x03'*\n\xf0\x01\n\x02\x04\x06\x12\x06\x8f\x03\0\xa5\x03\x01\
+    \x1a\xe1\x01\x20Receiver-side\x20adaptive\x20decode-budget\x20state\x20(\
+    #987).\x20Mirrors\x20the\n\x20AdaptiveQuality\x20tier\x20fields\x20on\
+    \x20HealthPacket:\x20a\x20periodic\x20snapshot\x20of\x20the\n\x20current\
+    \x20decision\x20the\x20local\x20controller\x20has\x20reached\x20for\x20h\
+    ow\x20many\x20video\x20tiles\n\x20to\x20decode.\n\n\x0b\n\x03\x04\x06\
+    \x01\x12\x04\x8f\x03\x08\x14\nE\n\x04\x04\x06\x02\0\x12\x04\x90\x03\x02\
+    \x1b\"7\x20Current\x20effective\x20cap\x20on\x20simultaneously\x20decode\
+    d\x20tiles\n\n\r\n\x05\x04\x06\x02\0\x05\x12\x04\x90\x03\x02\x08\n\r\n\
+    \x05\x04\x06\x02\0\x01\x12\x04\x90\x03\t\x16\n\r\n\x05\x04\x06\x02\0\x03\
+    \x12\x04\x90\x03\x19\x1a\nF\n\x04\x04\x06\x02\x01\x12\x04\x91\x03\x02\
+    \x15\"8\x20Natural/unconstrained\x20tile\x20count\x20the\x20layout\x20wo\
+    uld\x20show\n\n\r\n\x05\x04\x06\x02\x01\x05\x12\x04\x91\x03\x02\x08\n\r\
+    \n\x05\x04\x06\x02\x01\x01\x12\x04\x91\x03\t\x10\n\r\n\x05\x04\x06\x02\
+    \x01\x03\x12\x04\x91\x03\x13\x14\n;\n\x04\x04\x06\x02\x02\x12\x04\x92\
+    \x03\x02\x15\"-\x20Pressured\x20latch\x20engaged\x20(loop\x20owns\x20the\
+    \x20cap)\n\n\r\n\x05\x04\x06\x02\x02\x05\x12\x04\x92\x03\x02\x06\n\r\n\
+    \x05\x04\x06\x02\x02\x01\x12\x04\x92\x03\x07\x10\n\r\n\x05\x04\x06\x02\
+    \x02\x03\x12\x04\x92\x03\x13\x14\n\x1d\n\x04\x04\x06\x02\x03\x12\x04\x93\
+    \x03\x02!\"\x0f\x20Auto\x20vs\x20Fixed\n\n\r\n\x05\x04\x06\x02\x03\x06\
+    \x12\x04\x93\x03\x02\x0e\n\r\n\x05\x04\x06\x02\x03\x01\x12\x04\x93\x03\
+    \x0f\x1c\n\r\n\x05\x04\x06\x02\x03\x03\x12\x04\x93\x03\x1f\x20\n]\n\x04\
+    \x04\x06\x02\x04\x12\x04\x95\x03\x02\x1e\x1aO\x20Set\x20only\x20when\x20\
+    override_mode\x20==\x20OVERRIDE_MODE_FIXED:\x20the\x20user's\x20hard\x20\
+    tile\x20cap.\n\n\r\n\x05\x04\x06\x02\x04\x05\x12\x04\x95\x03\x02\x08\n\r\
+    \n\x05\x04\x06\x02\x04\x01\x12\x04\x95\x03\t\x19\n\r\n\x05\x04\x06\x02\
+    \x04\x03\x12\x04\x95\x03\x1c\x1d\n\xa4\x03\n\x04\x04\x06\x02\x05\x12\x04\
+    \x9d\x03\x02\x18\x1a\x95\x03\x20Tiles\x20actually\x20being\x20decoded\
+    \x20right\x20now\x20=\x20min(effective_cap,\x20natural)\n\x20(#1143).\
+    \x20`effective_cap`\x20is\x20the\x20BUDGET\x20ceiling\x20and\x20`natural\
+    `\x20is\x20what\x20the\n\x20layout\x20WOULD\x20show\x20unconstrained;\
+    \x20neither\x20alone\x20answers\x20\"how\x20many\x20videos\x20is\n\x20th\
+    is\x20client\x20actually\x20decoding?\"\x20when\x20the\x20layout\x20has\
+    \x20fewer\x20tiles\x20than\x20the\n\x20cap\x20allows.\x20This\x20is\x20t\
+    hat\x20number\x20\xe2\x80\x94\x20the\x20per-client\x20\"videos\x20showin\
+    g\"\x20signal\x20the\n\x20observability\x20issue\x20asks\x20for.\n\n\r\n\
+    \x05\x04\x06\x02\x05\x05\x12\x04\x9d\x03\x02\x08\n\r\n\x05\x04\x06\x02\
+    \x05\x01\x12\x04\x9d\x03\t\x13\n\r\n\x05\x04\x06\x02\x05\x03\x12\x04\x9d\
+    \x03\x16\x17\n:\n\x04\x04\x06\x04\0\x12\x06\xa0\x03\x02\xa4\x03\x03\x1a*\
+    \x20Manual\x20override\x20mode\x20for\x20the\x20controller.\n\n\r\n\x05\
+    \x04\x06\x04\0\x01\x12\x04\xa0\x03\x07\x13\n,\n\x06\x04\x06\x04\0\x02\0\
+    \x12\x04\xa1\x03\x04\"\"\x1c\x20Treated\x20as\x20Auto\x20by\x20readers\n\
+    \n\x0f\n\x07\x04\x06\x04\0\x02\0\x01\x12\x04\xa1\x03\x04\x1d\n\x0f\n\x07\
+    \x04\x06\x04\0\x02\0\x02\x12\x04\xa1\x03\x20!\n/\n\x06\x04\x06\x04\0\x02\
+    \x01\x12\x04\xa2\x03\x04\x1b\"\x1f\x20Adaptive\x20loop\x20decides\x20the\
+    \x20cap\n\n\x0f\n\x07\x04\x06\x04\0\x02\x01\x01\x12\x04\xa2\x03\x04\x16\
+    \n\x0f\n\x07\x04\x06\x04\0\x02\x01\x02\x12\x04\xa2\x03\x19\x1a\nA\n\x06\
+    \x04\x06\x04\0\x02\x02\x12\x04\xa3\x03\x04\x1c\"1\x20User\x20hard-pinned\
+    \x20the\x20cap\x20(see\x20override_fixed_n)\n\n\x0f\n\x07\x04\x06\x04\0\
+    \x02\x02\x01\x12\x04\xa3\x03\x04\x17\n\x0f\n\x07\x04\x06\x04\0\x02\x02\
+    \x02\x12\x04\xa3\x03\x1a\x1b\n\x0c\n\x02\x04\x07\x12\x06\xa7\x03\0\xad\
+    \x03\x01\n\x0b\n\x03\x04\x07\x01\x12\x04\xa7\x03\x08\x16\n\x1e\n\x04\x04\
+    \x07\x02\0\x12\x04\xa8\x03\x02\x17\"\x10\x20\"up\"\x20or\x20\"down\"\n\n\
+    \r\n\x05\x04\x07\x02\0\x05\x12\x04\xa8\x03\x02\x08\n\r\n\x05\x04\x07\x02\
+    \0\x01\x12\x04\xa8\x03\t\x12\n\r\n\x05\x04\x07\x02\0\x03\x12\x04\xa8\x03\
+    \x15\x16\n*\n\x04\x04\x07\x02\x01\x12\x04\xa9\x03\x02\x14\"\x1c\x20\"vid\
+    eo\",\x20\"audio\",\x20\"screen\"\n\n\r\n\x05\x04\x07\x02\x01\x05\x12\
+    \x04\xa9\x03\x02\x08\n\r\n\x05\x04\x07\x02\x01\x01\x12\x04\xa9\x03\t\x0f\
+    \n\r\n\x05\x04\x07\x02\x01\x03\x12\x04\xa9\x03\x12\x13\n9\n\x04\x04\x07\
+    \x02\x02\x12\x04\xaa\x03\x02\x17\"+\x20tier\x20label\x20e.g.\x20\"hd_108\
+    0p\",\x20\"medium_480p\"\n\n\r\n\x05\x04\x07\x02\x02\x05\x12\x04\xaa\x03\
+    \x02\x08\n\r\n\x05\x04\x07\x02\x02\x01\x12\x04\xaa\x03\t\x12\n\r\n\x05\
+    \x04\x07\x02\x02\x03\x12\x04\xaa\x03\x15\x16\n\x1a\n\x04\x04\x07\x02\x03\
+    \x12\x04\xab\x03\x02\x15\"\x0c\x20tier\x20label\n\n\r\n\x05\x04\x07\x02\
+    \x03\x05\x12\x04\xab\x03\x02\x08\n\r\n\x05\x04\x07\x02\x03\x01\x12\x04\
+    \xab\x03\t\x10\n\r\n\x05\x04\x07\x02\x03\x03\x12\x04\xab\x03\x13\x14\n>\
+    \n\x04\x04\x07\x02\x04\x12\x04\xac\x03\x02\x15\"0\x20\"fps\",\x20\"bitra\
+    te\",\x20\"congestion\",\x20\"coordination\"\n\n\r\n\x05\x04\x07\x02\x04\
+    \x05\x12\x04\xac\x03\x02\x08\n\r\n\x05\x04\x07\x02\x04\x01\x12\x04\xac\
+    \x03\t\x10\n\r\n\x05\x04\x07\x02\x04\x03\x12\x04\xac\x03\x13\x14\n\x0c\n\
+    \x02\x04\x08\x12\x06\xaf\x03\0\xb2\x03\x01\n\x0b\n\x03\x04\x08\x01\x12\
+    \x04\xaf\x03\x08\x11\n,\n\x04\x04\x08\x02\0\x12\x04\xb0\x03\x02\x12\"\
+    \x1e\x20Tier\x20label\x20(e.g.\x20\"hd_1080p\")\n\n\r\n\x05\x04\x08\x02\
+    \0\x05\x12\x04\xb0\x03\x02\x08\n\r\n\x05\x04\x08\x02\0\x01\x12\x04\xb0\
+    \x03\t\r\n\r\n\x05\x04\x08\x02\0\x03\x12\x04\xb0\x03\x10\x11\n<\n\x04\
+    \x04\x08\x02\x01\x12\x04\xb1\x03\x02\x16\".\x20Time\x20spent\x20in\x20th\
+    is\x20tier\x20before\x20transitioning\n\n\r\n\x05\x04\x08\x02\x01\x05\
+    \x12\x04\xb1\x03\x02\x08\n\r\n\x05\x04\x08\x02\x01\x01\x12\x04\xb1\x03\t\
+    \x11\n\r\n\x05\x04\x08\x02\x01\x03\x12\x04\xb1\x03\x14\x15b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

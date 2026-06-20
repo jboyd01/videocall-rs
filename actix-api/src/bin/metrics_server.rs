@@ -36,6 +36,8 @@ struct SessionInfo {
     active_servers: HashSet<(String, String)>,
     // TELEM-7: last CLIENT_INFO label values (cores, arch, gpu, net, score) for cleanup
     client_info_labels: Option<[String; 5]>,
+    // #1556: last network_type label for CLIENT_NETWORK_TYPE cleanup
+    last_network_type: Option<String>,
 }
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
@@ -48,21 +50,22 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_LEVEL,
-    CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
-    CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES,
-    CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
-    CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
-    CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
-    DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
-    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
-    ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH,
-    ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    AUDIO_CONCEALMENT_PCT, AUDIO_CONGESTION_CEILING, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE,
+    BATTERY_CHARGING, BATTERY_LEVEL, CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_CPU_THROTTLED, CLIENT_INFO,
+    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
+    CLIENT_NETWORK_DOWNLINK_MAX, CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC,
+    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS,
+    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
+    DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP,
+    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
+    DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS,
+    ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
     KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
     NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
     NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
-    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RTT_PROBE_DROPPED_TOTAL,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER, RTT_PROBE_DROPPED_TOTAL,
     RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
     SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
     VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS,
@@ -295,17 +298,50 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = DECODE_ACTIVE_SET_SIZE.remove_label_values(&reporter_labels);
     let _ = CAPABILITY_SCORE.remove_label_values(&reporter_labels);
     let _ = BATTERY_LEVEL.remove_label_values(&reporter_labels);
-    // Layer gauges carry an extra media_kind label; the client only reports the
-    // camera encoder, so the single series GC'd is media_kind="camera".
-    let layer_labels: [&str; 5] = [
-        &session_info.meeting_id,
-        &session_info.session_id,
-        &session_info.reporting_user_id,
-        &session_info.display_name,
-        "camera",
-    ];
-    let _ = ENCODER_EFFECTIVE_LAYERS.remove_label_values(&layer_labels);
-    let _ = ENCODER_ACTIVE_LAYERS.remove_label_values(&layer_labels);
+    // Layer gauges carry an extra media_kind label; GC all three kinds
+    // (camera, screen, audio) that may have been published.
+    for kind in ["camera", "screen", "audio"] {
+        let layer_labels: [&str; 5] = [
+            &session_info.meeting_id,
+            &session_info.session_id,
+            &session_info.reporting_user_id,
+            &session_info.display_name,
+            kind,
+        ];
+        let _ = ENCODER_EFFECTIVE_LAYERS.remove_label_values(&layer_labels);
+        let _ = ENCODER_ACTIVE_LAYERS.remove_label_values(&layer_labels);
+    }
+
+    // #1561: Audio congestion ceiling (4-label reporter gauge)
+    let _ = AUDIO_CONGESTION_CEILING.remove_label_values(&reporter_labels);
+    // #1556: Battery charging, network downlink max, CPU throttled (4-label reporter gauges)
+    let _ = BATTERY_CHARGING.remove_label_values(&reporter_labels);
+    let _ = CLIENT_NETWORK_DOWNLINK_MAX.remove_label_values(&reporter_labels);
+    let _ = CLIENT_CPU_THROTTLED.remove_label_values(&reporter_labels);
+    // #1556: CLIENT_NETWORK_TYPE carries an extra network_type label
+    if let Some(ref net_type) = session_info.last_network_type {
+        let _ = CLIENT_NETWORK_TYPE.remove_label_values(&[
+            session_info.meeting_id.as_str(),
+            session_info.session_id.as_str(),
+            session_info.reporting_user_id.as_str(),
+            session_info.display_name.as_str(),
+            net_type.as_str(),
+        ]);
+    }
+
+    // #1561: Receiver-side layer selections (6-label: reporter + from_peer + media_kind)
+    for peer_id in &session_info.to_peers {
+        for kind in ["video", "screen", "audio"] {
+            let _ = RECEIVED_LAYER.remove_label_values(&[
+                session_info.meeting_id.as_str(),
+                session_info.session_id.as_str(),
+                session_info.reporting_user_id.as_str(),
+                session_info.display_name.as_str(),
+                peer_id.as_str(),
+                kind,
+            ]);
+        }
+    }
 
     // TELEM-8/9 cleanup (3-label: meeting_id, session_id, display_name)
     let telem_labels: [&str; 3] = [
@@ -535,6 +571,7 @@ fn process_health_packet_to_metrics_pb(
                 peer_ids: HashSet::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             });
         info.last_seen = Instant::now();
         info.display_name = reporter_display_name.clone();
@@ -982,6 +1019,176 @@ fn process_health_packet_to_metrics_pb(
                     "camera",
                 ])
                 .set(layers as f64);
+        }
+
+        // #1561: Screen encoder simulcast layer counts
+        if let Some(layers) = health_packet.effective_screen_layers {
+            ENCODER_EFFECTIVE_LAYERS
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    "screen",
+                ])
+                .set(layers as f64);
+        }
+        if let Some(layers) = health_packet.active_screen_layers {
+            ENCODER_ACTIVE_LAYERS
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    "screen",
+                ])
+                .set(layers as f64);
+        }
+
+        // #1561: Audio encoder simulcast layer counts
+        if let Some(layers) = health_packet.effective_audio_layers {
+            ENCODER_EFFECTIVE_LAYERS
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    "audio",
+                ])
+                .set(layers as f64);
+        }
+        // Audio active layers = min(effective, congestion_ceiling)
+        if let (Some(effective), Some(ceiling)) = (
+            health_packet.effective_audio_layers,
+            health_packet.audio_congestion_ceiling,
+        ) {
+            let active = effective.min(ceiling);
+            ENCODER_ACTIVE_LAYERS
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    "audio",
+                ])
+                .set(active as f64);
+        }
+
+        // #1561: Audio congestion ceiling
+        if let Some(ceiling) = health_packet.audio_congestion_ceiling {
+            AUDIO_CONGESTION_CEILING
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                ])
+                .set(ceiling as f64);
+        }
+
+        // #1561: Receiver-side layer selections
+        for (peer_session_id, layer) in &health_packet.received_video_layer {
+            RECEIVED_LAYER
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    peer_session_id.as_str(),
+                    "video",
+                ])
+                .set(*layer as f64);
+        }
+        for (peer_session_id, layer) in &health_packet.received_screen_layer {
+            RECEIVED_LAYER
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    peer_session_id.as_str(),
+                    "screen",
+                ])
+                .set(*layer as f64);
+        }
+        for (peer_session_id, layer) in &health_packet.received_audio_layer {
+            RECEIVED_LAYER
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    peer_session_id.as_str(),
+                    "audio",
+                ])
+                .set(*layer as f64);
+        }
+
+        // #1556: Battery charging state
+        if let Some(charging) = health_packet.client_battery_charging {
+            BATTERY_CHARGING
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                ])
+                .set(if charging { 1.0 } else { 0.0 });
+        }
+
+        // #1556: Network type
+        if let Some(ref net_type) = health_packet.client_network_type {
+            // Remove stale series if network type changed, then store new value.
+            {
+                let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(info) = tracker.get_mut(&session_key) {
+                    if let Some(ref prev) = info.last_network_type {
+                        if prev != net_type {
+                            let _ = CLIENT_NETWORK_TYPE.remove_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                reporter_display_name.as_str(),
+                                prev.as_str(),
+                            ]);
+                        }
+                    }
+                    info.last_network_type = Some(net_type.clone());
+                }
+            }
+            CLIENT_NETWORK_TYPE
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    net_type.as_str(),
+                ])
+                .set(1.0);
+        }
+
+        // #1556: Network downlink max
+        if let Some(max_mbps) = health_packet.client_network_downlink_max {
+            CLIENT_NETWORK_DOWNLINK_MAX
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                ])
+                .set(max_mbps);
+        }
+
+        // #1556: CPU throttle flag
+        if let Some(throttled) = health_packet.client_cpu_throttled {
+            CLIENT_CPU_THROTTLED
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                ])
+                .set(if throttled { 1.0 } else { 0.0 });
         }
 
         // Tier transition events (P2): increment counter for each transition
@@ -1758,6 +1965,7 @@ mod tests {
             to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
             client_info_labels: None,
+            last_network_type: None,
         };
 
         assert_eq!(session_info.session_id, "session_123");
@@ -1785,6 +1993,7 @@ mod tests {
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             };
             tracker_guard.insert(session_key.clone(), session_info);
             assert_eq!(tracker_guard.len(), 1);
@@ -1830,6 +2039,7 @@ mod tests {
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             };
             tracker_guard.insert(session_key, session_info);
         }
@@ -1849,6 +2059,7 @@ mod tests {
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             };
             // Simulate old timestamp by subtracting 40 seconds
             session_info.last_seen -= Duration::from_secs(40);
@@ -2275,6 +2486,7 @@ mod tests {
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             };
             tracker_guard.insert(session_key1, session_info1);
 
@@ -2291,6 +2503,7 @@ mod tests {
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             };
             session_info2.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
@@ -2308,6 +2521,7 @@ mod tests {
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             };
             tracker_guard.insert(session_key3, session_info3);
         }
@@ -2344,6 +2558,7 @@ mod tests {
             to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
             client_info_labels: None,
+            last_network_type: None,
         };
 
         // This test verifies that remove_session_metrics doesn't panic
@@ -2371,6 +2586,7 @@ mod tests {
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             };
             tracker_guard.insert(session_key, session_info);
         });
@@ -2519,6 +2735,7 @@ mod tests {
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
+                last_network_type: None,
             };
             // Set to exactly 30 seconds ago (timeout boundary)
             session_info.last_seen -= Duration::from_secs(30);
@@ -3086,6 +3303,7 @@ mod tests {
                     peer_ids: HashSet::new(),
                     active_servers: HashSet::new(),
                     client_info_labels: None,
+                    last_network_type: None,
                 },
             );
         }

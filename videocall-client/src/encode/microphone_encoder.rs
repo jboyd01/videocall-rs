@@ -554,6 +554,13 @@ impl MicrophoneEncoder {
         self.shared_congestion_layer_ceiling.clone()
     }
 
+    /// Returns the effective audio simulcast layer count (#1561): the clamped
+    /// `max_layers` this encoder was constructed with. Constant for the
+    /// session (the encoder is reconstructed on remount).
+    pub fn effective_audio_layers(&self) -> u32 {
+        clamp_audio_layer_count(self.max_layers)
+    }
+
     pub fn set_error_callback(&mut self, on_error: Callback<String>) {
         self.on_error = Some(on_error);
     }
@@ -651,6 +658,10 @@ impl MicrophoneEncoder {
         // 1 = single layer (default, byte-identical). N>1 = LOW base (layer 0)
         // plus the higher rungs of AUDIO_SIMULCAST_LAYER_KBPS.
         let n_audio_layers = clamp_audio_layer_count(self.max_layers) as usize;
+        log::info!(
+            "MicrophoneEncoder: effective audio layers = {}",
+            clamp_audio_layer_count(self.max_layers)
+        );
         let audio_simulcast = n_audio_layers > 1;
 
         // Resize the per-layer codec Vec to the effective layer count. Index 0

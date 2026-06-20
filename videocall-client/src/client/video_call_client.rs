@@ -1563,6 +1563,13 @@ impl VideoCallClient {
                                 let desired = inner
                                     .peer_decode_manager
                                     .tick_layer_choosers(now_ms, &bounds);
+                                // #1561: snapshot the per-(peer,kind) desired layer
+                                // map into the health reporter for the next packet.
+                                if let Some(hr) = &inner.health_reporter {
+                                    if let Ok(reporter) = hr.try_borrow() {
+                                        reporter.update_received_layers(&desired);
+                                    }
+                                }
                                 if let Some(entries) = inner
                                     .layer_preference_sender
                                     .take_if_changed(&desired, now_ms)
@@ -2334,6 +2341,7 @@ impl VideoCallClient {
 
     /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &self,
         queue_depth_report: Rc<AtomicU32>,
@@ -2347,6 +2355,11 @@ impl VideoCallClient {
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
+        // #1561: screen + audio layer metrics
+        effective_screen_layers: u32,
+        active_screen_layers: Rc<AtomicU32>,
+        effective_audio_layers: u32,
+        audio_congestion_ceiling: Arc<AtomicU32>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -2363,6 +2376,10 @@ impl VideoCallClient {
                         dwell_samples,
                         effective_video_layers,
                         active_video_layers,
+                        effective_screen_layers,
+                        active_screen_layers,
+                        effective_audio_layers,
+                        audio_congestion_ceiling,
                     );
                 }
             }

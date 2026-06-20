@@ -990,6 +990,58 @@ lazy_static! {
     )
     .expect("Failed to create encoder_active_layers metric");
 
+    /// Audio congestion ceiling: the congestion-driven dynamic layer cap (#1561).
+    /// Distinct from effective (configured max): this is the runtime cap applied
+    /// under congestion. MAX (u32::MAX or > 3) means uncapped.
+    pub static ref AUDIO_CONGESTION_CEILING: GaugeVec = register_gauge_vec!(
+        "videocall_audio_congestion_ceiling",
+        "Audio congestion-driven layer ceiling (1-3 = capped, >3 = uncapped); absent when audio layers not active",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create audio_congestion_ceiling metric");
+
+    /// Receiver-side layer selection: which simulcast layer THIS receiver is
+    /// subscribing to from a given peer for a given media kind (#1561).
+    pub static ref RECEIVED_LAYER: GaugeVec = register_gauge_vec!(
+        "videocall_received_layer",
+        "Simulcast layer index (0=base) this receiver has chosen for a given peer and media kind; absent when receiving the top layer (unconstrained)",
+        &["meeting_id", "session_id", "peer_id", "display_name", "from_peer", "media_kind"]
+    )
+    .expect("Failed to create received_layer metric");
+
+    /// Battery charging state (#1556): 1.0 = charging, 0.0 = discharging.
+    pub static ref BATTERY_CHARGING: GaugeVec = register_gauge_vec!(
+        "videocall_client_battery_charging",
+        "Battery charging state (1=charging, 0=discharging); absent when battery API unavailable",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_battery_charging metric");
+
+    /// Connection medium type (#1556): exposed as a dedicated gauge with value=1
+    /// and the type as a label, since CLIENT_INFO already has many labels.
+    pub static ref CLIENT_NETWORK_TYPE: GaugeVec = register_gauge_vec!(
+        "videocall_client_network_type",
+        "Connection medium indicator (value=1); network_type label carries the medium (wifi/ethernet/cellular)",
+        &["meeting_id", "session_id", "peer_id", "display_name", "network_type"]
+    )
+    .expect("Failed to create client_network_type metric");
+
+    /// Max downlink speed of the connection medium in Mbps (#1556).
+    pub static ref CLIENT_NETWORK_DOWNLINK_MAX: GaugeVec = register_gauge_vec!(
+        "videocall_client_network_downlink_max",
+        "Max downlink speed of the connection medium in Mbps (e.g. wifi=54, ethernet=1000)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_network_downlink_max metric");
+
+    /// CPU throttle indicator (#1556): 1.0 when capability_score/cores < 150.
+    pub static ref CLIENT_CPU_THROTTLED: GaugeVec = register_gauge_vec!(
+        "videocall_client_cpu_throttled",
+        "CPU throttle indicator (1=throttled, 0=normal); based on capability_score/cores ratio < 150",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_cpu_throttled metric");
+
     // ===== PER-PEER QUALITY METRICS (new/transition) =====
 
     /// Audio concealment percentage from NetEQ expand events (0.0-100.0)
