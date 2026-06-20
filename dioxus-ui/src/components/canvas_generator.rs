@@ -693,11 +693,11 @@ pub fn generate_for_peer(
         let ss_name_id = format!("{}-name", &*ss_div_id);
         let ss_signal_btn_id = format!("{}-signal-btn", &*ss_div_id);
         let ss_anchor_id = ss_signal_btn_id.clone();
-        let ss_split_class = if show_signal_popup {
-            "split-screen-tile signal-popup-open"
-        } else {
-            "split-screen-tile"
-        };
+        // issue 932 (follow-up to PR 931): the popup now floats via a
+        // `position: fixed` portal that escapes the tile's `overflow: hidden`,
+        // so the legacy `signal-popup-open` overflow-visible toggle is dead and
+        // its class is no longer emitted.
+        let ss_split_class = "split-screen-tile";
         return rsx! {
             div {
                 id: "{ss_div_id}",
@@ -809,11 +809,9 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
-        let split_peer_class = if show_signal_popup {
-            "split-peer-tile signal-popup-open"
-        } else {
-            "split-peer-tile"
-        };
+        // issue 932 (follow-up to PR 931): popup floats via a fixed-position
+        // portal, so the dead `signal-popup-open` overflow toggle is gone.
+        let split_peer_class = "split-peer-tile";
         // HCL follow-up 957 (@token-exempt): the signal-meter popup
         // anchors directly on the signal-quality button (id below) so
         // the popup overlays the button's top-left corner on first open.
@@ -1156,14 +1154,15 @@ pub fn generate_for_peer(
             // lets Dioxus diff the tile in place and REUSE the same `<canvas>`
             // node. The className is built to be byte-identical to the previous
             // behaviour: "grid-item" in the normal grid, "grid-item full-bleed"
-            // for the single surviving peer, each gaining " signal-popup-open"
-            // when the signal popup is open.
+            // for the single surviving peer.
+            //
+            // issue 932 (follow-up to PR 931): the former " signal-popup-open"
+            // suffix is dropped — the popup now floats via a `position: fixed`
+            // portal that escapes the tile's `overflow: hidden`, so the
+            // overflow-visible toggle that class drove is dead.
             let mut grid_item_class = String::from("grid-item");
             if full_bleed {
                 grid_item_class.push_str(" full-bleed");
-            }
-            if show_signal_popup {
-                grid_item_class.push_str(" signal-popup-open");
             }
             // HCL follow-up 957 (@token-exempt): anchor the popup on
             // the tile's signal-quality button (id below) so the popup

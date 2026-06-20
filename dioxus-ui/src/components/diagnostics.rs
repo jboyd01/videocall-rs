@@ -1392,7 +1392,7 @@ pub fn Diagnostics(
                                                 div { class: "peer-summary-item",
                                                     strong { "{display}" }
                                                     div {
-                                                        style: "display:flex; gap:8px; align-items:center;",
+                                                        class: "peer-summary-item__metrics",
                                                         span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
                                                         span {
                                                             "Buffer: "

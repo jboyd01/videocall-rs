@@ -1819,6 +1819,16 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-left: 3px solid var(--success);
 }
 
+/* Right-hand cluster of a peer-summary row: transport badge + Buffer/Jitter
+   readout. Replaces an inline `display:flex; gap:8px; align-items:center` on
+   the wrapping div (issue 553, follow-up to PR 548 — repo convention prefers a
+   named class over an inline style). Same computed layout, no visual change. */
+.peer-summary-item__metrics {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 .peer-summary-item strong {
   color: var(--text-primary);
   font-size: 13px;
@@ -7597,15 +7607,12 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   z-index: 9400;
 }
 
-/* Legacy `.signal-popup-open` overflow-visible escape was needed when
-   the popup was an absolutely-positioned child of `.canvas-container`.
-   In portal mode it is no longer required, but we keep the rule (with
-   the same effect) so any third-party theme that still relies on it
-   keeps working. */
-.grid-item.signal-popup-open,
-.split-peer-tile.signal-popup-open {
-  overflow: visible;
-}
+/* The legacy `.signal-popup-open` overflow-visible escape (PR 931 / issue 932)
+   was removed: it was only needed when the popup was an absolutely-positioned
+   child of `.canvas-container`. The popup now floats via the
+   `position: fixed` `.signal-quality-popup-portal` above, which escapes the
+   tile's `overflow: hidden` regardless of the tile's own overflow, so the rule
+   and its class application were dead. */
 
 .signal-quality-popup .popup-header {
   display: flex;
@@ -7630,11 +7637,10 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 /* Transport badge in the signal-quality popup header.
- * Mirrors the diagnostics popup (`diagnostics_cm_styles.css`) so the WT/WS pill
- * looks identical in both surfaces. The diagnostics popup ships its CSS as an
- * inline `<style>` block scoped to that modal, so this duplicates the same
- * three rules at global scope to make the classes available wherever the badge
- * is reused. */
+ * Higher-specificity, theme-aware variant of the global `.connection-type` /
+ * `.type-*` pill defined just below. Scoped to `.signal-quality-popup` so the
+ * popup header pill picks up the token-driven (bi-theme) colors; the global
+ * rules below cover every other surface (the diagnostics drawer). */
 .signal-quality-popup .connection-type {
   padding: 2px 8px;
   border-radius: 4px;
@@ -7655,6 +7661,39 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   background: var(--transport-badge-bg);
   color: var(--transport-badge-text);
   border: 1px solid var(--transport-badge-border);
+}
+
+/* Connection-type WT/WS pill — global home (issue 551 / issue 552, follow-up to
+ * PR 548). These unscoped rules previously lived ONLY in the diagnostics popup's
+ * inline `<style>` block (`diagnostics_cm_styles.css`). Being unscoped, that
+ * inline copy leaked to the whole document whenever the diagnostics drawer was
+ * mounted, and it was a second, separate definition of these selectors. Lifted
+ * here so the selectors are defined ONCE at global scope and apply wherever the
+ * badge renders (diagnostics drawer Reception + Per-Peer Summary). The
+ * higher-specificity `.signal-quality-popup .type-*` rules above still win
+ * inside the signal popup, so that surface is unchanged.
+ *
+ * Values are byte-identical to the former inline rules (the drawer historically
+ * rendered this pill with these fixed literals in BOTH themes), so the lift is
+ * purely structural with no rendered change. Tokenizing bg/border the way the
+ * signal popup does would flip the drawer pill light under the light theme — a
+ * visual change beyond this cleanup's scope.
+ * @token-exempt: preserves the existing fixed pill literals so the lift stays
+ * style-neutral (tokenization is a separate, behavior-changing follow-up). */
+.connection-type {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.type-websocket {
+  background: #1c1c1e;
+  color: #0a84ff;
+  border: 1px solid #38383a;
+}
+.type-webtransport {
+  background: #1c1c1e;
+  color: #0a84ff;
+  border: 1px solid #38383a;
 }
 
 .signal-quality-popup .popup-close {
