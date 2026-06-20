@@ -17,8 +17,8 @@
  */
 
 use crate::components::neteq_chart::{
-    push_capped, should_push, single_peer_selected, AdvancedChartType, ChartType,
-    NetEqAdvancedChart, NetEqChart, NetEqHistory, NetEqSample, NetEqStatusDisplay,
+    neteq_history_key, push_capped, should_push, single_peer_selected, AdvancedChartType,
+    ChartType, NetEqAdvancedChart, NetEqChart, NetEqHistory, NetEqSample, NetEqStatusDisplay,
     UnifiedTimelineChart, NETEQ_SAMPLE_CAP,
 };
 use crate::components::performance_settings::{
@@ -978,17 +978,56 @@ pub fn Diagnostics(
     let current_peer = selected_peer();
     let single_peer = single_peer_selected(&current_peer);
     let stats_map = neteq_stats_per_peer();
-    let neteq_stats_history: Rc<Vec<NetEqSample>> = if single_peer {
-        Rc::new(
-            stats_map
-                .get(&current_peer)
-                .map(|peer_stats| peer_stats.iter().cloned().collect())
-                .unwrap_or_default(),
-        )
-    } else {
-        // "All Peers": no single timeline → empty history (placeholder shown).
-        Rc::new(Vec::new())
-    };
+
+    // MEMOIZE the `Rc<Vec<NetEqSample>>` build so its POINTER identity is STABLE
+    // across parent re-renders that did NOT append a sample to the selected peer
+    // (#1451). Two layers:
+    //
+    // 1. `history_key` re-runs whenever EITHER signal it reads changes
+    //    (`selected_peer` or `neteq_stats_per_peer`, i.e. ANY peer's sample), but
+    //    only PROPAGATES a new value when the SELECTED peer's cheap identity key
+    //    (`peer` + `len` + `last_ts`) actually changed — see `neteq_history_key`.
+    // 2. `neteq_history_memo`'s only reactive dependency is `history_key()`, so it
+    //    rebuilds the `Rc` EXACTLY when the key changes. It reads the map via
+    //    `.peek()` (a NON-reactive read) so the heavy clone is NOT re-tracked on
+    //    every map mutation — the key alone gates the rebuild.
+    //
+    // Net effect: an unrelated parent re-render (toggling a help popover, resizing
+    // the drawer, another peer's sample landing) hands the SAME `Rc` to the
+    // children, so the child `UnifiedTimelineChart`'s `Rc::ptr_eq` prop gate
+    // engages and `unified_series_from_samples` is NOT recomputed. The `Rc` is
+    // rebuilt — and the children re-clip/redraw — only on a real append to the
+    // selected peer (≤1 Hz) or a peer switch. For "All Peers" the key is
+    // (peer="All Peers", len=0, last_ts=None) → a stable empty history. (#1451)
+    let history_key = use_memo(move || {
+        let peer = selected_peer();
+        let map = neteq_stats_per_peer();
+        if single_peer_selected(&peer) {
+            neteq_history_key(&peer, map.get(&peer))
+        } else {
+            // "All Peers": no single timeline → stable empty key.
+            neteq_history_key(&peer, None)
+        }
+    });
+    let neteq_history_memo = use_memo(move || {
+        // Establish the ONLY reactive dependency: the cheap key.
+        let _key = history_key();
+        // Build via `.peek()` (non-reactive) so the clone isn't re-tracked on
+        // every map mutation; the key already gates when we get here.
+        let peer = selected_peer.peek().clone();
+        if single_peer_selected(&peer) {
+            let map = neteq_stats_per_peer.peek();
+            Rc::new(
+                map.get(&peer)
+                    .map(|peer_stats| peer_stats.iter().cloned().collect())
+                    .unwrap_or_default(),
+            )
+        } else {
+            // "All Peers": no single timeline → empty history (placeholder shown).
+            Rc::new(Vec::new())
+        }
+    });
+    let neteq_stats_history: Rc<Vec<NetEqSample>> = neteq_history_memo();
 
     // Cap caption gates on len()==7200 (owner decision 2): the selected peer's
     // deque length. For "All Peers" no charts are shown, so capped stays false.
