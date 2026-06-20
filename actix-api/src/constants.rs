@@ -216,6 +216,23 @@ pub(crate) fn viewport_should_drop(
     }
 }
 
+/// Pure #1437 invariant predicate. Returns `true` iff a NON-VIDEO media kind
+/// reached the viewport drop-decision site — the impossible case the #1437
+/// tripwire counts. `MediaKind::VIDEO` => `false`; everything else, including an
+/// unknown/unparseable kind (`Err(_)`), => `true`. The viewport filter is
+/// VIDEO-only and guarded by `is_video` in `chat_server.rs` (#988), so on every
+/// real packet this returns `false`; a `true` here means that guard regressed.
+/// See #1437, #988.
+pub(crate) fn nonvideo_reached_viewport_drop_branch(
+    wire_media_kind: Result<
+        videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind,
+        i32,
+    >,
+) -> bool {
+    use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+    wire_media_kind != Ok(MediaKind::VIDEO)
+}
+
 /// Bounded channel capacity for WebSocket outbound relay queue.
 ///
 /// Half the WebTransport capacity because WS frames are larger
@@ -987,5 +1004,25 @@ mod tests {
         // enabled=true, unparseable source (None) -> fail open.
         let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
         assert!(!viewport_should_drop(true, &ids, None));
+    }
+
+    #[test]
+    fn nonvideo_reached_viewport_drop_branch_video_does_not_trip() {
+        use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+        // VIDEO is the only kind that legitimately reaches the viewport drop
+        // branch — the tripwire must NOT fire.
+        assert!(!nonvideo_reached_viewport_drop_branch(Ok(MediaKind::VIDEO)));
+    }
+
+    #[test]
+    fn nonvideo_reached_viewport_drop_branch_nonvideo_and_err_trip() {
+        use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+        // AUDIO, SCREEN, and an unknown/unparseable kind (Err) are all the
+        // impossible case — each must trip. MUTATION GUARD: if the helper is
+        // neutered to always return `false` (the "guard removed" mutation),
+        // every assert below fails.
+        assert!(nonvideo_reached_viewport_drop_branch(Ok(MediaKind::AUDIO)));
+        assert!(nonvideo_reached_viewport_drop_branch(Ok(MediaKind::SCREEN)));
+        assert!(nonvideo_reached_viewport_drop_branch(Err(999)));
     }
 }
