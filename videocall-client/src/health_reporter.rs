@@ -221,6 +221,8 @@ pub struct HealthReporter {
     effective_audio_layers: Rc<RefCell<Rc<AtomicU32>>>,
     /// #1561: CONGESTION-driven audio layer-ceiling atomic (issue #621).
     audio_congestion_ceiling: Rc<RefCell<Arc<AtomicU32>>>,
+    /// #1561: USER-driven audio layer-ceiling atomic (perf-panel control).
+    audio_user_layer_ceiling: Rc<RefCell<Rc<AtomicU32>>>,
     /// #1561: latest per-(peer,kind) desired layer map from `tick_layer_choosers`.
     /// Populated by the peer monitor tick in VideoCallClient and read here.
     received_layers: Rc<RefCell<HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>>>,
@@ -493,6 +495,7 @@ impl HealthReporter {
             active_screen_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             effective_audio_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             audio_congestion_ceiling: Rc::new(RefCell::new(Arc::new(AtomicU32::new(u32::MAX)))),
+            audio_user_layer_ceiling: Rc::new(RefCell::new(Rc::new(AtomicU32::new(u32::MAX)))),
             received_layers: Rc::new(RefCell::new(HashMap::new())),
             tier_transitions: Rc::new(RefCell::new(Vec::new())),
             climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
@@ -613,6 +616,7 @@ impl HealthReporter {
         active_screen_layers: Rc<AtomicU32>,
         effective_audio_layers: u32,
         audio_congestion_ceiling: Arc<AtomicU32>,
+        audio_user_layer_ceiling: Rc<AtomicU32>,
     ) {
         *self.encoder_queue_depth_report.borrow_mut() = queue_depth_report;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
@@ -632,6 +636,7 @@ impl HealthReporter {
         // #1561: audio layers — effective is constant, same pattern.
         *self.effective_audio_layers.borrow_mut() = Rc::new(AtomicU32::new(effective_audio_layers));
         *self.audio_congestion_ceiling.borrow_mut() = audio_congestion_ceiling;
+        *self.audio_user_layer_ceiling.borrow_mut() = audio_user_layer_ceiling;
     }
 
     /// #1561: Update the receiver-side layer selection map snapshot. Called by
@@ -1213,6 +1218,7 @@ impl HealthReporter {
         let active_screen_layers = self.active_screen_layers.clone();
         let effective_audio_layers = self.effective_audio_layers.clone();
         let audio_congestion_ceiling = self.audio_congestion_ceiling.clone();
+        let audio_user_layer_ceiling = self.audio_user_layer_ceiling.clone();
         let received_layers = self.received_layers.clone();
         let tier_transitions = self.tier_transitions.clone();
         let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
@@ -1325,8 +1331,24 @@ impl HealthReporter {
                             active_screen_layers.borrow().load(Ordering::Relaxed);
                         let effective_audio_layers_val =
                             effective_audio_layers.borrow().load(Ordering::Relaxed);
-                        let audio_congestion_ceiling_val =
+                        let audio_congestion_ceiling_raw =
                             audio_congestion_ceiling.borrow().load(Ordering::Relaxed);
+                        let audio_user_ceiling_raw =
+                            audio_user_layer_ceiling.borrow().load(Ordering::Relaxed);
+                        // Effective audio ceiling = min(congestion, user), both
+                        // mapped through layer_ceiling_to_count (u32::MAX → usize::MAX
+                        // = "uncapped"). Clamp to effective so the metric never exceeds
+                        // the configured ladder depth.
+                        let congestion_count =
+                            crate::encode::layer_ceiling_to_count(audio_congestion_ceiling_raw);
+                        let user_count =
+                            crate::encode::layer_ceiling_to_count(audio_user_ceiling_raw);
+                        let combined = congestion_count.min(user_count);
+                        let audio_congestion_ceiling_val = if combined == usize::MAX {
+                            u32::MAX
+                        } else {
+                            combined as u32
+                        };
                         // #1561: snapshot the received-layer map for this health packet.
                         let received_layers_snapshot = received_layers
                             .try_borrow()

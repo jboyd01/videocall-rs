@@ -38,6 +38,9 @@ struct SessionInfo {
     client_info_labels: Option<[String; 5]>,
     // #1556: last network_type label for CLIENT_NETWORK_TYPE cleanup
     last_network_type: Option<String>,
+    // #1561: (peer_session_id, media_kind) pairs we have published RECEIVED_LAYER for.
+    // Diffed each packet to remove stale series when a constraint clears.
+    received_layer_peers: HashSet<(String, String)>,
 }
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
@@ -329,18 +332,17 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         ]);
     }
 
-    // #1561: Receiver-side layer selections (6-label: reporter + from_peer + media_kind)
-    for peer_id in &session_info.to_peers {
-        for kind in ["video", "screen", "audio"] {
-            let _ = RECEIVED_LAYER.remove_label_values(&[
-                session_info.meeting_id.as_str(),
-                session_info.session_id.as_str(),
-                session_info.reporting_user_id.as_str(),
-                session_info.display_name.as_str(),
-                peer_id.as_str(),
-                kind,
-            ]);
-        }
+    // #1561: Receiver-side layer selections — use the exact tracked set so we
+    // only attempt to remove series we actually published (not all to_peers).
+    for (peer_id, kind) in &session_info.received_layer_peers {
+        let _ = RECEIVED_LAYER.remove_label_values(&[
+            session_info.meeting_id.as_str(),
+            session_info.session_id.as_str(),
+            session_info.reporting_user_id.as_str(),
+            session_info.display_name.as_str(),
+            peer_id.as_str(),
+            kind.as_str(),
+        ]);
     }
 
     // TELEM-8/9 cleanup (3-label: meeting_id, session_id, display_name)
@@ -509,6 +511,20 @@ fn remove_per_peer_metrics(
     let _ = DECODER_ERRORS_TOTAL.remove_label_values(&labels);
     let _ = SCREEN_VIDEO_FPS.remove_label_values(&labels);
     let _ = SCREEN_VIDEO_BITRATE_KBPS.remove_label_values(&labels);
+
+    // #1561: RECEIVED_LAYER uses a different label set (reporter-centric, not pair).
+    // The `to_peer` in the per-pair labels above is the peer whose media we RECEIVE;
+    // for RECEIVED_LAYER the peer is in the `from_peer` position. Clean all 3 kinds.
+    for kind in ["video", "screen", "audio"] {
+        let _ = RECEIVED_LAYER.remove_label_values(&[
+            meeting_id,
+            session_id,
+            reporting_user_id,
+            reporter_display_name,
+            to_peer,
+            kind,
+        ]);
+    }
 }
 
 fn process_health_packet_to_metrics_pb(
@@ -572,6 +588,7 @@ fn process_health_packet_to_metrics_pb(
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             });
         info.last_seen = Instant::now();
         info.display_name = reporter_display_name.clone();
@@ -1057,12 +1074,17 @@ fn process_health_packet_to_metrics_pb(
                 ])
                 .set(layers as f64);
         }
-        // Audio active layers = min(effective, congestion_ceiling)
-        if let (Some(effective), Some(ceiling)) = (
-            health_packet.effective_audio_layers,
-            health_packet.audio_congestion_ceiling,
-        ) {
-            let active = effective.min(ceiling);
+        // Audio active layers: the client reports the actual active count
+        // (min of effective, user ceiling, and congestion ceiling) in the
+        // audio_congestion_ceiling field. When the ceiling is >= effective
+        // (uncapped / fail-open), active == effective. The client computes this
+        // correctly; we always emit active = min(effective, ceiling) and fall
+        // back to effective alone when ceiling is absent (healthy uncapped state).
+        if let Some(effective) = health_packet.effective_audio_layers {
+            let active = health_packet
+                .audio_congestion_ceiling
+                .map(|c| effective.min(c))
+                .unwrap_or(effective);
             ENCODER_ACTIVE_LAYERS
                 .with_label_values(&[
                     meeting_id,
@@ -1074,54 +1096,90 @@ fn process_health_packet_to_metrics_pb(
                 .set(active as f64);
         }
 
-        // #1561: Audio congestion ceiling
-        if let Some(ceiling) = health_packet.audio_congestion_ceiling {
-            AUDIO_CONGESTION_CEILING
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                ])
-                .set(ceiling as f64);
+        // #1561: Audio congestion ceiling. In the uncapped (healthy) state the
+        // client omits this field; emit the effective count so Grafana always
+        // has a value (ceiling == effective → no shed).
+        {
+            let ceiling_val = match (
+                health_packet.audio_congestion_ceiling,
+                health_packet.effective_audio_layers,
+            ) {
+                (Some(c), _) => Some(c as f64),
+                (None, Some(e)) => Some(e as f64),
+                _ => None,
+            };
+            if let Some(v) = ceiling_val {
+                AUDIO_CONGESTION_CEILING
+                    .with_label_values(&[
+                        meeting_id,
+                        session_id,
+                        reporting_user_id,
+                        reporter_display_name.as_str(),
+                    ])
+                    .set(v);
+            }
         }
 
-        // #1561: Receiver-side layer selections
-        for (peer_session_id, layer) in &health_packet.received_video_layer {
-            RECEIVED_LAYER
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    peer_session_id.as_str(),
-                    "video",
-                ])
-                .set(*layer as f64);
-        }
-        for (peer_session_id, layer) in &health_packet.received_screen_layer {
-            RECEIVED_LAYER
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    peer_session_id.as_str(),
-                    "screen",
-                ])
-                .set(*layer as f64);
-        }
-        for (peer_session_id, layer) in &health_packet.received_audio_layer {
-            RECEIVED_LAYER
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    peer_session_id.as_str(),
-                    "audio",
-                ])
-                .set(*layer as f64);
+        // #1561: Receiver-side layer selections. Track which (peer, kind) pairs
+        // are currently constrained so we can remove stale series when a constraint
+        // clears (peer recovers to top layer → entry disappears from the map).
+        {
+            let mut current_pairs: HashSet<(String, String)> = HashSet::new();
+            for (peer_session_id, layer) in &health_packet.received_video_layer {
+                RECEIVED_LAYER
+                    .with_label_values(&[
+                        meeting_id,
+                        session_id,
+                        reporting_user_id,
+                        reporter_display_name.as_str(),
+                        peer_session_id.as_str(),
+                        "video",
+                    ])
+                    .set(*layer as f64);
+                current_pairs.insert((peer_session_id.clone(), "video".to_string()));
+            }
+            for (peer_session_id, layer) in &health_packet.received_screen_layer {
+                RECEIVED_LAYER
+                    .with_label_values(&[
+                        meeting_id,
+                        session_id,
+                        reporting_user_id,
+                        reporter_display_name.as_str(),
+                        peer_session_id.as_str(),
+                        "screen",
+                    ])
+                    .set(*layer as f64);
+                current_pairs.insert((peer_session_id.clone(), "screen".to_string()));
+            }
+            for (peer_session_id, layer) in &health_packet.received_audio_layer {
+                RECEIVED_LAYER
+                    .with_label_values(&[
+                        meeting_id,
+                        session_id,
+                        reporting_user_id,
+                        reporter_display_name.as_str(),
+                        peer_session_id.as_str(),
+                        "audio",
+                    ])
+                    .set(*layer as f64);
+                current_pairs.insert((peer_session_id.clone(), "audio".to_string()));
+            }
+
+            // Remove stale series for constraints that cleared since last packet
+            let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(info) = tracker.get_mut(&session_key) {
+                for (peer_id, kind) in info.received_layer_peers.difference(&current_pairs) {
+                    let _ = RECEIVED_LAYER.remove_label_values(&[
+                        meeting_id,
+                        session_id,
+                        reporting_user_id,
+                        reporter_display_name.as_str(),
+                        peer_id.as_str(),
+                        kind.as_str(),
+                    ]);
+                }
+                info.received_layer_peers = current_pairs;
+            }
         }
 
         // #1556: Battery charging state
@@ -1966,6 +2024,7 @@ mod tests {
             active_servers: HashSet::new(),
             client_info_labels: None,
             last_network_type: None,
+            received_layer_peers: HashSet::new(),
         };
 
         assert_eq!(session_info.session_id, "session_123");
@@ -1994,6 +2053,7 @@ mod tests {
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             };
             tracker_guard.insert(session_key.clone(), session_info);
             assert_eq!(tracker_guard.len(), 1);
@@ -2040,6 +2100,7 @@ mod tests {
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
         }
@@ -2060,6 +2121,7 @@ mod tests {
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             };
             // Simulate old timestamp by subtracting 40 seconds
             session_info.last_seen -= Duration::from_secs(40);
@@ -2487,6 +2549,7 @@ mod tests {
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             };
             tracker_guard.insert(session_key1, session_info1);
 
@@ -2504,6 +2567,7 @@ mod tests {
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             };
             session_info2.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
@@ -2522,6 +2586,7 @@ mod tests {
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             };
             tracker_guard.insert(session_key3, session_info3);
         }
@@ -2559,6 +2624,7 @@ mod tests {
             active_servers: HashSet::new(),
             client_info_labels: None,
             last_network_type: None,
+            received_layer_peers: HashSet::new(),
         };
 
         // This test verifies that remove_session_metrics doesn't panic
@@ -2587,6 +2653,7 @@ mod tests {
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
         });
@@ -2736,6 +2803,7 @@ mod tests {
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
+                received_layer_peers: HashSet::new(),
             };
             // Set to exactly 30 seconds ago (timeout boundary)
             session_info.last_seen -= Duration::from_secs(30);
@@ -3304,6 +3372,7 @@ mod tests {
                     active_servers: HashSet::new(),
                     client_info_labels: None,
                     last_network_type: None,
+                    received_layer_peers: HashSet::new(),
                 },
             );
         }

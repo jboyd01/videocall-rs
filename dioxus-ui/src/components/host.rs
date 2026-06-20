@@ -314,6 +314,7 @@ pub fn Host(
             screen.shared_active_layer_count(),
             microphone.effective_audio_layers(),
             microphone.congestion_layer_ceiling(),
+            microphone.shared_user_layer_ceiling(),
         );
 
         // Wire up encoder controls. Issue #1108: the encoder AQ is now a

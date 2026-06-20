@@ -1,43 +1,17 @@
 // Console Log Collector — captures browser console output and uploads periodically.
 // Reads window.__APP_CONFIG.consoleLogUploadEnabled; does nothing if falsy.
 // See docs/2026-04-13-console-log-collection-proposal.md for full design.
+//
+// IMPORTANT: The client metadata section below (GPU, network, battery, UA) runs
+// UNCONDITIONALLY — the WASM health reporter reads window.__videocall_client_metadata
+// regardless of whether console-log upload is enabled. Only the log-capture and
+// upload machinery is gated on consoleLogUploadEnabled.
 (function () {
   "use strict";
 
-  var config = (window.__APP_CONFIG || {});
-  if (config.consoleLogUploadEnabled !== "true") {
-    // Feature disabled — expose a no-op API so WASM calls do not throw.
-    window.__consoleLogCollector = {
-      setContext: function () {},
-      setAuthToken: function () {},
-      flush: function () {},
-    };
-    return;
-  }
-
-  // ---------------------------------------------------------------------------
-  // State
-  // ---------------------------------------------------------------------------
-  var BUFFER_CAP = 10000;
-  var BUFFER_BYTE_BUDGET = 768 * 1024; // 768 KB — flush before hitting the 1 MB server limit
-  var UPLOAD_INTERVAL_MS = 30000;
-
-  var buffer = [];
-  var bufferBytes = 0; // running byte count of buffer contents
-  var meetingId = null;
-  var userId = null;
-  var displayName = null;
-  // room_token for this meeting, set via setAuthToken() on join + refresh.
-  // Attached to uploads as `Authorization: Bearer <token>`. Treated as a
-  // credential: never logged, never placed in the upload body.
-  var authToken = null;
-  var appVersion = null; // populated from __APP_CONFIG.imageTag (Helm-injected)
-  var sessionTimestampMs = null; // set once per page load via setContext
-  var preambleWritten = false;
-  var uploadTimer = null;
-  var uploadInFlight = false;
-  var nextSeq = 0;
-  var nextChunkSeq = 1;
+  // ===========================================================================
+  // CLIENT METADATA (runs unconditionally — feeds health_reporter.rs)
+  // ===========================================================================
 
   var highEntropyPlatform = null;
   var highEntropyArchitecture = null;
@@ -80,48 +54,56 @@
     }
   } catch (_) {}
 
-  // TELEM-4: Network information
+  // TELEM-4: Network information (live — updated on change events)
   var networkInfo = null;
-  if (navigator.connection) {
-    networkInfo = {
-      effectiveType: navigator.connection.effectiveType || null,
-      downlink: navigator.connection.downlink || null,
-      rtt: navigator.connection.rtt || null,
-      saveData: navigator.connection.saveData || false,
-      type: navigator.connection.type || null,
-      downlinkMax: navigator.connection.downlinkMax || null,
-    };
+  function readNetworkInfo() {
+    if (navigator.connection) {
+      networkInfo = {
+        effectiveType: navigator.connection.effectiveType || null,
+        downlink: navigator.connection.downlink || null,
+        rtt: navigator.connection.rtt || null,
+        saveData: navigator.connection.saveData || false,
+        type: navigator.connection.type || null,
+        downlinkMax: navigator.connection.downlinkMax || null,
+      };
+    }
+  }
+  readNetworkInfo();
+  if (navigator.connection && navigator.connection.addEventListener) {
+    navigator.connection.addEventListener("change", function () {
+      readNetworkInfo();
+      updateClientMetadata();
+    });
   }
 
-  // TELEM-5: Battery status (async)
+  // TELEM-5: Battery status (async, live — updated on change events)
   var batteryInfo = null;
   if (navigator.getBattery) {
     try {
       navigator.getBattery().then(function (battery) {
         batteryInfo = { charging: battery.charging, level: battery.level };
         updateClientMetadata();
+        battery.addEventListener("chargingchange", function () {
+          batteryInfo.charging = battery.charging;
+          updateClientMetadata();
+        });
+        battery.addEventListener("levelchange", function () {
+          batteryInfo.level = battery.level;
+          updateClientMetadata();
+        });
       }).catch(function () {});
     } catch (_) {}
   }
 
   // Shared helper: (re)write window.__videocall_client_metadata from current state.
-  // Called from async callbacks (getHighEntropyValues, getBattery) and from writePreamble().
+  // Called from async callbacks (getHighEntropyValues, getBattery, connection change)
+  // and from writePreamble().
   function updateClientMetadata() {
-    // Issue #1482: peer hardware metrics. Computed inline from live navigator.*
-    // plus the async-filled high-entropy module vars. Every navigator access is
-    // typeof/&&-guarded so this function can NEVER throw — a throw here would
-    // wipe out architecture/gpu/network/battery from the metadata object too.
     var nav = navigator || {};
-    // os: highEntropyPlatform is ALREADY OS+version (e.g. "macOS 14.5"). The
-    // non-Chromium fallbacks (userAgentData.platform, navigator.platform) are
-    // platform-only with no version. "" => None on the Rust side.
     var osStr = highEntropyPlatform
       || (nav.userAgentData && nav.userAgentData.platform)
       || nav.platform
       || "";
-    // device_type: "desktop" | "mobile" | "tablet". When userAgentData
-    // high-entropy resolved, highEntropyMobile is a bool; otherwise (null,
-    // Firefox/Safari) fall back to coarse UA sniffing.
     var uaStr = (typeof nav.userAgent === "string") ? nav.userAgent : "";
     var maxTouch = (typeof nav.maxTouchPoints === "number") ? nav.maxTouchPoints : 0;
     var TABLET_RE = /ipad|tablet|sm-t|nexus 7|nexus 9/i;
@@ -135,8 +117,6 @@
     } else if (highEntropyMobile === false) {
       deviceType = "desktop";
     } else {
-      // highEntropyMobile === null: userAgentData high-entropy unsupported
-      // (Firefox/Safari). Check iPad/tablet BEFORE the mobile regex.
       if (isIpadDesktopUA || /iPad/.test(uaStr)) {
         deviceType = "tablet";
       } else if (/Mobi|Android|iPhone/i.test(uaStr)) {
@@ -145,8 +125,6 @@
         deviceType = "desktop";
       }
     }
-    // device_memory_gb: NUMERIC navigator.deviceMemory. Unsupported => undefined
-    // so the key is dropped from the JSON view and read as None on the Rust side.
     var deviceMemoryGb = (typeof nav.deviceMemory === "number") ? nav.deviceMemory : undefined;
     window.__videocall_client_metadata = {
       architecture: highEntropyArchitecture || "",
@@ -163,6 +141,47 @@
       device_memory_gb: deviceMemoryGb
     };
   }
+
+  // Write initial metadata synchronously (before any async callbacks resolve)
+  updateClientMetadata();
+
+  // ===========================================================================
+  // CONSOLE LOG CAPTURE (gated on consoleLogUploadEnabled)
+  // ===========================================================================
+
+  var config = (window.__APP_CONFIG || {});
+  if (config.consoleLogUploadEnabled !== "true") {
+    window.__consoleLogCollector = {
+      setContext: function () {},
+      setAuthToken: function () {},
+      flush: function () {},
+    };
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------------
+  var BUFFER_CAP = 10000;
+  var BUFFER_BYTE_BUDGET = 768 * 1024; // 768 KB — flush before hitting the 1 MB server limit
+  var UPLOAD_INTERVAL_MS = 30000;
+
+  var buffer = [];
+  var bufferBytes = 0; // running byte count of buffer contents
+  var meetingId = null;
+  var userId = null;
+  var displayName = null;
+  // room_token for this meeting, set via setAuthToken() on join + refresh.
+  // Attached to uploads as `Authorization: Bearer <token>`. Treated as a
+  // credential: never logged, never placed in the upload body.
+  var authToken = null;
+  var appVersion = null; // populated from __APP_CONFIG.imageTag (Helm-injected)
+  var sessionTimestampMs = null; // set once per page load via setContext
+  var preambleWritten = false;
+  var uploadTimer = null;
+  var uploadInFlight = false;
+  var nextSeq = 0;
+  var nextChunkSeq = 1;
 
   // ---------------------------------------------------------------------------
   // PII / secret scrubbing (best-effort, pattern-based)
