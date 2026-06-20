@@ -71,6 +71,43 @@ All code changes must pass the project linters before the work is considered com
 - Do not leave unused imports or variables.
 - Respect local lint and formatter configuration.
 
+## Change Acceptance Criteria
+
+Every change must satisfy the applicable rules below. These are derived from recurring review findings; each rule exists because its absence caused a shipped defect or a review round-trip. Keep this table aligned with the corresponding table in `CLAUDE.md`.
+
+| If your change... | You MUST... |
+|---|---|
+| **Fixes a bug or changes runtime behavior** | Include a regression test that **FAILS on the un-fixed code**. Reverting the production change must break the test. A test that passes on both the fixed and unfixed code proves nothing. |
+| **Changes user-facing behavior** (click flow, rendered state, toast, control, overlay, route) | Include a Playwright E2E spec in `e2e/tests/` covering the new flow. "Covered" means the spec has **run green** (local docker e2e stack or scoped CI dispatch); written-but-never-run does not count. An untagged spec (no `@bvt`) does not run in per-PR CI; validate it another way. |
+| **Includes a new or modified test** | The test must call or import the **production function/path** it claims to guard, not re-implement the logic inline. A test that computes the expected value the same way the production code does is testing its own copy, not the production code. |
+| **Adds or modifies a comment/doc-comment making a behavioral claim** | The claim must be **traceable to code that delivers it**. "Fires regardless of X" requires a code path that provably fires regardless of X. If the claim doesn't match the code, either fix the code or fix the comment; never ship the contradiction. |
+| **Touches state in encoder, connection, session, or transport code** | Trace ALL lifecycle paths for that state: cold start, reconnect (#1311 path), re-election, fatal restart, graceful disconnect, tab-background/resume. A fix for one path must not break another. `None` after cold-start and `None` after reconnect are different runtime states. |
+| **Reuses a constant/threshold/interval across camera↔screen or WT↔WS** | Verify the existing values are the same across those contexts. If they DIFFER, the difference is deliberate (e.g., screen's 3s GOP for text readability vs camera's 5s). Unifying without justification is a regression. |
+| **Keys off a "congestion," "pressure," "full," or "backpressure" signal** | Trace the signal to the actual queue/buffer where real backpressure surfaces. Actix mailbox `Full` is a burst absorber, NOT a receiver's downlink. Verify both transports (WS + WT). |
+| **Adds recovery/exit hysteresis (consecutive-success counters, cooldown timers)** | Verify it cannot **wedge** under the condition that triggers it. Strictly-consecutive success counters reset under ongoing contention and can pin a healthy entity indefinitely. Prefer windowed/decaying/time-bounded exits. |
+| **Is a test-reliability or de-flake change** | Demonstrate the spec **actually runs green** after the fix (local docker or CI dispatch). A de-flake PR that hasn't been run proves nothing about reliability. |
+| **Has a merge conflict with the base branch** | Rebase clean before requesting review. Red CI from a merge conflict is a blocker regardless of code quality. |
+
+## Mandatory Adversarial Review
+
+Use the repository skill `$videocall-adversarial-review` for both of these workflows:
+
+- Before creating, updating, or marking a PR ready, run its **pre-submit mode** against the complete base-to-head diff. Fix blockers and rerun affected validation before proceeding.
+- Whenever reviewing or re-reviewing a PR, run its **pull-request mode**, including complete conversation collection, independent verification of every prior sub-finding, current-head CI and mergeability checks, a formal verdict, and terminal label reconciliation.
+
+This review is mandatory unless the user explicitly requests a WIP push or asks to skip it. A WIP exception does not permit describing the change as review-ready.
+
+Non-negotiable review rules:
+
+1. Read every formal review, issue comment, inline comment, and commit relevant to the current PR head. Do not truncate long bodies.
+2. Verify every sub-point of a multi-part finding independently against current code. Classify prior findings as resolved/stale, live, or over-indexed with evidence.
+3. Classify the change and enforce the skill's test obligations. Missing required tests, tests that bypass production code, and tests that would pass on unfixed code block approval.
+4. Trace real execution paths, lifecycle states, both transports, network conditions, scale behavior, cross-layer assumptions, and failure cleanup wherever applicable.
+5. Compile or run test targets; plain `cargo check` is not enough when Rust test code is part of the verdict.
+6. Verify required CI on the exact reviewed head SHA and investigate failing logs. Do not infer that a failure is a flake.
+7. Check mergeability immediately before approval. Conflicts, required-test gaps, unexplained red CI, and code blockers are incompatible with approval.
+8. Lead with concrete findings ordered by severity and supported by file:line evidence. Do not manufacture findings or block on taste.
+
 ## Verification Checklist
 
 1. **Mutation sensitivity**: Tests must fail when the production code they guard is reverted. A test that re-implements production logic inline (instead of calling the production function) is NOT testing the production code — flag it.
@@ -93,13 +130,11 @@ Apply this checklist to Rust, TypeScript, CI workflows, shell, YAML, Helm, Docke
 
 ## Pre-Submission Review
 
-There is currently no Codex hook or command that enforces the old Claude `/pre-submit` gate. Until one exists, do not describe `git push` or `gh pr create` as mechanically blocked by Codex.
-
-Before pushing or creating a PR, run this manual pre-submission review unless the user explicitly says to skip it:
+Before pushing or creating a PR, run the **pre-submit mode** of `$videocall-adversarial-review` unless the user explicitly says to skip it. At minimum:
 
 - Run `make clippy-ci`.
 - Run `cargo fmt --all --check`.
-- For substantive changes, explicitly ask Codex to spawn the personal custom agents `videocall-code-reviewer` and `videocall-performance-reviewer`, or run an equivalent fresh-context adversarial review.
+- For substantive changes, use an independent review agent when available, or perform the skill's equivalent fresh-context adversarial review.
 - Route domain-specific changes to the right kind of review: backend/relay/transport, frontend/client transport, security, database/schema/wire format, E2E test sync, and UX/accessibility.
 - Do not push if the gate finds blocking issues. Fix findings first, then rerun the gate.
 
@@ -109,4 +144,4 @@ Escalate further for changes spanning 5+ files of core transport/session/auth lo
 
 ## Code Review Output Format
 
-When the user asks for a code review, report only problems. Be concise: one line per finding with file:line reference. No praise, no summaries, no politeness. If zero problems are found, say `No issues found.` and nothing else.
+When the user asks for a code review, report problems first, ordered by severity, with file:line references. Do not add praise or a generic summary. If zero problems are found, say `No issues found.` For pull-request reviews, also include the prior-finding audit, evidence gaps, formal verdict, and label outcome required by `$videocall-adversarial-review`.
