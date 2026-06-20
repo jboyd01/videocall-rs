@@ -19,8 +19,9 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
     is_sole_real_tile, merge_pinned_decode, merge_user_requested_decode, partition_camera_tiles,
-    promote_pinned_into_decoded, promote_requested_into_decoded,
-    should_clear_force_decode_on_override_change, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
+    presenter_cap_ceiling, presenter_extra_shed_pressure, promote_pinned_into_decoded,
+    promote_requested_into_decoded, should_clear_force_decode_on_override_change, BudgetSample,
+    BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
@@ -2822,6 +2823,13 @@ pub fn AttendantsComponent(
                 // ---- Auto path ----
                 let now = now_ms() as f64;
                 let pressured = *decode_budget_pressured.peek();
+                // Presenter-aware shedding (issue #1559): is the LOCAL user
+                // screen-sharing right now? Read every tick so the bias appears
+                // on share-start and vanishes on share-stop with no leaked state.
+                // `is_sharing()` is true only for StreamReady/Active (the same
+                // states that drive the screen ENCODER), so the extra shedding is
+                // active exactly while the encoder is competing for CPU.
+                let sharing = screen_share_state.peek().is_sharing();
 
                 if !pressured {
                     // NOT-pressured path (HCL #987 review FIX 1 + FIX 2). The
@@ -2853,8 +2861,29 @@ pub fn AttendantsComponent(
                     // the controller into ownership of the cap. Up/Hold are
                     // irrelevant here because the un-pressured cap already equals
                     // natural (the maximum the loop would ever grow to).
-                    if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
-                    {
+                    //
+                    // Presenter-aware "step down sooner" (issue #1559): the normal
+                    // latch fires on `decide_step -> Down` (median FPS < 24, the
+                    // distress floor). While SHARING, a presenter also latches on
+                    // the milder 24-30 band via `presenter_extra_shed_pressure` —
+                    // synthesised as a single-tile `Down(1)` so the existing
+                    // latch/log path is reused unchanged. The normal trigger is
+                    // never weakened (it is OR-ed in, taking priority and keeping
+                    // its proportional magnitude); the presenter branch only ADDS
+                    // the milder band, and ONLY while sharing — when sharing stops
+                    // `presenter_extra_shed_pressure` returns false and the normal
+                    // trigger is the sole latch path again. Pressure-gated: a
+                    // presenter at a healthy >= 30 fps satisfies neither trigger.
+                    let latch_step = match decide_step(&samples, &state, natural, now) {
+                        BudgetStep::Down(magnitude) => Some(magnitude),
+                        _ if presenter_extra_shed_pressure(&samples, sharing)
+                            && state.cap > MIN_CAP =>
+                        {
+                            Some(1)
+                        }
+                        _ => None,
+                    };
+                    if let Some(magnitude) = latch_step {
                         // Telemetry for the decision logs below. Computed once on
                         // this one-time pressured-latch edge (NOT per tick), so the
                         // `median_render_fps` recompute cost is irrelevant here
@@ -2870,6 +2899,17 @@ pub fn AttendantsComponent(
 
                         decode_budget_pressured.set(true);
                         state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
+                        // Presenter-aware "lower floor" (issue #1559): while
+                        // sharing, clamp the just-latched cap to the presenter
+                        // ceiling (the fraction `ceil(natural * PRESENTER_SHED_FACTOR)`
+                        // bounded above by the absolute `PRESENTER_RESIDUAL_FLOOR`,
+                        // so a large meeting sheds to a small fixed residual) — the
+                        // first shed already frees substantial peer-decode CPU for
+                        // the screen encoder. `None` while not sharing leaves the
+                        // cap exactly as the normal down-step produced it.
+                        if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
+                            state.cap = state.cap.min(ceiling.max(MIN_CAP));
+                        }
                         state.last_step_ms = now;
                         state.direction_hold = 0;
                         decode_budget_cap.set(state.cap);
@@ -3076,10 +3116,20 @@ pub fn AttendantsComponent(
                         // `non_distress_growth_qualifying` already returns false
                         // for the blind longtask, so this arm rarely runs there;
                         // capping the target is the guarantee regardless.)
-                        let target = match device_decode_ceiling {
+                        let mut target = match device_decode_ceiling {
                             Some(ceiling) => natural.max(MIN_CAP).min(ceiling.max(MIN_CAP)),
                             None => natural.max(MIN_CAP),
                         };
+                        // Presenter-aware "lower floor" (issue #1559): while
+                        // sharing, cap the non-distress GROWTH target at the
+                        // presenter ceiling so the budget does not re-grow peer
+                        // tiles back into the CPU the screen encoder needs. When
+                        // sharing stops, `presenter_cap_ceiling` returns `None` and
+                        // the target reverts to natural (∩ device ceiling), so the
+                        // existing growth path re-grows tiles — recovery on stop.
+                        if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
+                            target = target.min(ceiling.max(MIN_CAP));
+                        }
                         let up_cooldown_elapsed = (now - state.last_step_ms) >= STEP_UP_COOLDOWN_MS;
                         let not_distressed =
                             non_distress_growth_qualifying(&samples, SUSTAIN_SAMPLES);
@@ -3107,6 +3157,44 @@ pub fn AttendantsComponent(
                                 natural,
                             );
                         }
+                    }
+                }
+
+                // Presenter-aware "lower floor" — post-step clamp (issue #1559).
+                //
+                // The growth-target cap above prevents the pressured loop from
+                // GROWING past the presenter ceiling, but it does not lower a cap
+                // that is ALREADY above the ceiling when sharing begins. A user
+                // who starts sharing while already pressured (e.g. the loop had
+                // settled at cap == natural - 2) must shed down to the presenter
+                // ceiling promptly, not wait for FPS to dip further. This clamp
+                // lowers `state.cap` to the presenter ceiling whenever sharing and
+                // pressured, on EVERY arm (Down/Up/Hold), and republishes so the
+                // render-side `effective_cap` (pressured Auto == loop cap) sheds
+                // the extra tiles. While NOT sharing it is a no-op (`None`), so the
+                // cap recovers via the normal growth path — no leaked state. The
+                // active-speaker exemption is preserved downstream: `promote_speakers`
+                // runs against the resulting lower `visible_tile_count` and swaps
+                // active speakers INTO the decoded window, shedding non-speakers
+                // first.
+                if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
+                    let clamped = state.cap.min(ceiling.max(MIN_CAP));
+                    if clamped != state.cap {
+                        let prev_cap = state.cap;
+                        state.cap = clamped;
+                        state.last_step_ms = now;
+                        // A presenter shed ends any recovery streak so the cap does
+                        // not immediately try to re-grow toward natural.
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                        log::info!(
+                            "DecodeBudget: cap {}->{} dir=presenter_shed magnitude={} pressured=true sharing=true natural={} ceiling={}",
+                            prev_cap,
+                            state.cap,
+                            prev_cap - state.cap,
+                            natural,
+                            ceiling,
+                        );
                     }
                 }
             }
