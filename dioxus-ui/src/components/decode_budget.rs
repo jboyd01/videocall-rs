@@ -932,6 +932,175 @@ pub fn promote_pinned_into_decoded(
     }
 }
 
+/// Presenter-aware decode-shed factor (issue #1559).
+///
+/// While the LOCAL user is screen-sharing, the sharer's CPU is split between the
+/// heavy screen ENCODE (which since #1554 seeds the screen ladder at two rungs
+/// including the 1080p `high` rung) and every concurrent WebCodecs peer-video
+/// DECODE. In a large meeting (~15 peers) the decode load starves the screen
+/// encoder, so the shared screen's bitrate/FPS collapses (~3x worse than a
+/// 7-peer call on the same machine — the #1562 audit). Freeing CPU from peer
+/// decodes is the higher-leverage lever than per-peer resolution because decode
+/// cost scales with the NUMBER of concurrent decodes, and the decode budget
+/// counts tiles.
+///
+/// This factor sets HOW HARD a presenter sheds once pressure is measured: while
+/// sharing, the presenter's pressured-cap ceiling starts from
+/// `ceil(natural * FACTOR)` and is then bounded ABOVE by
+/// [`PRESENTER_RESIDUAL_FLOOR`] (both floored at [`MIN_CAP`] — see
+/// [`presenter_cap_ceiling`]). At `0.5` the fraction keeps SMALL meetings gentle
+/// (e.g. 7-peer → `ceil(6 * 0.5)` = 3), while the residual-floor `min` handles
+/// LARGE meetings where a pure fraction would still leave too many concurrent
+/// decodes to unstarve the encoder.
+///
+/// Tuned per the #1559 performance review (NOT a bare first guess): the goal is a
+/// BOUNDED residual peer-decode count, targeting at-or-below the healthy peer
+/// baseline the screen encoder already ran fine alongside (a ~7-peer call's ~6
+/// decodes). A pure `0.5` fraction misses this for large meetings — a 15-peer
+/// call (natural ≈ 14) would land at `ceil(14 * 0.5)` = 7 residual decodes, still
+/// AT/ABOVE the borderline that was starving the encoder, and a 30-peer call at
+/// 15 — so the absolute [`PRESENTER_RESIDUAL_FLOOR`] cap is what actually delivers
+/// the fix at scale. The factor is retained for the gentle small-meeting taper.
+pub const PRESENTER_SHED_FACTOR: f64 = 0.5;
+
+/// Absolute upper bound on the number of peer tiles a PRESENTER (local user
+/// screen-sharing) decodes while pressured, regardless of meeting size
+/// (issue #1559).
+///
+/// This is the lever that actually frees the screen encoder in LARGE meetings:
+/// the [`PRESENTER_SHED_FACTOR`] fraction alone does not bound the absolute
+/// residual decode count (a 30-peer call at `0.5` still decodes 15 peers), so the
+/// presenter ceiling is the `min` of the fraction AND this floor. With `5`, a
+/// 15-peer sharer sheds to 5 concurrent peer decodes and a 30-peer sharer also to
+/// 5 — at or below the healthy ~6-decode baseline the encoder ran fine alongside,
+/// so it can recover its CPU. `5` = the active speaker (kept decoded inside this
+/// floor by `promote_speakers`) plus a few visible peers, so the UX cost of the
+/// lower floor is small: the presenter still sees the talker and a handful of
+/// participants while non-speaker thumbnails are shed.
+///
+/// Tuned per the #1559 performance review (bounded residual decode count, target
+/// at-or-below the healthy peer baseline) — NOT a bare first guess.
+pub const PRESENTER_RESIDUAL_FLOOR: usize = 5;
+
+/// The FPS step-down threshold to use this tick, biased by whether the local
+/// user is screen-sharing (issue #1559).
+///
+/// Returns the normal [`FPS_STEP_DOWN`] (24) when NOT sharing, and the higher
+/// [`FPS_STEP_UP`] (30) when sharing. Raising the step-down threshold to 30 while
+/// sharing makes the controller treat the *entire* 24-30 hysteresis band as
+/// pressure FOR A PRESENTER, so the budget steps down SOONER (it sheds peer
+/// tiles at a milder FPS dip than it would for a non-presenter). This is the
+/// "step down sooner" half of presenter-aware shedding.
+///
+/// It is still PRESSURE-GATED: a presenter whose FPS stays comfortably above 30
+/// (`>= FPS_STEP_UP`) is never under measured pressure, so this threshold never
+/// trips and a powerful device sharing in a small meeting keeps decoding all
+/// peers. The threshold only changes WHICH fps level counts as pressure; it does
+/// not manufacture pressure on a healthy machine.
+///
+/// Pure / DOM-free / signal-free so the bias is host-unit-testable; the caller
+/// resolves `sharing` from `screen_share_state().is_sharing()`.
+pub fn presenter_step_down_fps(sharing: bool) -> f64 {
+    if sharing {
+        FPS_STEP_UP
+    } else {
+        FPS_STEP_DOWN
+    }
+}
+
+/// True when a PRESENTER (local user screen-sharing) is under *measured* decode
+/// pressure that warrants extra peer-tile shedding, evaluated over the sustain
+/// window (issue #1559).
+///
+/// This is the presenter "step down sooner" trigger. It fires when ALL of:
+///
+/// - `sharing` is true (the local user is screen-sharing — otherwise this is
+///   never a presenter and the function returns `false`), AND
+/// - the median render FPS over the sustain window is BELOW the presenter
+///   step-down threshold ([`presenter_step_down_fps`] = [`FPS_STEP_UP`] = 30 while
+///   sharing), i.e. the presenter is in or below the 24-30 band that the normal
+///   (`< FPS_STEP_DOWN` = 24) trigger would NOT yet treat as pressure.
+///
+/// It is the COMPLEMENT-aware companion to [`decide_step`]'s own step-down
+/// trigger: the normal trigger (`median < FPS_STEP_DOWN` OR sustained longtask)
+/// still fires independently; this ADDS the milder 24-30 band as a presenter-only
+/// down-trigger. The caller composes the two with OR (so the normal path is never
+/// weakened) and only ACTS on the result while `sharing` — when sharing stops the
+/// function returns `false` and the controller reverts to the normal trigger.
+///
+/// Crucially it is PRESSURE-GATED: a presenter at a healthy `>= 30` fps does NOT
+/// satisfy `median < presenter_step_down_fps(true)`, so a powerful device sharing
+/// in a small meeting is never shed by this path.
+///
+/// Returns `false` for a short/incomplete window (mirroring [`decide_step`]'s
+/// conservative handling) or any missing `render_fps` in the window.
+///
+/// Pure / DOM-free / signal-free so the trigger is host-unit-testable.
+pub fn presenter_extra_shed_pressure(samples: &[BudgetSample], sharing: bool) -> bool {
+    if !sharing {
+        return false;
+    }
+    median_render_fps(samples, SUSTAIN_SAMPLES)
+        .map(|m| m < presenter_step_down_fps(true))
+        .unwrap_or(false)
+}
+
+/// The presenter-aware *pressured cap ceiling*: an optional hard upper bound on
+/// the loop-owned decode cap that binds ONLY while the local user is
+/// screen-sharing AND the budget is already in its pressured state (issue #1559).
+///
+/// While `sharing` is true, returns
+/// `Some( min( ceil(natural * PRESENTER_SHED_FACTOR), PRESENTER_RESIDUAL_FLOOR )
+/// .max(MIN_CAP) )` — the "lower floor" half of presenter-aware shedding. The
+/// `min` is what makes this effective at SCALE: the fraction tapers small
+/// meetings gently, while [`PRESENTER_RESIDUAL_FLOOR`] hard-bounds the absolute
+/// residual peer-decode count so a 15- or 30-peer sharer is shed to the same
+/// small number (≈ the healthy baseline the encoder ran fine alongside), not a
+/// large fraction of a large meeting. Clamping the loop-owned cap to this ceiling
+/// frees peer-decode CPU for the screen encoder by shedding the lowest-priority
+/// (non-speaker / off-screen) peer thumbnails first; the active-speaker exemption
+/// is preserved by the caller's `promote_speakers`, which runs against the
+/// resulting (lower) `visible_tile_count` and swaps active speakers INTO the
+/// decoded window before the visible/avatar split, displacing only NON-speaking
+/// visible tiles — so the talker stays decoded inside the residual floor.
+///
+/// ## Worked sizes (with FACTOR = 0.5, RESIDUAL_FLOOR = 5)
+///
+/// - 6-peer meeting → `min(ceil(6 * 0.5)=3, 5)` = 3 (the fraction wins; gentle).
+/// - 14-peer meeting → `min(ceil(14 * 0.5)=7, 5)` = 5 (the floor wins; the fix).
+/// - 30-peer meeting → `min(ceil(30 * 0.5)=15, 5)` = 5 (the floor wins; bounded).
+///
+/// While `sharing` is false, returns `None` (no presenter ceiling) so the cap
+/// recovers to its normal behaviour and re-grows via the existing non-distress
+/// growth path. No leaked state: the ceiling is recomputed from the live
+/// `sharing` flag every tick.
+///
+/// ## Pressure-gating is the CALLER's responsibility
+///
+/// This helper does not itself inspect the pressure signals — the CALLER applies
+/// it only on the pressured-cap path (after `decode_budget_pressured` has
+/// latched, or on the latch edge), so a presenter whose device is NOT pressured
+/// never has this ceiling bind: a powerful machine sharing in a small meeting
+/// keeps decoding all peers. The factor only governs HOW HARD an already-pressured
+/// presenter sheds.
+///
+/// Pure / DOM-free / signal-free so the ceiling is host-unit-testable; the caller
+/// resolves `sharing` from `screen_share_state().is_sharing()`.
+pub fn presenter_cap_ceiling(natural: usize, sharing: bool) -> Option<usize> {
+    if !sharing {
+        return None;
+    }
+    // Fractional taper for small meetings, hard-bounded by the absolute residual
+    // floor for large meetings (the latter is what actually unstarves the encoder
+    // at scale — see PRESENTER_RESIDUAL_FLOOR). Floored at MIN_CAP so a presenter
+    // always decodes at least one tile (the active speaker). `MIN_CAP` (1) <=
+    // `PRESENTER_RESIDUAL_FLOOR` (5) — both consts — so the clamp bounds are
+    // well-ordered and `clamp` cannot panic; it is exactly
+    // `fraction.min(RESIDUAL_FLOOR).max(MIN_CAP)`.
+    let fraction = (natural as f64 * PRESENTER_SHED_FACTOR).ceil() as usize;
+    Some(fraction.clamp(MIN_CAP, PRESENTER_RESIDUAL_FLOOR))
+}
+
 /// True when exactly ONE real-peer tile is displayed across ALL THREE render
 /// groups combined: decoded video tiles (`visible`), off-budget avatar tiles
 /// (`avatar`), and camera-off avatar tiles (`camera_off`) (issues #1465, #508).
@@ -2517,6 +2686,254 @@ mod tests {
         assert_eq!(
             all, before,
             "a pin already in the decoded window is left untouched"
+        );
+    }
+
+    // ── issue #1559: presenter-aware decode shedding ─────────────────────────
+    //
+    // While the local user is screen-sharing, the budget must shed peer decodes
+    // MORE aggressively under pressure to free CPU for the screen encoder, but
+    // ONLY when actually pressured (a powerful device sharing in a small meeting
+    // keeps decoding peers). These pin the two pure levers — the lowered
+    // step-down FPS threshold (`presenter_step_down_fps` /
+    // `presenter_extra_shed_pressure`, "step down sooner") and the pressured-cap
+    // ceiling (`presenter_cap_ceiling`, "lower floor") — plus a loop-mirroring
+    // simulation that proves the cap lands LOWER while sharing and recovers when
+    // sharing stops.
+
+    /// The presenter step-down FPS threshold is raised to FPS_STEP_UP while
+    /// sharing (so the 24-30 band counts as pressure) and is the normal
+    /// FPS_STEP_DOWN otherwise.
+    ///
+    /// MUTATION SENSITIVITY: if `presenter_step_down_fps` ignored `sharing` (e.g.
+    /// always returned FPS_STEP_DOWN) the first assert fails; the `<` ordering
+    /// assert pins that sharing genuinely raises the bar (sheds sooner). Both
+    /// expected values are independent constants, not derived from the output.
+    #[test]
+    fn presenter_step_down_threshold_is_higher_while_sharing() {
+        assert_eq!(
+            presenter_step_down_fps(true),
+            FPS_STEP_UP,
+            "sharing widens the pressure zone up to FPS_STEP_UP"
+        );
+        assert_eq!(
+            presenter_step_down_fps(false),
+            FPS_STEP_DOWN,
+            "not sharing uses the normal step-down threshold"
+        );
+        assert!(
+            presenter_step_down_fps(false) < presenter_step_down_fps(true),
+            "sharing must lower the FPS bar for shedding (step down sooner)"
+        );
+    }
+
+    /// `presenter_extra_shed_pressure` fires in the mild 24-30 band ONLY while
+    /// sharing, and never on a healthy >= 30 presenter (pressure-gated) nor when
+    /// not sharing.
+    ///
+    /// MUTATION SENSITIVITY: removing the presenter bias (returning `false`
+    /// unconditionally, or gating on the normal `< FPS_STEP_DOWN`) makes the
+    /// `band_sharing` assert fail. Removing the `!sharing` guard makes the
+    /// `band_not_sharing` assert fail. Using `<=` on a healthy machine would make
+    /// the `healthy_sharing` assert fail.
+    #[test]
+    fn presenter_extra_shed_pressure_fires_in_band_only_while_sharing() {
+        // Median in the 24-30 band (29 fps): a presenter IS pressured here.
+        let band = [fps_sample(29.0), fps_sample(29.0), fps_sample(29.0)];
+        assert!(
+            presenter_extra_shed_pressure(&band, true),
+            "a sharing presenter in the 24-30 band is under extra-shed pressure"
+        );
+        // ...but NOT a presenter (not sharing) — the normal trigger handles 24-30
+        // as the hysteresis band, no extra shed.
+        assert!(
+            !presenter_extra_shed_pressure(&band, false),
+            "not sharing ⇒ the 24-30 band is the normal hysteresis band, no extra shed"
+        );
+        // A healthy >= 30 presenter is NOT pressured (the whole point of
+        // pressure-gating: a powerful device sharing keeps decoding peers).
+        let healthy = [
+            fps_sample(FPS_STEP_UP + 5.0),
+            fps_sample(FPS_STEP_UP + 5.0),
+            fps_sample(FPS_STEP_UP + 5.0),
+        ];
+        assert!(
+            !presenter_extra_shed_pressure(&healthy, true),
+            "a healthy >= 30 presenter is not pressured ⇒ no extra shed (pressure-gated)"
+        );
+        // Boundary: median EXACTLY at FPS_STEP_UP is NOT below it ⇒ not pressured.
+        let boundary = [
+            fps_sample(FPS_STEP_UP),
+            fps_sample(FPS_STEP_UP),
+            fps_sample(FPS_STEP_UP),
+        ];
+        assert!(
+            !presenter_extra_shed_pressure(&boundary, true),
+            "median == FPS_STEP_UP is the recovery floor, not pressure"
+        );
+        // Short window declines to act.
+        assert!(!presenter_extra_shed_pressure(&band[..1], true));
+    }
+
+    /// `presenter_cap_ceiling` returns a LOWER, ABSOLUTELY-BOUNDED cap while
+    /// sharing — `min(ceil(natural * FACTOR), PRESENTER_RESIDUAL_FLOOR)` floored
+    /// at MIN_CAP — and `None` when not sharing (full recovery, no leaked state).
+    ///
+    /// MUTATION SENSITIVITY:
+    /// - Removing the `PRESENTER_RESIDUAL_FLOOR` `min` (reverting to the pure
+    ///   fraction) makes the LARGE-meeting asserts fail: `natural=14` would yield
+    ///   `ceil(14*0.5)=7` not `5`, and `natural=30` would yield `15` not `5`.
+    /// - Ignoring `sharing` and returning `Some(_)` while NOT sharing fails the
+    ///   `not_sharing` assert (`None`).
+    /// - Dropping the fraction (always returning the floor) fails the SMALL-meeting
+    ///   assert: `natural=6` would yield `5` not `3` (the fraction must win there).
+    ///
+    /// All expected values are independent literals, not derived from the output.
+    #[test]
+    fn presenter_cap_ceiling_sheds_while_sharing_and_recovers_on_stop() {
+        // Not sharing ⇒ no ceiling (recovery / non-presenter behaviour).
+        assert_eq!(
+            presenter_cap_ceiling(14, false),
+            None,
+            "not sharing ⇒ no presenter ceiling (cap recovers to normal behaviour)"
+        );
+
+        // LARGE meeting (the #1559 worst case): natural=14 ⇒ the residual FLOOR
+        // (5) wins over the fraction (ceil(14*0.5)=7). This is the effectiveness
+        // fix: 5 residual decodes ≈ the healthy baseline the encoder ran fine
+        // alongside, NOT 7 (which was still at/above the starving borderline).
+        let large = presenter_cap_ceiling(14, true).expect("sharing ⇒ a ceiling");
+        assert!(
+            large < 14,
+            "a sharing presenter's pressured-cap ceiling must be below natural so peer tiles shed"
+        );
+        assert_eq!(
+            large, 5,
+            "large meeting sheds to the residual floor (5), not the fraction (7)"
+        );
+
+        // VERY LARGE meeting: natural=30 ⇒ still bounded to the floor (5), NOT
+        // ceil(30*0.5)=15. A pure fraction would leave a large meeting starving
+        // the encoder; the absolute floor is what bounds it regardless of size.
+        assert_eq!(
+            presenter_cap_ceiling(30, true),
+            Some(5),
+            "very large meeting is bounded to the residual floor (5), not 15"
+        );
+
+        // SMALL meeting: natural=6 ⇒ the FRACTION (ceil(6*0.5)=3) wins over the
+        // floor (5), keeping small meetings gentle (3 < 5, the min picks 3).
+        assert_eq!(
+            presenter_cap_ceiling(6, true),
+            Some(3),
+            "small meeting uses the gentle fraction (3), the floor does not bind"
+        );
+
+        // Tiny meetings never drop below MIN_CAP (the presenter always decodes the
+        // active speaker).
+        assert_eq!(
+            presenter_cap_ceiling(1, true),
+            Some(MIN_CAP),
+            "ceiling is floored at MIN_CAP (a presenter always decodes >= 1 tile)"
+        );
+        assert_eq!(
+            presenter_cap_ceiling(0, true),
+            Some(MIN_CAP),
+            "0-natural ceiling is floored at MIN_CAP, never 0"
+        );
+    }
+
+    /// END-TO-END (loop-mirroring): under the SAME measured pressure, a SHARING
+    /// presenter's cap lands STRICTLY LOWER than a non-sharing user's, and when
+    /// sharing stops the cap recovers back toward natural. This reproduces the
+    /// loop's pressured-path arithmetic: apply `decide_step`, then clamp to the
+    /// presenter ceiling while sharing (the post-step clamp the loop performs).
+    ///
+    /// MUTATION SENSITIVITY: deleting the presenter-ceiling clamp (the #1559
+    /// lever) makes `shared_cap == not_shared_cap`, so the `<` assert fails. This
+    /// is the load-bearing presenter-bias assertion.
+    fn presenter_sim_pressured_cap(
+        samples: &[BudgetSample],
+        start_cap: usize,
+        natural: usize,
+        sharing: bool,
+        now: f64,
+    ) -> usize {
+        let mut state = BudgetState {
+            cap: start_cap,
+            last_step_ms: 0.0,
+            direction_hold: 0,
+        };
+        // Pressured path: apply decide_step's step.
+        match decide_step(samples, &state, natural, now) {
+            BudgetStep::Down(m) => state.cap = state.cap.saturating_sub(m).max(MIN_CAP),
+            BudgetStep::Up => state.cap = (state.cap + 1).min(natural.max(MIN_CAP)),
+            BudgetStep::Hold => {}
+        }
+        // Presenter post-step clamp (the loop's #1559 lever).
+        if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
+            state.cap = state.cap.min(ceiling.max(MIN_CAP));
+        }
+        state.cap
+    }
+
+    #[test]
+    fn sharing_presenter_sheds_more_under_pressure_and_recovers_on_stop() {
+        let natural = 14;
+        // Mild measured pressure (24-30 band-ish, below FPS_STEP_DOWN so the
+        // normal down-step also fires): both users step down by one tile, but the
+        // sharing presenter is ALSO clamped to the presenter ceiling.
+        let mild = (FPS_SEVERE + FPS_STEP_DOWN) / 2.0;
+        let pressure = [fps_sample(mild), fps_sample(mild), fps_sample(mild)];
+        // Both start at a high cap (already pressured, settled near natural).
+        let start = natural - 1; // 13
+
+        let not_shared =
+            presenter_sim_pressured_cap(&pressure, start, natural, false, PAST_COOLDOWN);
+        let shared = presenter_sim_pressured_cap(&pressure, start, natural, true, PAST_COOLDOWN);
+
+        assert!(
+            shared < not_shared,
+            "under the same pressure a sharing presenter sheds MORE tiles than a non-sharing user (shared={shared}, not_shared={not_shared})"
+        );
+        // The presenter cap equals the presenter ceiling. natural=14 ⇒ the residual
+        // floor (5) binds over the fraction (ceil(14*0.5)=7), so the shed lands at 5.
+        assert_eq!(
+            shared, 5,
+            "the sharing presenter cap is clamped to the presenter ceiling (residual floor)"
+        );
+
+        // RECOVER ON STOP: once sharing stops, the presenter ceiling no longer
+        // binds — a machine sitting ABOVE the old ceiling (cap 9 > 5) is NOT
+        // dragged back down. With healthy samples `decide_step` Holds (no
+        // down-step) and `sharing=false` ⇒ `presenter_cap_ceiling` is `None`, so
+        // the clamp leaves the cap at 9.
+        //
+        // SCOPE (honest): this sim models the Hold arm as a no-op, so it pins ONLY
+        // that the ceiling no longer drags the cap down once sharing stops — it
+        // does NOT exercise the loop's non-distress GROWTH re-step (that lives in
+        // the pressured-Hold arm of the control loop, not this pure helper). The
+        // re-grow toward natural is covered by the existing growth-sim tests.
+        //
+        // MUTATION SENSITIVITY: if the presenter clamp ignored `sharing` (always
+        // bound the ceiling) the cap would be dragged to 5 and this fails.
+        let healthy = [fps_sample(29.0), fps_sample(29.0), fps_sample(29.0)];
+        let above_ceiling = 9; // > presenter ceiling 5, < natural 14
+        let recovered =
+            presenter_sim_pressured_cap(&healthy, above_ceiling, natural, false, PAST_COOLDOWN);
+        assert_eq!(
+            recovered, above_ceiling,
+            "once sharing stops the presenter ceiling no longer drags the cap down (recovered={recovered})"
+        );
+        // And the CONTRAST: with the SAME healthy window but still sharing, the
+        // cap IS clamped back to the presenter ceiling (the lever still binds
+        // while sharing). This pins that recovery is gated on `sharing`, not on
+        // the sample health.
+        let still_sharing =
+            presenter_sim_pressured_cap(&healthy, above_ceiling, natural, true, PAST_COOLDOWN);
+        assert_eq!(
+            still_sharing, 5,
+            "while STILL sharing, a healthy cap above the ceiling is clamped back to it"
         );
     }
 }
