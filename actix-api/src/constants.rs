@@ -740,10 +740,10 @@ pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 /// serves (the exact O(n)-per-connection fan-out hazard the Change Impact Policy
 /// warns about).
 ///
-/// ## Why DEPARTURES are safe to debounce but JOINS are not
+/// ## Debounce policy per recompute trigger
 ///
-/// The emit policy is ASYMMETRIC (mirroring the suppress-lazy / restore-eager
-/// split in [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]):
+/// The emit policy has three tiers (per-LAYER_PREFERENCE is immediate; joins
+/// and departures are both debounced behind this trailing window):
 ///
 /// * **Departures (leave/evict) → DEBOUNCE.** A leaving receiver can only RAISE
 ///   a remaining publisher's fail-open union (its constraint disappears), and a
@@ -756,12 +756,15 @@ pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 ///   membership. Delaying it by this window cannot black-tile anyone (a publisher
 ///   over-encoding for a few hundred ms is the fail-open-safe direction).
 ///
-/// * **Joins → IMMEDIATE (never debounced).** A NEW receiver has no recorded
-///   preference, so under fail-open it wants the FULL ladder from every existing
-///   publisher — its recompute can RESTORE a layer a publisher had suppressed. A
-///   real human is waiting on that tile; delaying it leaves the joiner stuck on a
-///   low/black layer for the window. The join recompute (`chat_server.rs` join
-///   path) stays a direct `do_send`.
+/// * **Joins → DEBOUNCED (same window as departures, issue #1288).** A join can
+///   only RAISE the union (fail-open demand), which is the restore-eager
+///   direction. The 300ms delay is acceptable because: (a) a new receiver's NATS
+///   subscription setup takes ~100-200ms before media flows, (b) the publisher's
+///   AQ controller needs an encoder tick + keyframe to re-enable upper layers
+///   (~300-1000ms), so the recompute delay is subsumed by the encoder reaction.
+///   Meanwhile, a join burst of K participants (call start, reconnection wave)
+///   collapses K separate O(publishers × receivers) recomputes into 1, avoiding
+///   actor starvation on the ChatServer's serialized mailbox.
 ///
 /// * **Per-LAYER_PREFERENCE recompute → IMMEDIATE (never debounced).** That path
 ///   is the latency-sensitive UPGRADE case and is already rate-limited upstream by
