@@ -605,6 +605,11 @@ impl MicrophoneEncoder {
         }
     }
 
+    /// Returns a clone of the user layer ceiling atomic for the health reporter.
+    pub fn shared_user_layer_ceiling(&self) -> Rc<AtomicU32> {
+        self.shared_user_layer_ceiling.clone()
+    }
+
     /// Replace the internal CONGESTION audio layer-ceiling atom with an
     /// externally-owned one (issue #621).
     ///
@@ -623,6 +628,13 @@ impl MicrophoneEncoder {
     /// [`VideoCallClient`] or for a host test to drive/observe (issue #621).
     pub fn congestion_layer_ceiling(&self) -> Arc<AtomicU32> {
         self.shared_congestion_layer_ceiling.clone()
+    }
+
+    /// Returns the effective audio simulcast layer count (#1561): the clamped
+    /// `max_layers` this encoder was constructed with. Constant for the
+    /// session (the encoder is reconstructed on remount).
+    pub fn effective_audio_layers(&self) -> u32 {
+        clamp_audio_layer_count(self.max_layers)
     }
 
     pub fn set_error_callback(&mut self, on_error: Callback<String>) {
@@ -726,6 +738,10 @@ impl MicrophoneEncoder {
         // 1 = single layer (default, byte-identical). N>1 = LOW base (layer 0)
         // plus the higher rungs of AUDIO_SIMULCAST_LAYER_KBPS.
         let n_audio_layers = clamp_audio_layer_count(self.max_layers) as usize;
+        log::info!(
+            "MicrophoneEncoder: effective audio layers = {}",
+            clamp_audio_layer_count(self.max_layers)
+        );
         let audio_simulcast = n_audio_layers > 1;
 
         // Resize the per-layer codec Vec to the effective layer count. Index 0
@@ -1356,6 +1372,11 @@ impl MicrophoneEncoder {
                 );
                 if next != current {
                     recovery_ceiling.store(next, Ordering::Relaxed);
+                    log::info!(
+                        "MicrophoneEncoder: congestion ceiling {} -> {} (recovery)",
+                        current,
+                        next
+                    );
                 }
                 last_seen_ceiling.set(next_seen);
                 last_congestion_ms.set(next_cut);

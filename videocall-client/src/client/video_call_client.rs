@@ -1576,6 +1576,13 @@ impl VideoCallClient {
                                 let desired = inner
                                     .peer_decode_manager
                                     .tick_layer_choosers(now_ms, &bounds);
+                                // #1561: snapshot the per-(peer,kind) desired layer
+                                // map into the health reporter for the next packet.
+                                if let Some(hr) = &inner.health_reporter {
+                                    if let Ok(reporter) = hr.try_borrow() {
+                                        reporter.update_received_layers(&desired);
+                                    }
+                                }
                                 if let Some(entries) = inner
                                     .layer_preference_sender
                                     .take_if_changed(&desired, now_ms)
@@ -2369,6 +2376,12 @@ impl VideoCallClient {
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
+        // #1561: screen + audio layer metrics
+        effective_screen_layers: u32,
+        active_screen_layers: Rc<AtomicU32>,
+        effective_audio_layers: u32,
+        audio_congestion_ceiling: Arc<AtomicU32>,
+        audio_user_layer_ceiling: Rc<AtomicU32>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -2385,6 +2398,11 @@ impl VideoCallClient {
                         dwell_samples,
                         effective_video_layers,
                         active_video_layers,
+                        effective_screen_layers,
+                        active_screen_layers,
+                        effective_audio_layers,
+                        audio_congestion_ceiling,
+                        audio_user_layer_ceiling,
                     );
                 }
             }
@@ -3042,8 +3060,15 @@ impl Inner {
         // video/screen flags use `Release` only to pair with the `swap(false)`
         // `AcqRel` consume in their AQ loops; the audio ceiling has no such
         // consume, so do not "upgrade" this to `Release`.
-        self.audio_congestion_layer_ceiling
-            .store(1, Ordering::Relaxed);
+        let prev = self
+            .audio_congestion_layer_ceiling
+            .swap(1, Ordering::Relaxed);
+        if prev != 1 {
+            log::info!(
+                "MicrophoneEncoder: congestion ceiling cut to 1 layer (was {})",
+                prev
+            );
+        }
     }
 
     /// Returns the [`PeerStatus`] of the (possibly newly-created) peer so the
