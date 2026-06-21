@@ -154,6 +154,8 @@ features = [
     "Crypto",
     "Window",
     "Location",
+    "Document",
+    "VisibilityState",
 ]
 
 [dev-dependencies]

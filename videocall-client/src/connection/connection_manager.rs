@@ -284,6 +284,32 @@ pub(super) fn monotonic_now_ms() -> f64 {
     epoch.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Age (ms) of the oldest in-flight probe relative to `now`, or None if empty.
+/// `probes` is oldest-first, so the oldest send timestamp is the front entry.
+fn oldest_probe_age_ms(probes: &VecDeque<f64>, now: f64) -> Option<f64> {
+    probes.front().map(|&oldest| now - oldest)
+}
+
+/// Current document visibility as a stable lowercase label for diagnostics.
+/// Returns "unknown" when the document or visibility state is unavailable
+/// (e.g. workers / headless WASM runtimes) and on non-wasm host builds.
+#[cfg(target_arch = "wasm32")]
+fn current_visibility_str() -> &'static str {
+    match web_sys::window()
+        .and_then(|w| w.document())
+        .map(|d| d.visibility_state())
+    {
+        Some(web_sys::VisibilityState::Visible) => "visible",
+        Some(web_sys::VisibilityState::Hidden) => "hidden",
+        _ => "unknown",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_visibility_str() -> &'static str {
+    "unknown"
+}
+
 // Connection-loss reason counters, SPLIT BY TRANSPORT (#509 parity audit,
 // item #4). WebTransport is the production-default transport (cc7tp had 8/8
 // participants on WT, 0 on WS), so a global counter cannot answer the audit's
@@ -1531,9 +1557,73 @@ impl ConnectionManager {
         // streak counter so a sustained discard pattern becomes actionable
         // (rather than silently starving the RTT-degradation watchdog).
         if !plausible {
+            // PURE OBSERVABILITY: compute all context locals BEFORE the warn! and
+            // BEFORE the existing get_mut block so no new read overlaps the
+            // mutable borrow below, and so the discard decision is unchanged.
+            let now_perf = monotonic_now_ms();
+
+            // gap vs last INBOUND media on this connection (last_inbound_at_ms).
+            // try_borrow() (never borrow()) so a concurrent borrow can't panic;
+            // copy the f64 out and drop the borrow inside this tight scope.
+            let gap_str = {
+                match self.last_inbound_at_ms.try_borrow() {
+                    Ok(map) => match map.get(connection_id).copied() {
+                        Some(ts) => format!("{:.1}ms", now_perf - ts),
+                        None => "n/a".to_string(),
+                    },
+                    Err(_) => "n/a".to_string(),
+                }
+            };
+
+            let vis = current_visibility_str();
+
+            // Discriminant ONLY — never log inner fields (e.g. Connected.server_url
+            // is a redacted URL). ConnectionState is not non-exhaustive, so no
+            // wildcard arm. Takes &self; called before the get_mut block.
+            let state_str = match self.get_connection_state() {
+                ConnectionState::Testing { .. } => "Testing",
+                ConnectionState::Connected { .. } => "Connected",
+                ConnectionState::Reconnecting { .. } => "Reconnecting",
+                ConnectionState::Failed { .. } => "Failed",
+            };
+
+            // probes_in_flight: read count + oldest age into OWNED locals inside
+            // this scope so the immutable .get() borrow drops before the .get_mut()
+            // block below (no overlap of &/&mut on rtt_measurements).
+            let (count, oldest_age): (usize, Option<f64>) = {
+                match self.rtt_measurements.get(connection_id) {
+                    Some(measurement) => (
+                        measurement.in_flight_probes.len(),
+                        oldest_probe_age_ms(&measurement.in_flight_probes, now_perf),
+                    ),
+                    None => (0, None),
+                }
+            };
+            let age_str = match oldest_age {
+                Some(ms) => format!("{:.1}s", ms / 1000.0),
+                None => "n/a".to_string(),
+            };
+
+            // INVARIANT: only self-RTT reaches here. The inbound callback guards
+            // `if packet.user_id[..] == *userid.as_bytes()` (see line ~1273) on the
+            // OUTER PacketWrapper.user_id before queueing the RTT response, so the
+            // outer id always equals the local user id at this site. We log
+            // packet_user (the INNER MediaPacket.user_id) anyway to rule out
+            // cross-user-id RTT collisions at a glance.
             warn!(
-                "Discarding implausible RTT measurement on {}: {:.1}ms (sent={}, recv={})",
-                connection_id, rtt, sent_timestamp, reception_time
+                "Discarding implausible RTT measurement on {}: {:.1}ms (sent={}, recv={}) | context: now_perf={:.1} gap_since_last_recv={} visibility={} state={} packet_user={} local_user={} probes_in_flight={} oldest_probe_age={}",
+                connection_id,
+                rtt,
+                sent_timestamp,
+                reception_time,
+                now_perf,
+                gap_str,
+                vis,
+                state_str,
+                String::from_utf8_lossy(&media_packet.user_id),
+                self.options.userid,
+                count,
+                age_str
             );
             if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
                 measurement.consecutive_implausible_discards = measurement
@@ -4559,6 +4649,24 @@ mod tests {
             "expected ElectionState::Failed after a no-candidate election"
         );
         after - before
+    }
+
+    #[test]
+    fn oldest_probe_age_ms_uses_front_oldest() {
+        // Empty queue -> no age.
+        assert_eq!(oldest_probe_age_ms(&VecDeque::<f64>::new(), 300.0), None);
+
+        // in_flight_probes is oldest-first, so the FRONT (100.0) is the oldest
+        // send timestamp. With now=300.0 the age must be 300-100=200.0, NOT
+        // 300-250=50.0 (which would be the back/newest entry). This assertion
+        // fails if the helper reads `.back()` instead of `.front()` or if the
+        // subtraction direction is broken.
+        let probes = VecDeque::from([100.0, 250.0]);
+        let age = oldest_probe_age_ms(&probes, 300.0).expect("non-empty queue has an age");
+        assert!(
+            (age - 200.0).abs() < 1e-9,
+            "oldest age must be now - front (oldest), got {age}"
+        );
     }
 
     #[test]
