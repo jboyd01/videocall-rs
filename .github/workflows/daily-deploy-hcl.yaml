@@ -1,8 +1,8 @@
-name: Daily Deploy to Production (HCL)
+name: Daily Deploy to HCL Daily-Dev
 
 on:
   workflow_run:
-    workflows: ["Daily Build Images"]
+    workflows: ["Daily Build Images (HCL)"]
     types: [completed]
     branches: [hcl-main]
   workflow_dispatch:
@@ -25,7 +25,7 @@ env:
 
 jobs:
   deploy:
-    name: Deploy to production
+    name: Deploy to HCL daily-dev
     runs-on: [self-hosted, linux, docker]
     # Only deploy if build was successful (for workflow_run trigger)
     if: |
@@ -160,7 +160,7 @@ jobs:
         run: |
           echo "Ensuring videocall namespace exists..."
           kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
-          kubectl label namespace ${NAMESPACE} app=videocall env=production --overwrite
+          kubectl label namespace ${NAMESPACE} app=videocall env=daily-dev --overwrite
           echo "✅ Namespace ready: ${NAMESPACE}"
 
       - name: Verify required secrets exist
@@ -217,7 +217,7 @@ jobs:
           # Build helm dependencies for the NATS chart
           helm dependency update helm/global/us-east/nats/
 
-          # Deploy using the production NATS chart
+          # Deploy using the NATS chart
           helm upgrade --install nats helm/global/us-east/nats/ \
             --namespace ${NAMESPACE} \
             --set nats.natsbox.enabled=true \
@@ -485,12 +485,12 @@ jobs:
           TAG=${{ steps.determine-tag.outputs.tag }}
 
           echo "=================================================="
-          echo "✅ Production deployment completed successfully!"
+          echo "✅ HCL daily-dev deployment completed successfully!"
           echo "=================================================="
           echo ""
           echo "Deployed image tag: ${TAG}"
           echo ""
-          echo "Production URLs:"
+          echo "HCL Daily-Dev URLs:"
           echo "  - Dioxus UI:     https://app.videocall.fnxlabs.com"
           echo "  - API:           https://api.videocall.fnxlabs.com"
           echo "  - WebSocket:     wss://websocket.videocall.fnxlabs.com"
@@ -529,9 +529,9 @@ jobs:
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           if [ "${{ job.status }}" = "success" ]; then
-            MESSAGE="✅ *Production Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app.videocall.fnxlabs.com\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n\n_Deployed to videocall namespace_"
+            MESSAGE="✅ *HCL Daily-Dev Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app.videocall.fnxlabs.com\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n\n_Deployed to videocall namespace_"
           else
-            MESSAGE="❌ *Production Deployment Failed*\n\n📦 Tag: \`${TAG}\`\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n🔗 Logs: ${WORKFLOW_URL}\n\n_Check workflow logs for details_"
+            MESSAGE="❌ *HCL Daily-Dev Deployment Failed*\n\n📦 Tag: \`${TAG}\`\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n🔗 Logs: ${WORKFLOW_URL}\n\n_Check workflow logs for details_"
           fi
 
           curl -X POST "${GCHAT_WEBHOOK_URL}" \
@@ -544,7 +544,7 @@ jobs:
           TAG=${{ steps.determine-tag.outputs.tag }}
 
           if [ "${{ job.status }}" = "success" ]; then
-            echo "::notice::Production deployment successful - tag: ${TAG}"
+            echo "::notice::HCL daily-dev deployment successful - tag: ${TAG}"
           else
-            echo "::error::Production deployment failed - tag: ${TAG}"
+            echo "::error::HCL daily-dev deployment failed - tag: ${TAG}"
           fi
