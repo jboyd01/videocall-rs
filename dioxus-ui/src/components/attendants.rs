@@ -4020,7 +4020,7 @@ pub fn AttendantsComponent(
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     //
-    // Screen-share right panel: compact tiles via CSS flex-wrap layout.
+    // Screen-share right panel: compact tiles via CSS grid layout.
     // All visual sizing is handled purely by CSS (.ss-peer-panel).
     //
     // ALL participants are rendered in the DOM (vertical scroll handles
@@ -4225,7 +4225,7 @@ pub fn AttendantsComponent(
         "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
          display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
          padding: 16px 16px 80px 16px; \
-         align-items: center; box-sizing: border-box; \
+         align-items: stretch; box-sizing: border-box; \
          grid-template-columns: none; grid-template-rows: none;"
             .to_string()
     } else {
@@ -4982,6 +4982,7 @@ pub fn AttendantsComponent(
                         {
                             let left_pct = screen_share_ratio() * 100.0;
                             let right_pct = (1.0 - screen_share_ratio()) * 100.0 - 0.4; // account for handle
+
                             let handle_class = if ss_resizing() {
                                 "screen-share-resize-handle dragging"
                             } else {
@@ -5015,7 +5016,7 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — CSS flex-wrap panel.
+                                // Right panel — CSS grid via auto-fill (see .ss-peer-panel in style.css).
                                 div {
                                     class: "ss-peer-panel",
                                     style: "width: {right_pct:.2}%;",

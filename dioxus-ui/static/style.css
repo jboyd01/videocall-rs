@@ -4346,17 +4346,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* Screen share split-layout — right-panel peer video tile.
-   The parent `.ss-peer-panel` is a flex-wrap container; each tile gets
-   `flex: 1 1 160px` so tiles grow to fill available width with a 160px
-   flex basis, collapsing to one column when the panel is narrow.
-   `aspect-ratio: 3 / 2` derives height from width. Off-budget tiles
+   The parent `.ss-peer-panel` is a CSS grid with auto-fill columns
+   (minmax(160px, 1fr)). Each tile spans one grid cell with
+   `aspect-ratio: 3 / 2` deriving height from width. Off-budget tiles
    render with `force_avatar: true` (avatar placeholder, no decode) —
    the decode budget caps live decoders just as the normal grid does
    (issue 987). */
 .split-peer-tile {
   position: relative;
-  flex: 1 1 160px;
-  max-width: 100%;
+  width: 100%;
   aspect-ratio: 3 / 2;
   min-width: 0;
   min-height: 0;
@@ -4394,16 +4392,20 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* ── Screen-share right panel ─────────────────────────────────────────
-   CSS flex-wrap panel. Tiles auto-wrap into as many columns as fit;
-   scrolls vertically when rows exceed height. */
+   CSS grid panel. auto-fill creates as many equal columns as fit:
+   - narrow panel (<330px content): 1 column, tiles full width
+   - wider panel (>=330px content): 2+ columns (threshold = 2*160+10 gap)
+   All tiles are always the same size (grid cells are uniform). */
 .ss-peer-panel {
   min-width: 0;
   height: 100%;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-auto-rows: min-content;
   gap: 10px;
   padding: 14px;
-  align-content: flex-start;
+  align-content: start;
+  align-items: start;
   overflow-y: auto;
   overflow-x: hidden;
   box-sizing: border-box;
@@ -4427,10 +4429,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-radius: 6px;
   gap: 2px;
   font-size: 13px;
-  max-width: 70%;
-  white-space: normal;
-  text-overflow: clip;
-  overflow: visible;
+  max-width: calc(100% - 90px);
+  white-space: nowrap;
+  overflow: hidden;
   line-height: 1.3;
   display: inline-flex;
   flex-wrap: wrap;
