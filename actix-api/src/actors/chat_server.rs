@@ -21,8 +21,8 @@ use crate::{
         LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_RECOMPUTE_COALESCE_MS,
         LAYER_HINT_SUPPRESS_DEBOUNCE_MS, LAYER_PREFERENCE_MAX_ENTRIES,
         LAYER_PREFERENCE_MAX_LAYER_ID, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL,
-        LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
-        VIEWPORT_MIN_UPDATE_INTERVAL,
+        LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, PARTICIPANT_REBROADCAST_COALESCE_MS,
+        RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
         server::{
@@ -682,6 +682,30 @@ struct RecomputeLayerHints {
 #[rtype(result = "()")]
 struct FlushPendingRecomputes;
 
+/// Trailing-debounce flush for coalesced cross-server presence re-announces.
+///
+/// Self-sent via `notify_later` [`PARTICIPANT_REBROADCAST_COALESCE_MS`] after the
+/// first `RebroadcastPresence` of a wave arms the timer. The handler drains
+/// [`ChatServer::pending_rebroadcasts`] and re-announces one PARTICIPANT_JOINED
+/// per distinct responder — broadcast for a wave (≥2 distinct requesters), unicast
+/// to the lone requester otherwise — collapsing the wave's M·N publishes to N.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct FlushRebroadcasts;
+
+/// Per-responder coalescing state. Tracks just enough to answer "did this
+/// responder see one distinct requester or ≥2 during the window?" — the threshold
+/// that selects unicast (single join) vs broadcast (wave) at flush, without
+/// storing the full requester set.
+struct RebroadcastPending {
+    /// The first requester that armed this responder; the unicast target when it
+    /// stays the only distinct requester.
+    first_requester: SessionId,
+    /// Set once a requester different from `first_requester` arrives — a wave,
+    /// which flips the flush to a broadcast.
+    saw_other_requester: bool,
+}
+
 /// Periodic self-tick that refreshes the DEMAND-side simulcast gauge
 /// `relay_layer_preference_sessions{room, kind, layer_id}` (#1170 item 2).
 ///
@@ -1052,6 +1076,33 @@ pub struct ChatServer {
     /// `!is_member`/`SkipClearPending` no-op — but wasteful). Cancelled wholesale
     /// in [`Actor::stopping`] so a stopped actor leaks no `SpawnHandle`.
     layer_hint_recheck_handles: HashMap<(String, SessionId, i32), SpawnHandle>,
+    /// Responder sessions with a coalesced presence re-announce pending behind the
+    /// [`PARTICIPANT_REBROADCAST_COALESCE_MS`] trailing debounce, each mapped to
+    /// the distinct-requester tracking that picks unicast vs broadcast at flush.
+    ///
+    /// A reconnection wave of M joiners delivers M `PARTICIPANT_LIST_REQUEST`s to
+    /// each of N peers. Rather than publish once per request, the peer is recorded
+    /// here once and a single trailing [`FlushRebroadcasts`] timer
+    /// ([`rebroadcast_coalesce_handle`]) is armed; on fire the flush re-announces
+    /// each pending responder once, dropping publishes from M·N to N. (The M·N
+    /// inbound request messages still arrive; only the arm path runs per message,
+    /// and it is cheap O(1).)
+    ///
+    /// The per-responder [`RebroadcastPending`] tracks the first requester and
+    /// whether a second distinct one arrived, so the flush unicasts to the lone
+    /// requester for a single join (no N² fan-out) and broadcasts only for a wave.
+    /// A responder that left or dropped out of `Active` during the window
+    /// self-clears (the flush re-resolves and skips it), like
+    /// [`pending_recompute_rooms`] tolerates a drained room.
+    ///
+    /// [`rebroadcast_coalesce_handle`]: ChatServer::rebroadcast_coalesce_handle
+    pending_rebroadcasts: HashMap<SessionId, RebroadcastPending>,
+    /// Single in-flight coalescing timer handle for [`pending_rebroadcasts`].
+    /// `Some` while a trailing flush is armed; `None` otherwise. Re-arming while
+    /// pending is a no-op (the existing deadline still fires), which makes the
+    /// debounce trailing — it dedups the whole wave rather than firing per
+    /// request. Cancelled in [`Actor::stopping`] so no `SpawnHandle` leaks.
+    rebroadcast_coalesce_handle: Option<SpawnHandle>,
 }
 
 impl ChatServer {
@@ -1076,6 +1127,8 @@ impl ChatServer {
             pending_recompute_rooms: std::collections::HashSet::new(),
             recompute_coalesce_handle: None,
             layer_hint_recheck_handles: HashMap::new(),
+            pending_rebroadcasts: HashMap::new(),
+            rebroadcast_coalesce_handle: None,
         }
     }
 
@@ -2171,6 +2224,12 @@ impl Actor for ChatServer {
         for (_key, handle) in self.layer_hint_recheck_handles.drain() {
             ctx.cancel_future(handle);
         }
+        // Cancel the single in-flight presence re-announce coalescing timer.
+        // A stopping relay has no joiners left to inform.
+        if let Some(handle) = self.rebroadcast_coalesce_handle.take() {
+            ctx.cancel_future(handle);
+        }
+        self.pending_rebroadcasts.clear();
         actix::Running::Stop
     }
 }
@@ -2549,61 +2608,226 @@ impl Handler<RebroadcastPresence> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: RebroadcastPresence, ctx: &mut Self::Context) -> Self::Result {
-        let found = self
-            .session_room
-            .get(&msg.session)
-            .and_then(|room_id| self.room_members.get(room_id).map(|m| (room_id.clone(), m)))
-            .and_then(|(room_id, members)| {
-                members
-                    .iter()
-                    .find(|m| m.session == msg.session)
-                    .map(|m| (room_id, m.user_id.clone(), m.display_name.clone()))
-            });
+        // Arm only; the re-announce happens in `FlushRebroadcasts` so a wave of M
+        // requests for this peer collapses into one publish.
+        let responder_is_active =
+            self.connection_states.get(&msg.session).copied() == Some(ConnectionState::Active);
+        // A "local" requester (tracked on this instance) was already served by the
+        // in-memory replay in JoinRoom, so re-announcing would only duplicate.
+        // Skipping keeps single-server zero-cost (every requester is local).
+        let requester_is_local = self.connection_states.contains_key(&msg.requester_session);
+        if !responder_is_active || requester_is_local {
+            debug!(
+                "RebroadcastPresence: not arming for session {} (active={}, requester {} local={})",
+                msg.session, responder_is_active, msg.requester_session, requester_is_local
+            );
+            return;
+        }
 
-        if let Some((room_id, user_id, display_name)) = found {
+        // Record this responder once and track distinct requesters: the flush
+        // unicasts for a single join and broadcasts only once a second distinct
+        // requester proves a wave. Identity is re-resolved at flush, so don't
+        // snapshot room/name here.
+        self.pending_rebroadcasts
+            .entry(msg.session)
+            .and_modify(|p| {
+                if msg.requester_session != p.first_requester {
+                    p.saw_other_requester = true;
+                }
+            })
+            .or_insert(RebroadcastPending {
+                first_requester: msg.requester_session,
+                saw_other_requester: false,
+            });
+        if self.rebroadcast_coalesce_handle.is_none() {
+            let handle = ctx.notify_later(
+                FlushRebroadcasts,
+                std::time::Duration::from_millis(PARTICIPANT_REBROADCAST_COALESCE_MS),
+            );
+            self.rebroadcast_coalesce_handle = Some(handle);
+        }
+    }
+}
+
+/// Trailing-debounce flush for coalesced cross-server presence re-announces.
+///
+/// Drains [`ChatServer::pending_rebroadcasts`] and re-announces each still-present,
+/// still-`Active` responder once, then clears the timer handle so the next wave
+/// arms fresh. Addressing is the threshold hybrid: a responder that saw a second
+/// distinct requester (a wave) broadcasts to `room.{room}.system`; one that saw a
+/// single requester unicasts to it, avoiding the N² relay→client fan-out a
+/// broadcast would cost on the common single-join path.
+///
+/// Identity is re-resolved here (not snapshotted at arm time), so a peer that
+/// left, was evicted, or dropped out of `Active` during the window self-clears —
+/// like [`FlushPendingRecomputes`] tolerates a room that drained to empty.
+impl Handler<FlushRebroadcasts> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, _msg: FlushRebroadcasts, ctx: &mut Self::Context) -> Self::Result {
+        // Clear the in-flight handle first so a re-arm during the drain schedules
+        // a fresh timer rather than no-op against the handle we're consuming.
+        self.rebroadcast_coalesce_handle = None;
+        let responders: Vec<(SessionId, RebroadcastPending)> =
+            self.pending_rebroadcasts.drain().collect();
+        for (session, pending) in responders {
+            let resolved = self
+                .session_room
+                .get(&session)
+                .and_then(|room_id| self.room_members.get(room_id).map(|m| (room_id.clone(), m)))
+                .and_then(|(room_id, members)| {
+                    members
+                        .iter()
+                        .find(|m| m.session == session)
+                        .map(|m| (room_id, m.user_id.clone(), m.display_name.clone()))
+                });
+            let Some((room_id, user_id, display_name)) = resolved else {
+                continue;
+            };
             let responder_is_active =
-                self.connection_states.get(&msg.session).copied() == Some(ConnectionState::Active);
-            // The requester is "local" if this instance tracks its connection;
-            // then the in-memory existing-member replay already delivered the
-            // PARTICIPANT_JOINED, so a NATS reply would duplicate it.
-            let requester_is_local = self.connection_states.contains_key(&msg.requester_session);
+                self.connection_states.get(&session).copied() == Some(ConnectionState::Active);
             let is_guest = self
                 .session_is_guest
-                .get(&msg.session)
+                .get(&session)
                 .copied()
                 .unwrap_or(false);
 
-            if let Some((subject, bytes)) = SessionManager::rebroadcast_reply_publication(
+            // Threshold hybrid: broadcast only for a genuine wave (≥2 distinct
+            // requesters); otherwise unicast to the lone requester.
+            let target = if pending.saw_other_requester {
+                None
+            } else {
+                Some(pending.first_requester)
+            };
+
+            if let Some((subject, bytes)) = SessionManager::rebroadcast_publication(
                 &room_id,
                 &user_id,
                 &display_name,
-                msg.session,
-                msg.requester_session,
+                session,
                 is_guest,
                 responder_is_active,
-                requester_is_local,
+                target,
             ) {
+                #[cfg(test)]
+                {
+                    REBROADCAST_PUBLISH_INVOCATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if target.is_none() {
+                        REBROADCAST_BROADCAST_INVOCATIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
                 info!(
-                    "RebroadcastPresence: re-publishing PARTICIPANT_JOINED for {} (session={}) to requester {} via {}",
-                    user_id, msg.session, msg.requester_session, subject
+                    "FlushRebroadcasts: re-announcing PARTICIPANT_JOINED for {} (session={}) to {}",
+                    user_id, session, subject
                 );
                 let nc = self.nats_connection.clone();
                 let fut = async move {
                     if let Err(e) = nc.publish(subject, bytes.into()).await {
                         error!(
-                            "RebroadcastPresence: failed to publish PARTICIPANT_JOINED: {}",
+                            "FlushRebroadcasts: failed to publish PARTICIPANT_JOINED: {}",
                             e
                         );
                     }
                 };
                 ctx.spawn(actix::fut::wrap_future::<_, Self>(fut));
-            } else {
-                debug!(
-                    "RebroadcastPresence: no reply for session {} (active={}, requester {} local={})",
-                    msg.session, responder_is_active, msg.requester_session, requester_is_local
-                );
             }
         }
+    }
+}
+
+/// Counts all `FlushRebroadcasts`-driven re-announce publishes (unicast +
+/// broadcast) so the tests can assert "M requests for a peer → one publish" by
+/// counting real handler invocations. `cfg(test)` only, zero production cost.
+#[cfg(test)]
+pub(crate) static REBROADCAST_PUBLISH_INVOCATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts only the broadcast re-announces (the wave branch). Lets the tests prove
+/// the hybrid: a single join stays at 0 (unicast); a wave increments it.
+/// `cfg(test)` only.
+#[cfg(test)]
+pub(crate) static REBROADCAST_BROADCAST_INVOCATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only: seed one `Active` room member so the real `RebroadcastPresence` /
+/// `FlushRebroadcasts` path can be driven on a started actor without the full
+/// JoinRoom + ActivateConnection flow. Populates the maps those handlers read.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct TestSeedActiveMember {
+    session: SessionId,
+    room: String,
+    user_id: String,
+    display_name: String,
+}
+
+#[cfg(test)]
+impl Handler<TestSeedActiveMember> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: TestSeedActiveMember, _ctx: &mut Self::Context) -> Self::Result {
+        self.session_room.insert(msg.session, msg.room.clone());
+        self.room_members
+            .entry(msg.room)
+            .or_default()
+            .push(RoomMemberInfo {
+                session: msg.session,
+                user_id: msg.user_id,
+                display_name: msg.display_name,
+                is_host: false,
+                end_on_host_leave: false,
+            });
+        self.connection_states
+            .insert(msg.session, ConnectionState::Active);
+        self.session_is_guest.insert(msg.session, false);
+    }
+}
+
+/// Test-only: drop all state for a session (as `leave_rooms`/`forget_session`
+/// would) so a test can prove the `FlushRebroadcasts` self-clear — a responder
+/// that left during the window produces no re-announce.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct TestForgetMember {
+    session: SessionId,
+}
+
+#[cfg(test)]
+impl Handler<TestForgetMember> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: TestForgetMember, _ctx: &mut Self::Context) -> Self::Result {
+        if let Some(room) = self.session_room.remove(&msg.session) {
+            if let Some(members) = self.room_members.get_mut(&room) {
+                members.retain(|m| m.session != msg.session);
+            }
+        }
+        self.connection_states.remove(&msg.session);
+        self.session_is_guest.remove(&msg.session);
+    }
+}
+
+/// Test-only: report the coalescing state (`pending_rebroadcasts.len()`,
+/// `rebroadcast_coalesce_handle.is_some()`) so a test can assert dedup and that
+/// the flush drained everything, without reaching into private fields.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "(usize, bool)")]
+struct TestRebroadcastState;
+
+#[cfg(test)]
+impl Handler<TestRebroadcastState> for ChatServer {
+    type Result = MessageResult<TestRebroadcastState>;
+
+    fn handle(&mut self, _msg: TestRebroadcastState, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult((
+            self.pending_rebroadcasts.len(),
+            self.rebroadcast_coalesce_handle.is_some(),
+        ))
     }
 }
 
@@ -4193,10 +4417,12 @@ fn try_intercept_layer_preference(
 }
 
 /// Checks whether `msg` is a `PARTICIPANT_LIST_REQUEST` system event.
-/// If so, asks the local ChatServer (via `RebroadcastPresence`) to re-publish
-/// this session's own PARTICIPANT_JOINED addressed to the requesting joiner, so
-/// a cross-server joiner — whose NATS subscription was established after the
+/// If so, asks the local ChatServer (via `RebroadcastPresence`) to arm a
+/// coalesced re-announce of this session's own PARTICIPANT_JOINED, so a
+/// cross-server joiner — whose NATS subscription was established after the
 /// original deferred PARTICIPANT_JOINED was published — learns about this peer.
+/// The ChatServer re-announces once per coalescing window — unicast to the lone
+/// joiner, or broadcast for a wave — not once per request.
 ///
 /// `parsed` is the `PacketWrapper` decoded once per packet in the NATS loop.
 /// Returns `true` when intercepted (caller must `continue`); `false` otherwise.
@@ -4691,13 +4917,16 @@ fn handle_msg(
             return Ok(());
         }
 
-        // Unicast MEETING reply filter (see `RebroadcastPresence`): a
-        // PARTICIPANT_JOINED sent in reply to a PARTICIPANT_LIST_REQUEST is
-        // addressed to a single requester by publishing on that requester's
-        // per-session subject (`room.{room}.{N}`). Every session receives it via
-        // the room wildcard, so drop it unless it targets us. Broadcast MEETING
-        // events (PARTICIPANT_JOINED at activation, PARTICIPANT_LEFT, etc.) use
-        // the `room.{room}.system` subject and are left untouched.
+        // Unicast MEETING reply filter (presence info-leak boundary): a MEETING
+        // packet addressed to a single session via a per-session subject
+        // (`room.{room}.{N}`) — which every session receives via the room wildcard
+        // — is dropped unless it targets us, so only the addressed requester
+        // forwards it to its client. The single-join presence re-announce uses
+        // this per-session addressing (the flush unicasts when only one joiner
+        // asked), so this filter is on the live path — it keeps a single join at
+        // O(N) relay→client forwards instead of O(N²). Broadcast MEETING events
+        // (PARTICIPANT_JOINED at activation, the wave re-announce, PARTICIPANT_LEFT)
+        // use `room.{room}.system` and are left untouched so they reach everyone.
         if is_meeting && !subject_self {
             let targets_other_session = msg
                 .subject
@@ -15109,6 +15338,299 @@ mod tests {
             "a direct RecomputeLayerHints must run IMMEDIATELY, not be \
              held behind the coalesce window"
         );
+    }
+
+    // These tests start a real `ChatServer` (NATS-backed) and drive the real
+    // `RebroadcastPresence` arm + `notify_later` timer + `FlushRebroadcasts`
+    // path. They count actual re-announce publishes via the test-only
+    // `REBROADCAST_PUBLISH_INVOCATIONS` (total) and `REBROADCAST_BROADCAST_INVOCATIONS`
+    // (broadcast branch only) counters. State is seeded with `TestSeedActiveMember`.
+
+    /// M PARTICIPANT_LIST_REQUESTs targeting the SAME peer collapse into one
+    /// re-announce, and a second peer adds exactly one more — one publish per
+    /// distinct responder, not per request. Also proves the hybrid: peer 8001 saw
+    /// ≥2 distinct requesters (a wave) → broadcast; peer 8002 saw one → unicast.
+    ///
+    /// MUTATION PROOF:
+    /// * Revert the coalescing (publish per request) → `(pending_len, armed)` is
+    ///   no longer `(1, true)` after 8001's 5 requests, and total publishes go 2→6.
+    /// * Revert the hybrid to broadcast-only → 8002 broadcasts too, so
+    ///   `REBROADCAST_BROADCAST_INVOCATIONS` is 2, not 1.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_rebroadcasts_coalesce_per_responder() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        REBROADCAST_BROADCAST_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-reannounce-coalesce";
+        // Two existing ACTIVE peers in the room (the responders).
+        for (session, name) in [(8001u64, "alice@x.com"), (8002u64, "bob@x.com")] {
+            chat.send(TestSeedActiveMember {
+                session,
+                room: room.to_string(),
+                user_id: name.to_string(),
+                display_name: name.to_string(),
+            })
+            .await
+            .expect("seed should succeed");
+        }
+
+        // A reconnection wave: 5 REMOTE joiners (sessions 9001..=9005, none tracked
+        // locally → `requester_is_local == false`) each ask peer 8001 to
+        // re-announce. All 5 arrive within the coalescing window → 8001 sees ≥2
+        // distinct requesters (a wave).
+        for requester in 9001u64..=9005 {
+            chat.send(RebroadcastPresence {
+                session: 8001,
+                requester_session: requester,
+            })
+            .await
+            .expect("message delivery should succeed");
+            let (pending_len, armed) = chat
+                .send(TestRebroadcastState)
+                .await
+                .expect("state probe should succeed");
+            assert_eq!(
+                pending_len, 1,
+                "requester {requester}: M requests for the SAME peer must dedup to ONE pending responder"
+            );
+            assert!(
+                armed,
+                "requester {requester}: the single trailing timer must be armed"
+            );
+        }
+
+        // A different peer (8002) is asked by exactly ONE remote joiner (an
+        // ordinary single join) → pending grows to 2, still ONE timer.
+        chat.send(RebroadcastPresence {
+            session: 8002,
+            requester_session: 9006,
+        })
+        .await
+        .expect("message delivery should succeed");
+        let (pending_len, armed) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_len, 2,
+            "a distinct responder adds a second pending entry"
+        );
+        assert!(armed, "still exactly one trailing timer for the whole wave");
+
+        // Before the window elapses, NOTHING has gone out (debounced).
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "re-announces must be DEFERRED until the coalesce window elapses"
+        );
+
+        // Wait out the window + slack for the flush to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        // Exactly ONE publish per distinct responder (2), NOT one per request (6).
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            2,
+            "the 6 coalesced requests must yield exactly 2 publishes (one per peer)"
+        );
+        // Hybrid: only 8001 (≥2 distinct requesters) broadcast; 8002 (one
+        // requester) unicast → exactly ONE broadcast.
+        assert_eq!(
+            REBROADCAST_BROADCAST_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "only the wave responder (8001) may broadcast; the single-join \
+             responder (8002) must unicast"
+        );
+
+        // The flush drained the set and cleared the timer handle.
+        let (pending_after, armed_after) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(pending_after, 0, "flush must drain the pending set");
+        assert!(
+            !armed_after,
+            "flush must clear the in-flight timer so the next wave re-arms fresh"
+        );
+    }
+
+    /// An ordinary single join — one remote requester asks one existing peer —
+    /// must unicast the re-announce, not broadcast it (broadcasting fans a single
+    /// join out to ~N² relay→client forwards). The requester asks twice to prove a
+    /// repeat from the SAME requester does not count as a second distinct one.
+    ///
+    /// MUTATION PROOF: revert the hybrid (always broadcast) →
+    /// `REBROADCAST_BROADCAST_INVOCATIONS` becomes 1, failing the `== 0` assert.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_single_join_unicasts_not_broadcasts() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        REBROADCAST_BROADCAST_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-reannounce-single";
+        chat.send(TestSeedActiveMember {
+            session: 8301,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        // One remote joiner asks — TWICE, to prove a repeat from the SAME
+        // requester does not count as a second distinct requester.
+        for _ in 0..2 {
+            chat.send(RebroadcastPresence {
+                session: 8301,
+                requester_session: 9301,
+            })
+            .await
+            .expect("message delivery should succeed");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "a single join must produce exactly one re-announce publish"
+        );
+        assert_eq!(
+            REBROADCAST_BROADCAST_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "a single-requester re-announce must UNICAST, never broadcast"
+        );
+    }
+
+    /// A request from a local requester (one this instance tracks) must NOT arm a
+    /// re-announce — the in-memory replay in JoinRoom already served it, so
+    /// single-server deployments stay zero-cost.
+    ///
+    /// MUTATION PROOF: drop the `requester_is_local` short-circuit → the pending
+    /// set arms (pending == 1, armed == true), failing both asserts.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_local_requester_does_not_arm() {
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-reannounce-local";
+        // Responder 8101 is active; requester 9101 is ALSO a tracked local session.
+        chat.send(TestSeedActiveMember {
+            session: 8101,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+        chat.send(TestSeedActiveMember {
+            session: 9101,
+            room: room.to_string(),
+            user_id: "carol@x.com".to_string(),
+            display_name: "carol@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        chat.send(RebroadcastPresence {
+            session: 8101,
+            requester_session: 9101, // local (tracked in connection_states)
+        })
+        .await
+        .expect("message delivery should succeed");
+
+        let (pending, armed) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(pending, 0, "a local requester must NOT arm a re-announce");
+        assert!(
+            !armed,
+            "no trailing timer should be armed for a local requester"
+        );
+    }
+
+    /// A responder that leaves during the coalescing window produces no
+    /// re-announce — the flush re-resolves identity at fire time and self-clears a
+    /// departed peer.
+    ///
+    /// MUTATION PROOF: snapshot identity at arm time instead of re-resolving →
+    /// this would publish for a left peer (count == 1), failing.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_responder_left_during_window_no_broadcast() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-reannounce-left";
+        chat.send(TestSeedActiveMember {
+            session: 8201,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        // A remote joiner arms the re-announce…
+        chat.send(RebroadcastPresence {
+            session: 8201,
+            requester_session: 9201,
+        })
+        .await
+        .expect("message delivery should succeed");
+
+        // …but the responder leaves before the window fires.
+        chat.send(TestForgetMember { session: 8201 })
+            .await
+            .expect("forget should succeed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "a responder that left during the window must NOT be broadcast"
+        );
+        let (pending_after, armed_after) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(pending_after, 0, "flush must still drain the pending set");
+        assert!(!armed_after, "flush must clear the in-flight timer");
     }
 
     // --- Transfer-host: in-memory presence-map logic -----------------
