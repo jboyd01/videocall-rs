@@ -237,6 +237,21 @@ pub struct BudgetState {
     /// Counter of consecutive samples spent holding in the *recovery*
     /// condition. Used to enforce [`RECOVERY_HOLD`] before stepping up.
     pub direction_hold: u32,
+    /// `now_ms` of the most recent *layer-drop* apply (issue #1557). Used by
+    /// [`cascade_action`] for settle timing: a Down edge escalates from
+    /// lowering received layers to pausing tiles only once
+    /// [`STEP_DOWN_COOLDOWN_MS`] has elapsed since this timestamp.
+    pub last_layer_drop_ms: f64,
+    /// Set from the last `apply_local_cpu_pressure_congestion()` that ACTUALLY RAN
+    /// (`Some(stepped)`) (issue #1557); a contended/skipped apply (`None`) leaves
+    /// this field UNCHANGED so the cascade does not advance. `stepped == false`
+    /// means no peer chooser moved — every
+    /// droppable/non-exempt received layer is already at base (this includes the
+    /// degenerate case where the only connected peers are active speakers, who are
+    /// exempt from layer-drop, so nothing was eligible to move). When
+    /// `layers_at_floor == true`, further layer drops are a no-op and
+    /// [`cascade_action`] may escalate to pausing tiles.
+    pub layers_at_floor: bool,
 }
 
 /// The decision produced by [`decide_step`].
@@ -490,6 +505,116 @@ pub fn decide_step(
     }
 
     BudgetStep::Hold
+}
+
+/// The cascade decision produced by [`cascade_action`] — whether a Down edge
+/// should LOWER received simulcast layers first or escalate to PAUSING (capping)
+/// decoded tiles (issue #1557).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadeAction {
+    None,
+    LowerLayer,
+    PauseTiles,
+}
+
+/// Decide whether a Down edge should lower received simulcast layers FIRST or
+/// proceed to pausing (capping) tiles. Pure: no clock, no DOM, no I/O — the
+/// caller supplies the facts. Issue #1557: layer-drop precedes tile-pause; tiles
+/// are paused only once layers are at floor AND a settle window has elapsed.
+///
+/// - `down_pressure`: a Down edge was decided this tick (decide_step Down OR the
+///   presenter-extra latch).
+/// - `layers_at_floor`: the last layer-drop apply reported no peer moved (all
+///   received choosers already at base), i.e. lowering layers further is a no-op.
+/// - `settle_elapsed`: STEP_DOWN_COOLDOWN_MS has elapsed since the last
+///   layer-drop, so the layer reduction has had time to take effect before we
+///   escalate to pausing tiles.
+pub fn cascade_action(
+    down_pressure: bool,
+    layers_at_floor: bool,
+    settle_elapsed: bool,
+) -> CascadeAction {
+    if !down_pressure {
+        return CascadeAction::None;
+    }
+    if !layers_at_floor {
+        return CascadeAction::LowerLayer;
+    }
+    if settle_elapsed {
+        CascadeAction::PauseTiles
+    } else {
+        CascadeAction::LowerLayer
+    }
+}
+
+/// True once the cascade settle window has elapsed since the most recent REAL
+/// layer drop (issue #1557). Pure: the caller supplies `now` and the frozen
+/// `last_layer_drop_ms`. Reuses [`STEP_DOWN_COOLDOWN_MS`] as the settle window.
+pub fn settle_window_elapsed(now: f64, last_layer_drop_ms: f64) -> bool {
+    (now - last_layer_drop_ms) >= STEP_DOWN_COOLDOWN_MS
+}
+
+/// Compute the next `last_layer_drop_ms` after an
+/// `apply_local_cpu_pressure_congestion()` call (issue #1557).
+///
+/// CRITICAL: the settle clock advances to `now` ONLY when a layer ACTUALLY moved
+/// (`stepped == true`). Once received layers are at floor the apply is a per-tick
+/// no-op (`stepped == false`); if the clock were reset on those no-op ticks the
+/// `now - last_layer_drop_ms` delta would be pinned at a single tick-gap forever
+/// and [`settle_window_elapsed`] would NEVER return true — so the cascade could
+/// never escalate from lowering layers to pausing tiles. Freezing the timestamp
+/// at floor lets the settle window accumulate from the moment the floor was first
+/// reached, which is the entire point of the tiered cascade.
+pub fn next_layer_drop_ms(prev_last_layer_drop_ms: f64, now: f64, stepped: bool) -> f64 {
+    if stepped {
+        now
+    } else {
+        prev_last_layer_drop_ms
+    }
+}
+
+/// Re-arm the tier-before-pause cascade when recovery raises the cap (issue
+/// #1557). Called from BOTH the `BudgetStep::Up` arm and the non-distress
+/// growth step in the `BudgetStep::Hold` arm (attendants.rs) — the two places a
+/// pressure episode ends by growing the cap back toward natural while the
+/// controller stays latched-pressured.
+///
+/// Clears `layers_at_floor` and re-anchors `last_layer_drop_ms = now` so the
+/// NEXT Down edge re-enters at the LowerLayer stage and must re-earn the settle
+/// window before pausing a tile. WITHOUT this, the next Down edge after any
+/// recovery sees a STALE `layers_at_floor == true` plus a stale (far-in-the-past)
+/// `last_layer_drop_ms`, so `cascade_action(true, true, settle_elapsed=true)`
+/// routes straight to PauseTiles — pausing a tile while the choosers have already
+/// re-grown received layers, inverting the feature on every cycle after the
+/// first. This is the single source of truth for that reset; the unit test
+/// `cascade_re_arms_after_recovery_so_next_down_lowers_layers_first` calls THIS
+/// function so gutting it turns the test red.
+pub fn re_arm_cascade_after_recovery(state: &mut BudgetState, now: f64) {
+    state.layers_at_floor = false;
+    state.last_layer_drop_ms = now;
+}
+
+/// The cap to PIN on a [`CascadeAction::LowerLayer`] outcome (issue #1557 BLOCKER
+/// fix). A LowerLayer edge drops received simulcast layers but pauses NO tile, so
+/// the cap must equal the displayed (natural) tile count — clamped into
+/// `[MIN_CAP, CANVAS_LIMIT]` and then bounded by the device-class decode ceiling
+/// (iOS / #1286) exactly as the un-pressured sync does. This is deliberately the
+/// SAME clamp as the not-pressured path and explicitly does NOT apply
+/// `presenter_cap_ceiling` (that clamp sheds tiles and belongs only to the
+/// PauseTiles arm).
+///
+/// REGRESSION GUARD: without writing this value into `decode_budget_cap` on the
+/// LowerLayer edge, the render's `effective_cap` would read the stale Auto seed
+/// (`MIN_CAP`) and pause N-1 of N tiles on the FIRST Down edge — the exact
+/// inversion of #1557. The unit test `lower_layer_pins_cap_to_natural_no_pause`
+/// pins that this returns the full natural cap (no pause) while a PauseTiles step
+/// returns strictly fewer.
+pub fn lower_layer_cap(natural: usize, device_ceiling: Option<usize>) -> usize {
+    let cap = natural.clamp(MIN_CAP, crate::constants::CANVAS_LIMIT);
+    match device_ceiling {
+        Some(ceiling) => cap.min(ceiling.max(MIN_CAP)),
+        None => cap,
+    }
 }
 
 /// Severe-tier label for a multi-tile (`magnitude > 1`) down-step, reproducing
@@ -1170,6 +1295,8 @@ mod tests {
             // reasonable `now_ms` used in the tests.
             last_step_ms: 0.0,
             direction_hold: 0,
+            last_layer_drop_ms: 0.0,
+            layers_at_floor: false,
         }
     }
 
@@ -1186,6 +1313,305 @@ mod tests {
             decide_step(&samples, &state, 9, PAST_COOLDOWN),
             BudgetStep::Down(1)
         );
+    }
+
+    // ---- Issue #1557: cascade_action (layer-drop before tile-pause) ----
+
+    #[test]
+    fn cascade_layer_drop_precedes_pause() {
+        // Under Down pressure, while received layers are NOT yet at floor, the
+        // cascade always lowers layers first — REGARDLESS of the settle window.
+        // A tile cannot be paused while there is still a layer to drop.
+        assert_eq!(
+            cascade_action(true, false, false),
+            CascadeAction::LowerLayer,
+            "down pressure + layers not at floor (no settle) must lower a layer"
+        );
+        assert_eq!(
+            cascade_action(true, false, true),
+            CascadeAction::LowerLayer,
+            "down pressure + layers not at floor must lower a layer even after settle"
+        );
+        // MUTATION: deleting the `if !layers_at_floor` guard would let the
+        // (true, false, true) case fall through to PauseTiles — this fails.
+    }
+
+    #[test]
+    fn cascade_pause_only_after_floor_and_settle() {
+        // Once layers are at floor, pausing tiles is gated on the settle window:
+        // not elapsed → keep cascading on layers (a harmless idempotent nudge);
+        // elapsed → escalate to pausing a tile.
+        assert_eq!(
+            cascade_action(true, true, false),
+            CascadeAction::LowerLayer,
+            "at floor but settle window not elapsed must NOT pause a tile yet"
+        );
+        assert_eq!(
+            cascade_action(true, true, true),
+            CascadeAction::PauseTiles,
+            "at floor AND settle elapsed escalates to pausing a tile"
+        );
+        // MUTATION: inverting or removing the `if settle_elapsed` branch flips
+        // one of these two outcomes — this fails.
+    }
+
+    #[test]
+    fn cascade_no_pressure_is_none() {
+        // Without a Down edge there is no cascade at all — neither layer-drop
+        // nor tile-pause, irrespective of floor/settle facts.
+        assert_eq!(
+            cascade_action(false, true, true),
+            CascadeAction::None,
+            "no down pressure must be None even at floor + settled"
+        );
+        assert_eq!(
+            cascade_action(false, false, false),
+            CascadeAction::None,
+            "no down pressure must be None regardless of facts"
+        );
+        // MUTATION: removing the `if !down_pressure` early return would make the
+        // first case PauseTiles and the second LowerLayer — this fails.
+    }
+
+    #[test]
+    fn lower_layer_pins_cap_to_natural_no_pause() {
+        // #1557 BLOCKER guard: on a LowerLayer outcome the cap MUST equal the full
+        // displayed (natural) tile count — NO tile paused — while a PauseTiles step
+        // returns strictly fewer. This pins the cap-write wiring fix: if a future
+        // regression drops the cap on the LowerLayer arm (the original bug, where
+        // the stale `MIN_CAP` Auto seed paused N-1 of N tiles on the first Down
+        // edge), `lower_layer_cap` would no longer return `natural` and this fails.
+        let natural = 6usize;
+        let lower = lower_layer_cap(natural, None);
+        assert_eq!(
+            lower, natural,
+            "LowerLayer must keep the full natural cap (no tile paused)"
+        );
+        // A single-tile PauseTiles step on the same natural sheds at least one tile;
+        // the LowerLayer cap must be strictly larger (it pauses nothing).
+        let paused_cap = natural.saturating_sub(1).max(MIN_CAP);
+        assert!(
+            lower > paused_cap,
+            "LowerLayer cap ({lower}) must exceed a PauseTiles step cap ({paused_cap}) — \
+             LowerLayer pauses no tile"
+        );
+        // Natural is clamped into [MIN_CAP, CANVAS_LIMIT]; a 0-peer layout floors at
+        // MIN_CAP (the local participant always decodes at least one tile).
+        assert_eq!(
+            lower_layer_cap(0, None),
+            MIN_CAP,
+            "a 0-peer natural floors at MIN_CAP, never below"
+        );
+        // The device-class decode ceiling (iOS / #1286) clamps the LowerLayer cap
+        // exactly as the un-pressured sync does. MUTATION: dropping the ceiling
+        // clamp would return `natural` (6) here instead of the ceiling (3).
+        assert_eq!(
+            lower_layer_cap(natural, Some(3)),
+            3,
+            "device decode ceiling must clamp the LowerLayer cap"
+        );
+        // The ceiling itself never drops below MIN_CAP.
+        assert_eq!(
+            lower_layer_cap(natural, Some(0)),
+            MIN_CAP,
+            "a 0 device ceiling still floors at MIN_CAP"
+        );
+    }
+
+    #[test]
+    fn cascade_recovery_is_out_of_band_never_raises() {
+        // Recovery (un-pausing tiles and re-growing received layers) is NOT
+        // routed through `cascade_action`: tile un-pause is the control loop's
+        // existing Up arm (cap RAISE), and received-layer re-grow happens via
+        // the choosers' clean-window recovery on the monitor tick
+        // (`layer_chooser.rs::choose`). The recovery rate-limit regression guard
+        // is the existing test `stepped_down_machine_does_not_regrow_on_single_good_sample`.
+        //
+        // This test pins that out-of-band-ness structurally: across the FULL 8-row
+        // truth table, `cascade_action` only ever yields None / LowerLayer /
+        // PauseTiles — there is NO "raise" variant. The exhaustive match means
+        // that if a `CascadeAction::Raise` were ever added without re-routing
+        // recovery through here, this test would fail to COMPILE (non-exhaustive
+        // match), forcing the author to revisit the design.
+        let table = [
+            (false, false, false),
+            (false, false, true),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ];
+        for (down_pressure, layers_at_floor, settle_elapsed) in table {
+            let action = cascade_action(down_pressure, layers_at_floor, settle_elapsed);
+            // Exhaustive match: a future "raise" variant cannot be silently
+            // ignored — it would break compilation here.
+            match action {
+                CascadeAction::None | CascadeAction::LowerLayer | CascadeAction::PauseTiles => {}
+            }
+        }
+    }
+
+    #[test]
+    fn settle_clock_freezes_at_floor_so_pause_becomes_reachable() {
+        // REGRESSION (#1557 blocker): once received layers are at floor, the
+        // per-tick `apply_local_cpu_pressure_congestion()` is a no-op
+        // (`stepped == false`). If the settle clock were advanced on those no-op
+        // ticks, the `now - last_layer_drop_ms` delta would be pinned at one
+        // tick-gap forever and `settle_window_elapsed` would NEVER fire — so the
+        // cascade could never escalate from LowerLayer to PauseTiles under steady
+        // ~1 Hz pressure. `next_layer_drop_ms` freezes the timestamp at floor so
+        // the window accumulates.
+        //
+        // Simulate the steady ~1 Hz Down loop AT FLOOR (every tick stepped=false).
+        let tick = 1000.0; // ~1 Hz telemetry cadence
+                           // The floor was first reached at this timestamp; the clock starts here.
+        let mut last_layer_drop_ms = 5000.0_f64;
+        let mut now = last_layer_drop_ms;
+
+        // Tick at the floor moment itself: not yet elapsed.
+        assert!(
+            !settle_window_elapsed(now, last_layer_drop_ms),
+            "settle cannot be elapsed at the instant the floor is reached"
+        );
+
+        // Advance the loop tick-by-tick with stepped=false (at floor). With the
+        // freeze, the timestamp must NOT move, so the window keeps growing.
+        let mut paused = false;
+        for _ in 0..5 {
+            now += tick;
+            // The loop calls this every Down tick to (not) advance the clock.
+            last_layer_drop_ms = next_layer_drop_ms(last_layer_drop_ms, now, false);
+            // Frozen: the timestamp stays at the moment the floor was reached.
+            assert_eq!(
+                last_layer_drop_ms, 5000.0,
+                "at floor (stepped=false) the settle clock must stay frozen"
+            );
+            if settle_window_elapsed(now, last_layer_drop_ms) {
+                paused = true;
+            }
+        }
+        // STEP_DOWN_COOLDOWN_MS (2000ms) is 2 ticks; PauseTiles is reachable.
+        assert!(
+            paused,
+            "after the settle window elapses at floor the cascade reaches PauseTiles"
+        );
+
+        // MUTATION CHECK: make `next_layer_drop_ms` return `now` unconditionally
+        // (the original blocker) and `last_layer_drop_ms` tracks `now` each tick,
+        // so `now - last_layer_drop_ms == 0` forever — `paused` stays false and
+        // this test fails.
+    }
+
+    #[test]
+    fn settle_clock_advances_on_a_real_layer_drop() {
+        // Counterpart: while layers are STILL dropping (stepped=true) the clock
+        // tracks `now`, so the settle window restarts on each real drop — the
+        // cascade keeps lowering layers (not pausing) until the floor is reached.
+        let mut last_layer_drop_ms = 5000.0_f64;
+        let now = 5000.0 + 3.0 * STEP_DOWN_COOLDOWN_MS; // well past the window
+        last_layer_drop_ms = next_layer_drop_ms(last_layer_drop_ms, now, true);
+        assert_eq!(
+            last_layer_drop_ms, now,
+            "a real layer drop (stepped=true) advances the settle clock to now"
+        );
+        assert!(
+            !settle_window_elapsed(now, last_layer_drop_ms),
+            "right after a real drop the settle window has NOT elapsed yet"
+        );
+        // MUTATION CHECK: freeze unconditionally (return prev) and the first
+        // assert fails — a real drop would not advance the clock.
+    }
+
+    #[test]
+    fn cascade_re_arms_after_recovery_so_next_down_lowers_layers_first() {
+        // REGRESSION (#1557 blocker): `state.layers_at_floor` must be cleared on
+        // recovery, else the SECOND Down edge after any recovery pauses a tile
+        // BEFORE re-dropping the re-grown received layers — inverting the feature
+        // on every pressure cycle after the first.
+        //
+        // The attendants cascade arms (Up / Hold / Site A / Site B) live in
+        // attendants.rs and are NOT reachable from this decode_budget unit harness
+        // (which models `decide_step` on a `BudgetState`). So this test models the
+        // recovery transition by calling `re_arm_cascade_after_recovery` — the SAME
+        // pure function the `BudgetStep::Up` arm and the Hold-arm non-distress
+        // growth step call. Gutting that function (removing the `layers_at_floor`
+        // reset) turns this test RED, so the assertion is coupled to the real
+        // source of truth, not to an inline copy.
+        let mut state = state_with_cap(5);
+
+        // --- End of episode 1: received layers at floor, settle window elapsed.
+        // This is the steady at-floor state the loop reaches after dropping every
+        // received layer under sustained Down pressure. A tile-pause is CORRECT
+        // here (this is the whole point of the cascade's second stage).
+        state.layers_at_floor = true;
+        state.last_layer_drop_ms = 0.0; // floor reached long ago
+        let pause_now = 10_000.0;
+        assert!(
+            settle_window_elapsed(pause_now, state.last_layer_drop_ms),
+            "by end of episode 1 the settle window has long elapsed"
+        );
+        assert_eq!(
+            cascade_action(
+                true,
+                state.layers_at_floor,
+                settle_window_elapsed(pause_now, state.last_layer_drop_ms),
+            ),
+            CascadeAction::PauseTiles,
+            "at the end of episode 1 (at floor + settled) the cascade pauses a tile"
+        );
+
+        // --- Recovery: the Up arm (or Hold-growth) raises the cap and RE-ARMS the
+        // cascade. Model that exact transition via the shared source of truth.
+        let recovery_now = 10_000.0;
+        re_arm_cascade_after_recovery(&mut state, recovery_now);
+        assert!(
+            !state.layers_at_floor,
+            "recovery must clear layers_at_floor so the next Down re-drops layers first"
+        );
+        assert_eq!(
+            state.last_layer_drop_ms, recovery_now,
+            "recovery re-anchors the settle clock to now"
+        );
+
+        // --- Episode 2, first Down edge, 1s after recovery (< STEP_DOWN_COOLDOWN_MS
+        // = 2000ms, so the settle window is NOT yet elapsed). The cascade MUST lower
+        // a received layer first, NOT pause a tile. Without the Up-arm reset,
+        // layers_at_floor would still be true AND last_layer_drop_ms still 0.0, so
+        // settle_window_elapsed(11_000.0, 0.0) == true and the cascade would route
+        // to PauseTiles — the bug.
+        let down_now = recovery_now + 1_000.0;
+        assert!(
+            !settle_window_elapsed(down_now, state.last_layer_drop_ms),
+            "1s after the re-armed drop the settle window has NOT elapsed"
+        );
+        assert_eq!(
+            cascade_action(
+                true,
+                state.layers_at_floor,
+                settle_window_elapsed(down_now, state.last_layer_drop_ms),
+            ),
+            CascadeAction::LowerLayer,
+            "the first Down after recovery must lower a received layer, not pause a tile"
+        );
+
+        // --- Clock-independent pin: even if the settle window WERE already elapsed,
+        // clearing layers_at_floor alone routes the first post-recovery Down to
+        // LowerLayer. This isolates "clearing layers_at_floor is what saves us" from
+        // the settle-clock re-anchor, so the test fails specifically if the
+        // `layers_at_floor = false` line is removed from
+        // `re_arm_cascade_after_recovery` (even if last_layer_drop_ms were left set).
+        assert_eq!(
+            cascade_action(true, state.layers_at_floor, true),
+            CascadeAction::LowerLayer,
+            "clearing layers_at_floor forces LowerLayer on the first post-recovery Down \
+             regardless of the settle clock"
+        );
+
+        // MUTATION CHECK: delete `state.layers_at_floor = false;` from
+        // `re_arm_cascade_after_recovery` and the two post-recovery LowerLayer
+        // assertions flip to PauseTiles — this test fails.
     }
 
     #[test]
@@ -1661,6 +2087,8 @@ mod tests {
             cap: MIN_CAP,
             last_step_ms: 0.0,
             direction_hold: 0,
+            last_layer_drop_ms: 0.0,
+            layers_at_floor: false,
         };
         let steady29 = [fps_sample(29.0); 5];
         // Advance the clock one up-cooldown per tick so the gate can fire each
@@ -1694,6 +2122,8 @@ mod tests {
             cap: 8,
             last_step_ms: 0.0,
             direction_hold: 0,
+            last_layer_drop_ms: 0.0,
+            layers_at_floor: false,
         };
         // Real pressure: sustained mild-low FPS -> a down-step. `t_down` is past
         // the down-cooldown (last_step_ms == 0) so the step actually fires.
@@ -1728,6 +2158,8 @@ mod tests {
             cap: 5,
             last_step_ms: 0.0,
             direction_hold: 0,
+            last_layer_drop_ms: 0.0,
+            layers_at_floor: false,
         };
         let healthy = [fps_sample(29.0); 5];
         // natural jumps 5 -> 8 (three peers joined).
@@ -2863,6 +3295,8 @@ mod tests {
             cap: start_cap,
             last_step_ms: 0.0,
             direction_hold: 0,
+            last_layer_drop_ms: 0.0,
+            layers_at_floor: false,
         };
         // Pressured path: apply decide_step's step.
         match decide_step(samples, &state, natural, now) {

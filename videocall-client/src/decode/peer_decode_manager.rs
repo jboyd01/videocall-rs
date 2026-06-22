@@ -2837,10 +2837,38 @@ impl PeerDecodeManager {
         &mut self,
         now_ms: u64,
         bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+        exempt_speakers: bool,
     ) -> bool {
         let mut seeded = false;
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                // Issue #1557: the active speaker(s) are EXEMPT from receiver-side
+                // layer-drop ONLY for the LOCAL-CPU-pressure cascade — and only
+                // when the caller passes `exempt_speakers == true`. That keeps the
+                // person talking sharp while the LOCAL decoder is the bottleneck.
+                // This mirrors the PAUSE-side exemption in `promote_speakers`
+                // (attendants_layout.rs) — both protect the active speaker — and like
+                // it we exempt EVERY `is_speaking` peer to honor the multi-speaker
+                // case. The protection predicate differs, though: `promote_speakers`
+                // uses a TIME WINDOW (`now - speech_ts < active_ms`), so a peer who
+                // just stopped stays PAUSE-protected for `active_ms`, whereas this
+                // seed uses the INSTANTANEOUS `is_speaking` VAD bool, so a peer who
+                // just stopped is immediately eligible for layer-drop again.
+                //
+                // The relay DOWNLINK_CONGESTION arm (#1219 Half 2) calls this with
+                // `exempt_speakers == false`: under REAL downlink saturation the
+                // largest inbound stream (often the speaker's video) is exactly what
+                // must be shed, and in the degenerate 1-on-1 the only remote peer IS
+                // the speaker — exempting it would shed ZERO bitrate. So on that path
+                // the speaker's VIDEO is stepped down like any other peer's.
+                //
+                // Audio is never touched on EITHER path (`seed_downlink_congestion`
+                // never touches the audio chooser); screen for a non-speaking sharer
+                // is still dropped. A skipped speaker contributes `false` to `seeded`
+                // (its chooser did not move).
+                if exempt_speakers && peer.is_speaking {
+                    continue;
+                }
                 if peer.seed_downlink_congestion(now_ms, bounds) {
                     seeded = true;
                 }
@@ -6668,7 +6696,7 @@ mod tests {
         );
 
         // The relay-authored signal: synthetic congestion steps the chooser down.
-        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open);
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open, false);
         assert!(
             seeded,
             "DOWNLINK_CONGESTION must step the chooser down despite zero real loss"
@@ -6755,7 +6783,7 @@ mod tests {
         let mut bounds = ReceiveLayerBounds::default();
         bounds.set_kind(PrefMediaKind::Video, None, Some(0));
 
-        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &bounds);
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &bounds, false);
         assert!(
             seeded,
             "the synthetic congested sample must still step a constrain (clamp is a \
@@ -6817,7 +6845,7 @@ mod tests {
 
         // Seed steps the RECEIVER chooser down. There is no publisher-encoder field
         // reachable from here to inspect — the manager owns only receive-side state.
-        assert!(manager.seed_downlink_congestion_for_connected_peers(2000, &open));
+        assert!(manager.seed_downlink_congestion_for_connected_peers(2000, &open, false));
         let after = manager
             .connected_peers
             .get(&702)
@@ -6831,6 +6859,236 @@ mod tests {
         // And it advertises a receive-layer request, never an encoder action.
         let desired = manager.current_desired_preferences(2000, &open);
         assert_eq!(desired.get(&(702, PrefMediaKind::Video)).copied(), Some(1));
+    }
+
+    /// SPEAKER EXEMPTION (#1557): an active speaker is NOT stepped down by the
+    /// receiver-side layer-drop seed — the person talking stays sharp — while a
+    /// non-speaking peer in the same room IS stepped down.
+    ///
+    /// MUTATION CHECK: flip this call's `exempt_speakers` arg to `false` and this
+    /// fails — the speaker (710) drops to 1 alongside the non-speaker (711). (The
+    /// `exempt_speakers &&` guard itself is pinned by the sibling relay test
+    /// `speaker_video_layer_stepped_on_relay_downlink_seed`, whose `false` arg would
+    /// let the bare `is_speaking` skip resurface and break ITS 710 -> 1 assertion.)
+    #[test]
+    fn speaker_video_layer_exempt_from_downlink_seed() {
+        use crate::decode::layer_chooser::ReceiveLayerBounds;
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(710, make_zero_loss_top_peer(710));
+        manager
+            .connected_peers
+            .insert(711, make_zero_loss_top_peer(711));
+
+        let open = ReceiveLayerBounds::default();
+
+        // Mark peer 710 as the active speaker; 711 stays silent.
+        manager.connected_peers.get_mut(&710).unwrap().is_speaking = true;
+
+        // Bring BOTH choosers to the top (current == 2) via one clean tick.
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&710)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "speaking peer climbed to the top before the seed"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&711)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "non-speaking peer climbed to the top before the seed"
+        );
+
+        // Seed receiver-side congestion with `exempt_speakers == true` (the LOCAL
+        // CPU-pressure policy). The speaker must be skipped (not stepped), so
+        // `seeded` reflects ONLY the non-speaker's move.
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open, true);
+        assert!(
+            seeded,
+            "the non-speaking peer was stepped, so the seed reports movement"
+        );
+
+        // Speaker (710) is EXEMPT — its video layer is byte-identical (still 2).
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&710)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "active speaker keeps its current video layer (exempt from layer-drop)"
+        );
+        // Non-speaker (711) WAS stepped down 2 -> 1.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&711)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "non-speaking peer is stepped down by the seed (2 -> 1)"
+        );
+    }
+
+    /// RELAY DOWNLINK NON-EXEMPTION (#1557 / #1219 Half 2): on the relay
+    /// DOWNLINK_CONGESTION path the seed is called with `exempt_speakers == false`,
+    /// so the active speaker's VIDEO IS stepped down alongside everyone else's.
+    /// Under REAL downlink saturation the speaker's stream is the largest inbound
+    /// and must be shed; in the degenerate 1-on-1 the only remote peer IS the
+    /// speaker, so exempting it would shed zero bitrate. This pins that the
+    /// relay path does NOT honor the speaker exemption.
+    ///
+    /// MUTATION CHECK: flip this call's `exempt_speakers` arg to `true` and this
+    /// fails — the speaker (710) stays at 2 and the "both stepped 2 -> 1"
+    /// assertion on 710 breaks.
+    #[test]
+    fn speaker_video_layer_stepped_on_relay_downlink_seed() {
+        use crate::decode::layer_chooser::ReceiveLayerBounds;
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(710, make_zero_loss_top_peer(710));
+        manager
+            .connected_peers
+            .insert(711, make_zero_loss_top_peer(711));
+
+        let open = ReceiveLayerBounds::default();
+
+        // Mark peer 710 as the active speaker; 711 stays silent.
+        manager.connected_peers.get_mut(&710).unwrap().is_speaking = true;
+
+        // Bring BOTH choosers to the top (current == 2) via one clean tick.
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&710)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "speaking peer climbed to the top before the seed"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&711)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "non-speaking peer climbed to the top before the seed"
+        );
+
+        // Relay path: `exempt_speakers == false` — the speaker is NOT skipped.
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open, false);
+        assert!(
+            seeded,
+            "both peers were stepped, so the seed reports movement"
+        );
+
+        // Speaker (710) IS stepped down 2 -> 1 on the relay path (NOT exempt).
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&710)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "active speaker's video IS stepped down on the relay path (2 -> 1)"
+        );
+        // Non-speaker (711) WAS stepped down 2 -> 1.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&711)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "non-speaking peer is stepped down by the seed (2 -> 1)"
+        );
+    }
+
+    /// AUDIO EXEMPTION (#1557 / pre-existing #1219 Half 2): the receiver-side
+    /// layer-drop seed NEVER steps any peer's audio chooser — audio is
+    /// priority-protected. Pins that the speaker exemption did not regress the
+    /// audio protection for either a speaking or a non-speaking peer. The audio
+    /// exemption holds for BOTH `exempt_speakers` values (true = local CPU policy,
+    /// false = relay downlink policy): neither path ever touches the audio chooser.
+    ///
+    /// MUTATION CHECK: add an audio branch to `Peer::seed_downlink_congestion` and
+    /// this fails — a peer's audio drops below 2.
+    #[test]
+    fn audio_never_stepped_by_downlink_seed() {
+        use crate::decode::layer_chooser::ReceiveLayerBounds;
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(712, make_zero_loss_top_peer(712));
+        manager
+            .connected_peers
+            .insert(713, make_zero_loss_top_peer(713));
+
+        let open = ReceiveLayerBounds::default();
+        // 712 speaks, 713 does not — exercise both exemption paths for audio.
+        manager.connected_peers.get_mut(&712).unwrap().is_speaking = true;
+
+        // Climb both choosers to the top (audio chooser reaches 2 as well).
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&712)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "speaker audio at the top before the seed"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&713)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "non-speaker audio at the top before the seed"
+        );
+
+        // Drive BOTH policies: exempt_speakers true (local CPU) then false (relay).
+        // Neither must touch the audio chooser for either peer.
+        let _ = manager.seed_downlink_congestion_for_connected_peers(2000, &open, true);
+        let _ = manager.seed_downlink_congestion_for_connected_peers(2100, &open, false);
+
+        // Observed: NEITHER peer's audio layer moved — the seed only ever steps
+        // VIDEO/SCREEN, never AUDIO (the speaker is fully skipped; the non-speaker
+        // is stepped on video but its audio chooser is left at the top).
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&712)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "speaker audio untouched by the downlink seed"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&713)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "non-speaker audio untouched by the downlink seed (video-only step)"
+        );
     }
 
     /// NIT 1 (PR #1192 review): a source whose ONLY learned layer is the base
