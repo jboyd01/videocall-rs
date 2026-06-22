@@ -520,6 +520,26 @@ pub(crate) fn classify_settings_deep_link(section: Option<&str>) -> SettingsDeep
     }
 }
 
+/// Read the device capability score the console-log preamble already benchmarked
+/// and stashed on `window.__videocall_capability_score` (issue #1558).
+///
+/// This is a cheap JS property read — it does NOT re-run the 100 ms capability
+/// benchmark (`videocall_capability_score()` does, and must never be called on
+/// the ~1 Hz budget loop). Returns `None` when the value is absent or not a
+/// finite non-negative number, in which case the protective-mode low-cap trigger
+/// stays conservatively off.
+fn read_cached_capability_score() -> Option<u32> {
+    let window = web_sys::window()?;
+    let val =
+        js_sys::Reflect::get(&window, &JsValue::from_str("__videocall_capability_score")).ok()?;
+    let score = val.as_f64()?;
+    if score.is_finite() && score >= 0.0 {
+        Some(score as u32)
+    } else {
+        None
+    }
+}
+
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
@@ -689,6 +709,12 @@ pub fn AttendantsComponent(
     // it with the live `total_tiles` on the first frame, after which the loop
     // seeds/tracks the cap up to it.
     let mut decode_budget_natural = use_signal(|| MIN_CAP);
+    // Issue #1558: protective-mode report. The decode-budget control loop is the
+    // sole WRITER (it latches protective mode and computes the encoder send-layer
+    // self-shed ceiling); `Host` is the consumer (it applies the ceiling to the
+    // local encoders, composed with the user's persisted preference). Provided as
+    // a context below so the child `Host` can read it.
+    let mut protective_mode_report = use_signal(crate::context::ProtectiveModeReport::default);
     // Shared "is the decode-budget banner ACTUALLY on screen right now" flag,
     // owned here so the banner (writer) and the persistent paused pill (reader)
     // — sibling children below — agree on a single source of truth. The banner
@@ -2354,6 +2380,9 @@ pub fn AttendantsComponent(
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
+    // Issue #1558: publish the protective-mode report so `Host` can actuate the
+    // LOCAL encoder send-layer self-shed (stage 3).
+    use_context_provider(|| crate::context::ProtectiveModeCtx(protective_mode_report));
     // Provide the host set so peer-list rows and video tiles render a host
     // indicator for the current host.
     use_context_provider(|| HostSetCtx(host_set_signal));
@@ -2631,11 +2660,15 @@ pub fn AttendantsComponent(
         let task = spawn(async move {
             let client_for_budget = client_for_budget.clone();
             use crate::components::decode_budget::{
-                cascade_action, lower_layer_cap, median_render_fps, next_layer_drop_ms,
-                non_distress_growth_qualifying, re_arm_cascade_after_recovery, recovery_qualifying,
-                settle_window_elapsed, severe_label, CascadeAction, STEP_UP_COOLDOWN_MS,
-                SUSTAIN_SAMPLES,
+                cascade_action, decide_step_with_median, in_distress, lower_layer_cap,
+                median_render_fps, next_layer_drop_ms, non_distress_growth_allowed,
+                non_distress_growth_qualifying, protective_emergency_cap,
+                protective_encoder_layer_ceiling, re_arm_cascade_after_recovery,
+                recovery_qualifying, settle_window_elapsed, severe_label, suppress_growth_step,
+                tick_protective_mode, CascadeAction, DistressSignals, ProtectiveModeState,
+                ProtectiveTransition, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
             };
+            use crate::context::ProtectiveModeReport;
             use videocall_diagnostics::{now_ms, MetricValue};
 
             /// Rolling window length (~5 s at 1 Hz). Must be >= SUSTAIN_SAMPLES so
@@ -2647,6 +2680,30 @@ pub fn AttendantsComponent(
             let mut samples: Vec<BudgetSample> = Vec::with_capacity(WINDOW);
             // Sum of long-task durations observed in the *current* (open) bucket.
             let mut longtask_bucket_ms: f64 = 0.0;
+            // Issue #1558: MAX per-peer `audio_buffer_ms` observed in the current
+            // (open) bucket, from "neteq" bus events. `None` until the first
+            // reading arrives; reset on each fps tick (bucket close). Feeds the
+            // protective-mode audio-distress + emergency triggers.
+            let mut audio_buffer_bucket_ms_max: Option<f64> = None;
+            // Issue #1558: the most recent closed-bucket audio-buffer max, carried
+            // across ticks so the per-tick distress predicate has a value even on
+            // ticks where no fresh neteq event arrived this second.
+            let mut last_audio_buffer_ms_max: Option<f64> = None;
+            // Issue #1558: latched protective-mode state, owned by THIS loop across
+            // ticks (mirrors how the loop owns `BudgetState`). Drives the encoder
+            // self-shed + emergency stages on top of the #1557 cascade.
+            let mut protective = ProtectiveModeState::default();
+            // Issue #1558: device capability score, read ONCE from the cached value
+            // the console-log preamble stashed on `window.__videocall_capability_score`
+            // (a benchmark already run at page load). We do NOT re-run the 100 ms
+            // benchmark on this hot loop. `None` if the value is absent/unreadable —
+            // the low-cap+crowded trigger then never fires (conservative).
+            let cap_score: Option<u32> = read_cached_capability_score();
+            // Issue #1558: escalating protective severity counter — how many
+            // consecutive ticks protective mode has been active AND still at the
+            // cascade floor. Drives the encoder self-shed from 2→1 layers. Reset to
+            // 0 whenever protective mode is inactive or the cascade leaves floor.
+            let mut protective_severity: u32 = 0;
             // #1286: is the Long Tasks API available on THIS browser at all?
             // Computed ONCE — it cannot change within a session. On WebKit
             // (desktop Safari + ALL iOS browsers) the `"longtask"`
@@ -2700,6 +2757,33 @@ pub fn AttendantsComponent(
             let mut prev_natural = *decode_budget_natural.peek();
 
             while let Ok(evt) = rx.recv().await {
+                // Issue #1558: the protective-mode predicate needs a per-peer
+                // audio-buffer signal. The NetEQ audio decoder broadcasts
+                // `audio_buffer_ms` on the SAME diagnostics bus, under subsystem
+                // "neteq" (see neteq_audio_decoder::emit_buffer_metrics). We
+                // observe it here WITHOUT a new control loop or refactor: track
+                // the MAX buffer seen across peers in the current open bucket
+                // (reset on each fps tick, exactly like the longtask bucket). A
+                // "neteq" event never closes a bucket — only a render-fps event
+                // does — so this just feeds the audio sub-signal.
+                if evt.subsystem == "neteq" {
+                    for m in &evt.metrics {
+                        if m.name == "audio_buffer_ms" {
+                            // The decoder emits this as a u64 ms value.
+                            let buf = match &m.value {
+                                MetricValue::U64(v) => Some(*v as f64),
+                                MetricValue::F64(v) => Some(*v),
+                                _ => None,
+                            };
+                            if let Some(buf) = buf {
+                                audio_buffer_bucket_ms_max = Some(
+                                    audio_buffer_bucket_ms_max.map_or(buf, |m: f64| m.max(buf)),
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if evt.subsystem != "client_perf" {
                     continue;
                 }
@@ -2748,6 +2832,14 @@ pub fn AttendantsComponent(
                     let overflow = samples.len() - WINDOW;
                     samples.drain(0..overflow);
                 }
+                // Issue #1558: close the audio-buffer bucket. Carry the last-seen
+                // max forward when this second produced no fresh neteq reading, so
+                // the distress predicate has a value on every tick. Reset the open
+                // bucket for the next second.
+                if audio_buffer_bucket_ms_max.is_some() {
+                    last_audio_buffer_ms_max = audio_buffer_bucket_ms_max;
+                }
+                audio_buffer_bucket_ms_max = None;
 
                 // ---- Override handling (DECISION: hard override) ----
                 let current_override = *decode_budget_override.peek();
@@ -2880,6 +2972,21 @@ pub fn AttendantsComponent(
                 // the cascade should be clean for the next arrival).
                 if natural <= MIN_CAP && prev_natural > MIN_CAP {
                     re_arm_cascade_after_recovery(&mut state, now);
+                    // Issue #1558: reset protective mode on the SAME session-reset
+                    // edge as the #1557 cascade re-arm (transport-agnostic — fires
+                    // on both WT and WS reconnect, and when the last peer leaves).
+                    // Clear the latch, severity, and the carried audio reading so a
+                    // fresh session starts un-protected with no stale encoder shed,
+                    // and publish the cleared report so `Host` restores the user's
+                    // encoder ceiling immediately.
+                    protective = ProtectiveModeState::default();
+                    protective_severity = 0;
+                    last_audio_buffer_ms_max = None;
+                    audio_buffer_bucket_ms_max = None;
+                    let cleared = ProtectiveModeReport::default();
+                    if *protective_mode_report.peek() != cleared {
+                        protective_mode_report.set(cleared);
+                    }
                 }
                 prev_natural = natural;
 
@@ -2891,6 +2998,174 @@ pub fn AttendantsComponent(
                 // states that drive the screen ENCODER), so the extra shedding is
                 // active exactly while the encoder is competing for CPU.
                 let sharing = screen_share_state.peek().is_sharing();
+
+                // ---- Issue #1558: protective mode (audio-first, speaker-priority) ----
+                //
+                // A THIN layer composed on top of the #1557 cascade, driven off
+                // this SAME 1 Hz Auto tick (NOT a second loop). Each tick we build
+                // the broader distress predicate, advance the latched protective
+                // state with asymmetric hysteresis, and — when active — publish the
+                // LOCAL encoder send-layer self-shed ceiling (stage 3, applied by
+                // `Host`) and prime the emergency decode-cap clamp (stage 4, applied
+                // at the end of this tick). The cascade (stages 1-2: layers→pause)
+                // is UNCHANGED below; protective mode never reimplements it.
+                let median_for_distress = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                let longtask_for_distress = if samples.len() >= SUSTAIN_SAMPLES {
+                    // Sustained-window longtask: the MIN across the window (every
+                    // sample must be heavy for sustained saturation). A `None`
+                    // (WebKit/iOS) in the window ⇒ `None` (cannot confirm), exactly
+                    // like `decide_step`'s conservative handling.
+                    let window = &samples[samples.len() - SUSTAIN_SAMPLES..];
+                    window
+                        .iter()
+                        .map(|s| s.longtask)
+                        .try_fold(f64::INFINITY, |acc, lt| lt.map(|v| acc.min(v)))
+                } else {
+                    None
+                };
+                let participant_count = client_for_budget.peer_count().unwrap_or(0);
+                let distress_signals = DistressSignals {
+                    median_fps: median_for_distress,
+                    longtask_ms_per_sec: longtask_for_distress,
+                    max_peer_audio_buffer_ms: last_audio_buffer_ms_max,
+                    // Deferred bus signal — see PROTECTIVE_NETEQ_ACCELERATE_DISTRESS_PER_SEC.
+                    neteq_accelerate_per_sec: None,
+                    cap_score,
+                    participant_count,
+                };
+                let distressed = in_distress(distress_signals);
+                let transition = tick_protective_mode(&mut protective, distressed);
+
+                // Severity escalation: once protective mode is active AND the
+                // cascade has reached floor (received layers at base + tiles
+                // pausing), each consecutive such tick escalates the encoder shed
+                // (2 layers → 1). Reset to 0 when inactive or off-floor so the next
+                // episode re-enters at the gentler 2-layer shed.
+                if protective.active && state.layers_at_floor {
+                    protective_severity = protective_severity.saturating_add(1);
+                } else {
+                    protective_severity = 0;
+                }
+                // Stage 3 lever: the LOCAL encoder send-layer ceiling. `None` until
+                // active AND at floor (ordered after stages 1-2). `Host` composes
+                // this with the user's persisted "layers published" preference.
+                let encoder_ceiling = protective_encoder_layer_ceiling(
+                    protective.active,
+                    state.layers_at_floor,
+                    protective_severity.saturating_sub(1),
+                );
+
+                // Publish the report (change-gated so a child re-render only fires
+                // on a real change — dioxus-signals 0.7.3 does not dedupe writes).
+                let report = ProtectiveModeReport {
+                    active: protective.active,
+                    encoder_layer_ceiling: encoder_ceiling,
+                };
+                if *protective_mode_report.peek() != report {
+                    protective_mode_report.set(report);
+                }
+
+                // Metric + log on the entry/exit edge (issue #1558 item 6),
+                // following the #1566 diagnostics-bus pattern. The gauge is 1 while
+                // active (0 on exit), with the naming the analysis tooling reads.
+                match transition {
+                    ProtectiveTransition::Entered => {
+                        // Name the dominant trigger for triage. Order mirrors the
+                        // severity intent: audio first (the thing being protected),
+                        // then renderer/main-thread, then the structural low-cap case.
+                        let trigger = if last_audio_buffer_ms_max
+                            .map(|b| b > crate::components::decode_budget::PROTECTIVE_AUDIO_BUFFER_DISTRESS_MS)
+                            .unwrap_or(false)
+                        {
+                            "audio_buffer"
+                        } else if median_for_distress
+                            .map(|m| m < crate::components::decode_budget::PROTECTIVE_FPS_DISTRESS)
+                            .unwrap_or(false)
+                        {
+                            "fps"
+                        } else if longtask_for_distress
+                            .map(|lt| lt >= crate::components::decode_budget::PROTECTIVE_LONGTASK_DISTRESS_MS_PER_SEC)
+                            .unwrap_or(false)
+                        {
+                            "longtask"
+                        } else {
+                            "low_cap_crowded"
+                        };
+                        log::warn!(
+                            "ProtectiveMode: ENTERED trigger={trigger} median_fps={} longtask_ms_per_sec={} audio_buffer_ms={} cap_score={} participants={}",
+                            median_for_distress.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                            longtask_for_distress.map(|l| format!("{l:.0}")).unwrap_or_else(|| "none".into()),
+                            last_audio_buffer_ms_max.map(|b| format!("{b:.0}")).unwrap_or_else(|| "none".into()),
+                            cap_score.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+                            participant_count,
+                        );
+                        videocall_diagnostics::global_sender()
+                            .try_broadcast(videocall_diagnostics::DiagEvent {
+                                subsystem: "protective_mode",
+                                stream_id: None,
+                                ts_ms: videocall_diagnostics::now_ms(),
+                                metrics: vec![
+                                    videocall_diagnostics::metric!("protective_mode_active", 1u64),
+                                    videocall_diagnostics::metric!(
+                                        "protective_mode_participants",
+                                        participant_count as u64
+                                    ),
+                                ],
+                            })
+                            .ok();
+                    }
+                    ProtectiveTransition::Exited => {
+                        log::info!(
+                            "ProtectiveMode: EXITED median_fps={} audio_buffer_ms={} participants={}",
+                            median_for_distress.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                            last_audio_buffer_ms_max.map(|b| format!("{b:.0}")).unwrap_or_else(|| "none".into()),
+                            participant_count,
+                        );
+                        videocall_diagnostics::global_sender()
+                            .try_broadcast(videocall_diagnostics::DiagEvent {
+                                subsystem: "protective_mode",
+                                stream_id: None,
+                                ts_ms: videocall_diagnostics::now_ms(),
+                                metrics: vec![videocall_diagnostics::metric!(
+                                    "protective_mode_active",
+                                    0u64
+                                )],
+                            })
+                            .ok();
+                    }
+                    ProtectiveTransition::None => {}
+                }
+
+                // Issue #1558: audio-driven ownership latch. Protective mode can be
+                // triggered by AUDIO alone (a backed-up jitter buffer) with the
+                // renderer still healthy — so `decide_step` never returns Down and
+                // the loop never latches `pressured` on its own. But the emergency
+                // decode-pause (stage 4) can only ACTUATE while pressured (the
+                // render-side `effective_cap` reads the loop cap only then). So when
+                // protective mode is active AND audio is past the EMERGENCY mark,
+                // latch the controller into cap ownership here, exactly as a
+                // measured down-step would. This is the audio-first principle: a
+                // healthy renderer with starving audio MUST still shed video to
+                // protect audio. Mirrors the #1557 latch contract (the loop owns the
+                // cap once latched); reset on the same session-reset edge.
+                let emergency_now = protective.active
+                    && last_audio_buffer_ms_max
+                        .map(|b| {
+                            b > crate::components::decode_budget::PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS
+                        })
+                        .unwrap_or(false);
+                let pressured = if !pressured && emergency_now {
+                    decode_budget_pressured.set(true);
+                    log::warn!(
+                        "ProtectiveMode: audio-driven pressured latch (renderer healthy, audio starving) audio_buffer_ms={}",
+                        last_audio_buffer_ms_max
+                            .map(|b| format!("{b:.0}"))
+                            .unwrap_or_else(|| "none".into()),
+                    );
+                    true
+                } else {
+                    pressured
+                };
 
                 if !pressured {
                     // NOT-pressured path (HCL #987 review FIX 1 + FIX 2). The
@@ -2935,6 +3210,11 @@ pub fn AttendantsComponent(
                     // `presenter_extra_shed_pressure` returns false and the normal
                     // trigger is the sole latch path again. Pressure-gated: a
                     // presenter at a healthy >= 30 fps satisfies neither trigger.
+                    // One-time pressured-latch EDGE (not per tick): use the plain
+                    // `decide_step` wrapper here — its internal median recompute is
+                    // irrelevant on this rare edge (contrast the per-tick pressured
+                    // path below, which threads the hoisted `median_for_distress`
+                    // into `decide_step_with_median`, issue #1558 / #1001).
                     let latch_step = match decide_step(&samples, &state, natural, now) {
                         BudgetStep::Down(magnitude) => Some(magnitude),
                         _ if presenter_extra_shed_pressure(&samples, sharing)
@@ -2945,16 +3225,16 @@ pub fn AttendantsComponent(
                         _ => None,
                     };
                     if let Some(magnitude) = latch_step {
-                        // Telemetry for the decision logs below. Computed once on
-                        // this one-time pressured-latch edge (NOT per tick), so the
-                        // `median_render_fps` recompute cost is irrelevant here
-                        // (contrast the per-tick Auto path, #1001). #1286: render a
-                        // `None` longtask (signal unavailable on WebKit/iOS) as
-                        // "none", mirroring how `median`/`cur_fps` render their
-                        // missing case, so the log never implies a healthy 0.0
-                        // where there is simply no telemetry. All three are used in
-                        // BOTH cascade arms' logs below, so none is ever unused.
-                        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                        // Telemetry for the decision logs below. Reuses the
+                        // single per-tick `median_for_distress` (issue #1558 perf
+                        // hoist — same value, no second `median_render_fps`
+                        // alloc+sort here). #1286: render a `None` longtask (signal
+                        // unavailable on WebKit/iOS) as "none", mirroring how
+                        // `median`/`cur_fps` render their missing case, so the log
+                        // never implies a healthy 0.0 where there is simply no
+                        // telemetry. All three are used in BOTH cascade arms' logs
+                        // below, so none is ever unused.
+                        let median = median_for_distress;
                         let cur_fps = samples.last().and_then(|s| s.render_fps);
                         let longtask = samples.last().and_then(|s| s.longtask);
 
@@ -3130,7 +3410,29 @@ pub fn AttendantsComponent(
                 }
 
                 // ---- Pressured Auto path: the loop is the sole cap owner ----
-                let step = decide_step(&samples, &state, natural, now);
+                // Reuse the single per-tick `median_for_distress` (issue #1558
+                // perf hoist): the protective distress predicate already computed
+                // `median_render_fps(&samples, SUSTAIN_SAMPLES)` at the top of this
+                // tick, so threading it in here avoids `decide_step` re-running the
+                // same `Vec`-alloc+sort a second time on the hot steady-state path
+                // (restores the #1001 "one median per tick" contract).
+                // Issue #1558 emergency-growth gate (Up arm): coerce a recovery
+                // `Up` to `Hold` while the protective EMERGENCY is active this tick
+                // (`emergency_now`). `decide_step`'s Up gate is blind to audio, so a
+                // healthy renderer with a starving jitter buffer would otherwise
+                // raise the cap + call `re_arm_cascade_after_recovery` (clearing
+                // `layers_at_floor`), and the emergency clamp below would re-slam the
+                // cap to MIN_CAP WITHOUT restoring the floor flag — flipping the
+                // stage-3 encoder ceiling to None for a tick (the ~4s flap). The
+                // coerced `Hold` then has its own growth vetoed by
+                // `non_distress_growth_allowed(.., emergency_now)`, so neither growth
+                // path fights the emergency. `suppress_growth_step` is the single
+                // source of truth for this Up suppression (shared with the
+                // `sim_tick_protective` test model).
+                let step = suppress_growth_step(
+                    decide_step_with_median(&samples, &state, natural, now, median_for_distress),
+                    emergency_now,
+                );
 
                 // Controller owns direction_hold: increment per consecutive
                 // recovery-qualifying sample, reset to 0 when recovery breaks.
@@ -3238,7 +3540,7 @@ pub fn AttendantsComponent(
                                 // floor transition) without per-tick log/alloc churn.
                                 let floor_flipped = state.layers_at_floor != prev_layers_at_floor;
                                 if stepped || floor_flipped {
-                                    let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                                    let median = median_for_distress;
                                     let cur_fps = samples.last().and_then(|s| s.render_fps);
                                     let longtask = samples.last().and_then(|s| s.longtask);
                                     log::info!(
@@ -3260,11 +3562,13 @@ pub fn AttendantsComponent(
                                 // Proportional/multi-tile down-step (HCL #987 review
                                 // FIX 4): `magnitude` is 1 under mild pressure, larger
                                 // under catastrophic pressure. Floor at MIN_CAP.
-                                // #1001: telemetry computed here in the consuming branch.
-                                // A Down only fires when `cap > MIN_CAP` (decide_step
-                                // guard), so it always strictly lowers the cap and the cap
-                                // log below always fires — these are never unused.
-                                let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                                // #1558 perf hoist: reuse the single per-tick
+                                // `median_for_distress` (same value) instead of a
+                                // second alloc+sort. A Down only fires when
+                                // `cap > MIN_CAP` (decide_step guard), so it always
+                                // strictly lowers the cap and the cap log below always
+                                // fires — these are never unused.
+                                let median = median_for_distress;
                                 let cur_fps = samples.last().and_then(|s| s.render_fps);
                                 let longtask = samples.last().and_then(|s| s.longtask);
                                 let prev_cap = state.cap;
@@ -3326,6 +3630,12 @@ pub fn AttendantsComponent(
                             }
                         }
                     }
+                    // Issue #1558: this Up arm is never reached during an active
+                    // protective emergency — `suppress_growth_step` (above) has
+                    // already coerced `Up` to `Hold` when `emergency_now`, so the
+                    // cap-raise + `re_arm_cascade_after_recovery` here cannot clear
+                    // `layers_at_floor` while audio is starving (the encoder-ceiling
+                    // flap). On a normal (non-emergency) tick it runs unchanged.
                     BudgetStep::Up => {
                         // Issue #1557: recovery reverses the cascade order. Tiles
                         // un-pause HERE (the cap raise below); RECEIVED layers
@@ -3369,9 +3679,10 @@ pub fn AttendantsComponent(
                         state.direction_hold = 0;
                         decode_budget_cap.set(state.cap);
                         if state.cap != prev_cap {
-                            // #1001: telemetry computed only when the up-step
-                            // actually moves the cap (and thus logs).
-                            let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                            // #1558 perf hoist: reuse the single per-tick
+                            // `median_for_distress` (same value), logged only when
+                            // the up-step actually moves the cap.
+                            let median = median_for_distress;
                             let cur_fps = samples.last().and_then(|s| s.render_fps);
                             let longtask = samples.last().and_then(|s| s.longtask);
                             log::info!(
@@ -3453,7 +3764,25 @@ pub fn AttendantsComponent(
                         let up_cooldown_elapsed = (now - state.last_step_ms) >= STEP_UP_COOLDOWN_MS;
                         let not_distressed =
                             non_distress_growth_qualifying(&samples, SUSTAIN_SAMPLES);
-                        if state.cap < target && up_cooldown_elapsed && not_distressed {
+                        // Issue #1558 emergency-growth gate: `non_distress_growth_allowed`
+                        // is the single source of truth combining the three pre-existing
+                        // growth conditions with the `!emergency_now` veto. The growth
+                        // gate is blind to audio, so during a SUSTAINED audio-only
+                        // emergency it would otherwise raise the cap (1→2) and call
+                        // `re_arm_cascade_after_recovery` here — clearing
+                        // `layers_at_floor` — only for the emergency clamp below to
+                        // re-slam the cap to MIN_CAP WITHOUT restoring the floor flag,
+                        // flipping the stage-3 encoder ceiling to None for a tick and
+                        // un-shedding the local send-ladder on a ~4s cycle. Vetoing
+                        // growth while `emergency_now` holds keeps `layers_at_floor`
+                        // stable so the encoder ceiling stays applied; when audio
+                        // recovers the veto lifts and growth resumes unchanged.
+                        if non_distress_growth_allowed(
+                            state.cap < target,
+                            up_cooldown_elapsed,
+                            not_distressed,
+                            emergency_now,
+                        ) {
                             let prev_cap = state.cap;
                             state.cap += 1;
                             state.last_step_ms = now;
@@ -3473,10 +3802,11 @@ pub fn AttendantsComponent(
                             // Shared source of truth with the Up arm.
                             re_arm_cascade_after_recovery(&mut state, now);
                             decode_budget_cap.set(state.cap);
-                            // #1001: telemetry computed only on an actual growth
-                            // step; a steady-state Hold tick never reaches here, so
-                            // `median_render_fps` does not run when nothing changes.
-                            let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                            // #1558 perf hoist: reuse the single per-tick
+                            // `median_for_distress` (same value), logged only on an
+                            // actual growth step; a steady-state Hold tick never
+                            // reaches here.
+                            let median = median_for_distress;
                             let cur_fps = samples.last().and_then(|s| s.render_fps);
                             let longtask = samples.last().and_then(|s| s.longtask);
                             // Non-distress growth: cap re-grows toward natural while
@@ -3536,6 +3866,44 @@ pub fn AttendantsComponent(
                             prev_cap - state.cap,
                             natural,
                             ceiling,
+                        );
+                    }
+                }
+
+                // ---- Issue #1558 stage 4: EMERGENCY non-speaker pause ----
+                //
+                // Applied LAST, after the cascade + presenter clamps, on the
+                // pressured path only (it is only reachable once the cascade has
+                // latched and reached floor — the cheaper stages run first). When
+                // protective mode is active AND audio is STILL growing past the
+                // EMERGENCY water mark, force the decode cap to MIN_CAP: exactly ONE
+                // decoded tile, which `promote_speakers` fills with the active
+                // speaker downstream. Every other non-speaker tile pauses, freeing
+                // decode CPU to protect audio. Returns `None` (no clamp) once audio
+                // drains, so the cap recovers via the normal cascade/growth path —
+                // the stage reverses on recovery. Audio decode is NEVER touched; this
+                // sheds VIDEO precisely to protect audio.
+                if let Some(emergency_cap) =
+                    protective_emergency_cap(protective.active, last_audio_buffer_ms_max)
+                {
+                    let clamped = state.cap.min(emergency_cap.max(MIN_CAP));
+                    if clamped != state.cap {
+                        let prev_cap = state.cap;
+                        state.cap = clamped;
+                        state.last_step_ms = now;
+                        // The emergency shed ends any recovery streak so the cap does
+                        // not immediately try to re-grow while audio is still in
+                        // distress.
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                        log::warn!(
+                            "ProtectiveMode: EMERGENCY cap {}->{} (speaker-only) audio_buffer_ms={} natural={}",
+                            prev_cap,
+                            state.cap,
+                            last_audio_buffer_ms_max
+                                .map(|b| format!("{b:.0}"))
+                                .unwrap_or_else(|| "none".into()),
+                            natural,
                         );
                     }
                 }
