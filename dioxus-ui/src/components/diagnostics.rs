@@ -24,8 +24,9 @@ use crate::components::neteq_chart::{
 use crate::components::performance_settings::{
     format_kbps_compact, format_mbps, format_peer_device_lines, format_peer_kind_line,
     format_send_header, format_send_layer, format_send_layer_short, format_send_total_kbps,
-    format_simulcast_summary, layer_quality_label, peers_for_kind, DiagnosticsReader, HelpPopover,
-    PerfControlsHandle, PerformanceSettingsPanel,
+    format_simulcast_summary, layer_led_on, layer_quality_label, peers_for_kind,
+    received_layer_led_on, DiagnosticsReader, HelpPopover, PerfControlsHandle,
+    PerformanceSettingsPanel,
 };
 use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use dioxus::prelude::*;
@@ -1817,11 +1818,13 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
             p { class: "simulcast-note", "Layers are named by quality: Low, Medium, High." }
             SimulcastSendLadder {
                 title: "Video (sending)",
+                kind: "video",
                 not_sharing_text: "Camera — off",
                 snap: send_video_snap,
             }
             SimulcastSendLadder {
                 title: "Screen (sending)",
+                kind: "screen",
                 not_sharing_text: "Screen — not sharing",
                 snap: send_screen_snap,
             }
@@ -1840,6 +1843,9 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
 #[component]
 fn SimulcastSendLadder(
     title: &'static str,
+    /// Media-kind slug for the per-LED testid (`video` / `screen`), so e2e can
+    /// target `diag-simulcast-led-{kind}-{layer_id}` per kind (issue #1607).
+    kind: &'static str,
     /// Static line shown when `snap` is `None` (source off / not sharing).
     not_sharing_text: &'static str,
     snap: Option<videocall_client::SimulcastSendSnapshot>,
@@ -1901,13 +1907,29 @@ fn SimulcastSendLadder(
                     rsx! {
                         for layer in snap.layers.iter().cloned() {
                             {
-                                let active = layer.layer_id < snap.active_layers;
+                                // issue 1607: the rung LED is lit ONLY for layers
+                                // currently being encoded+sent (below the shed-aware
+                                // active boundary). `active_layers` is the live count
+                                // off the encoder atomic (camera seeds 1 then ramps;
+                                // screen seeds the optimistic baseline then sheds), so
+                                // a shed top rung reads as OFF — not "all on".
+                                let active = layer_led_on(layer.layer_id, snap.active_layers);
                                 let grow = (layer.bitrate_kbps as f32 / max_kbps as f32).max(0.4);
                                 let chip_class = if active {
                                     "simulcast-rung is-active"
                                 } else {
                                     "simulcast-rung is-shed"
                                 };
+                                // Explicit LED dot (issue 1607): a filled green dot
+                                // for SENT layers, a hollow grey dot for shed layers —
+                                // an unambiguous on/off affordance distinct from the
+                                // rung's subtle dimming.
+                                let led_class = if active {
+                                    "simulcast-led is-on"
+                                } else {
+                                    "simulcast-led is-off"
+                                };
+                                let led_label = if active { "sending" } else { "not sending" };
                                 let full = format_send_layer(
                                     layer.layer_id, ladder_count, layer.width, layer.height, layer.bitrate_kbps,
                                 );
@@ -1923,7 +1945,16 @@ fn SimulcastSendLadder(
                                         "data-testid": "diag-simulcast-rung-{layer.layer_id}",
                                         title: "{full}",
                                         style: "flex-grow: {grow};",
-                                        span { class: "simulcast-rung-id", "{letter}" }
+                                        span {
+                                            class: "simulcast-rung-head",
+                                            span {
+                                                class: led_class,
+                                                "data-testid": "diag-simulcast-led-{kind}-{layer.layer_id}",
+                                                "aria-label": "{letter} layer {led_label}",
+                                                title: "{led_label}",
+                                            }
+                                            span { class: "simulcast-rung-id", "{letter}" }
+                                        }
                                         span { class: "simulcast-rung-res", "{res_short}" }
                                         span { class: "simulcast-rung-kbps", "{kbps_short}" }
                                     }
@@ -2013,6 +2044,14 @@ fn SimulcastReceiveBreakdown(
                                     {
                                         // Borrow the label for the testid; the line owns its String.
                                         let session_id = p.session_id;
+                                        // issue 1607: per-peer RECEIVE LED row. A receiver
+                                        // decodes exactly ONE layer per kind, so the LED is
+                                        // lit only for `layer_index` and dark for the rest.
+                                        // Use this peer's own ladder depth (`layer_count`),
+                                        // floored at the kind-wide `count` so the row width is
+                                        // stable across peers reporting different depths.
+                                        let recv_index = p.snap.layer_index;
+                                        let recv_count = p.snap.layer_count.max(count).max(1);
                                         let line = format_peer_kind_line(kind_label, Some(&p.snap))
                                             .map(|l| format!("{}: {l}", p.label))
                                             .unwrap_or(p.label);
@@ -2020,7 +2059,31 @@ fn SimulcastReceiveBreakdown(
                                             div {
                                                 class: "simulcast-recv-peer",
                                                 "data-testid": "diag-simulcast-recv-peer-{session_id}",
-                                                "{line}"
+                                                div {
+                                                    class: "simulcast-led-row",
+                                                    "data-testid": "diag-simulcast-recv-leds-{kind_label}-{session_id}",
+                                                    for layer_id in 0..recv_count {
+                                                        {
+                                                            let on = received_layer_led_on(layer_id, recv_index);
+                                                            let led_class = if on {
+                                                                "simulcast-led is-on"
+                                                            } else {
+                                                                "simulcast-led is-off"
+                                                            };
+                                                            let letter = layer_quality_label(layer_id, recv_count, true);
+                                                            let led_label = if on { "receiving" } else { "not receiving" };
+                                                            rsx! {
+                                                                span {
+                                                                    class: led_class,
+                                                                    "data-testid": "diag-simulcast-recv-led-{kind_label}-{session_id}-{layer_id}",
+                                                                    "aria-label": "{letter} layer {led_label}",
+                                                                    title: "{letter} · {led_label}",
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                span { class: "simulcast-recv-peer-line", "{line}" }
                                             }
                                         }
                                     }

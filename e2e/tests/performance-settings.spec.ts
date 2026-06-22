@@ -1545,6 +1545,32 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(baseRung.locator(".simulcast-rung-id")).toHaveText("L");
     await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L0$/ })).toHaveCount(0);
     await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L1$/ })).toHaveCount(0);
+
+    // SEND LED on/off (issue #1607): every rung carries exactly one LED dot
+    // (`diag-simulcast-led-video-{layer_id}`), and the LEDs are NOT all-on — the
+    // count of LIT (`is-on`) LEDs equals the number of layers actually being sent
+    // (the active count parsed from the "<a> of <b> layers active" header), which
+    // is < the rung count whenever the AQ has shed the top layer(s). The base
+    // rung's LED is ALWAYS lit (the base layer is always published). This is the
+    // core fix: shed layers read as OFF (hollow), not lit.
+    const rungCount = await ladder.locator('[data-testid^="diag-simulcast-rung-"]').count();
+    const ledCount = await ladder.locator('[data-testid^="diag-simulcast-led-video-"]').count();
+    expect(ledCount, "one LED dot per rung").toBe(rungCount);
+    // Base layer LED is on.
+    await expect(baseRung.locator('[data-testid="diag-simulcast-led-video-0"]')).toHaveClass(
+      /is-on/,
+    );
+    // The number of lit LEDs equals the active count from the header (never all-on
+    // unless the encoder genuinely has every rung active).
+    const sendText = await simulcastSendText(page, "Video (sending)");
+    const activeMatch = sendText.match(/(\d+) of (\d+) layers active/);
+    expect(activeMatch, `header carries the active count: ${sendText}`).not.toBeNull();
+    const activeCount = Number(activeMatch![1]);
+    await expect
+      .poll(async () => ladder.locator(".simulcast-led.is-on").count(), { timeout: 10_000 })
+      .toBe(activeCount);
+    // The shed rungs (rungCount - activeCount of them) render an OFF LED.
+    await expect(ladder.locator(".simulcast-led.is-off")).toHaveCount(rungCount - activeCount);
   });
 
   // ── Drawer help popovers + position:fixed viewport-clip regression (#1131) ──
