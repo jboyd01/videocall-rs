@@ -2631,8 +2631,10 @@ pub fn AttendantsComponent(
         let task = spawn(async move {
             let client_for_budget = client_for_budget.clone();
             use crate::components::decode_budget::{
-                median_render_fps, non_distress_growth_qualifying, recovery_qualifying,
-                severe_label, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
+                cascade_action, lower_layer_cap, median_render_fps, next_layer_drop_ms,
+                non_distress_growth_qualifying, re_arm_cascade_after_recovery, recovery_qualifying,
+                settle_window_elapsed, severe_label, CascadeAction, STEP_UP_COOLDOWN_MS,
+                SUSTAIN_SAMPLES,
             };
             use videocall_diagnostics::{now_ms, MetricValue};
 
@@ -2674,10 +2676,28 @@ pub fn AttendantsComponent(
                 cap: *decode_budget_cap.peek(),
                 last_step_ms: 0.0,
                 direction_hold: 0,
+                // #1557: cascade state starts clean on loop init. NOTE: this loop is
+                // built ONCE (use_effect) and persists across reconnects — it is NOT
+                // rebuilt per call session, and an in-place `client.connect()` reconnect
+                // does not remount this component. So this initializer alone does NOT
+                // protect against settle/at-floor leaking across a reconnect; that is
+                // handled by the SESSION-RESET re-arm below (peer count collapsing to
+                // MIN_CAP on `clear_all_peers`), which fires on BOTH WT and WS.
+                last_layer_drop_ms: 0.0,
+                layers_at_floor: false,
             };
             // Tracks the last override we acted on so we can detect a transition
             // back to Auto and cleanly re-seed `state` from the live cap.
             let mut last_override = *decode_budget_override.peek();
+            // #1557: tracks the previous live tile count so the loop can detect a
+            // SESSION-RESET edge (peer count collapsing to the MIN_CAP floor). On a
+            // reconnect the client clears all peers (`clear_all_peers` runs on
+            // ConnectionState::Failed, transport-agnostic), so `decode_budget_natural`
+            // collapses to MIN_CAP and peers re-join FRESH at top layer; we re-arm the
+            // cascade on that edge so stale at-floor/settle timing cannot leak across
+            // the reconnect. Seeded from the live count so a session that starts with
+            // peers already present does not spuriously fire on the first tick.
+            let mut prev_natural = *decode_budget_natural.peek();
 
             while let Ok(evt) = rx.recv().await {
                 if evt.subsystem != "client_perf" {
@@ -2791,6 +2811,12 @@ pub fn AttendantsComponent(
                             cap: *decode_budget_cap.peek(),
                             last_step_ms: now_ms() as f64,
                             direction_hold: 0,
+                            // #1557: reset cascade state on the Fixed->Auto resume
+                            // so settle timing does not leak across the override
+                            // transition (no phantom escalation to PauseTiles on
+                            // the first re-pressured tick after resuming Auto).
+                            last_layer_drop_ms: 0.0,
+                            layers_at_floor: false,
                         };
                         // Loop-local hygiene: re-seed BudgetState so the loop
                         // resumes cleanly without a phantom step. The pressured
@@ -2835,6 +2861,28 @@ pub fn AttendantsComponent(
 
                 // ---- Auto path ----
                 let now = now_ms() as f64;
+
+                // #1557 reconnect re-arm: the budget loop is built ONCE (use_effect)
+                // and lives across reconnects — it is NOT rebuilt per call session, and
+                // the in-place `client.connect()` reconnect does NOT remount this
+                // component. So `state` (incl. `layers_at_floor` / `last_layer_drop_ms`)
+                // would otherwise PERSIST across a reconnect. On a reconnect the client
+                // clears all peers, so `natural` collapses to the MIN_CAP floor and the
+                // peers re-join fresh at top layer. Re-arm the cascade on that collapse
+                // edge — `re_arm_cascade_after_recovery` clears `layers_at_floor` and
+                // re-anchors `last_layer_drop_ms = now` (the SAME reset used by the Up
+                // recovery arm) — so the next Down edge after re-join re-enters at
+                // LowerLayer instead of routing straight to PauseTiles on stale at-floor
+                // state. This is transport-agnostic: `clear_all_peers` runs on
+                // ConnectionState::Failed for BOTH WebTransport and WebSocket. The same
+                // edge also fires when the LAST peer legitimately leaves — which is
+                // equally a correct moment to re-arm (no peers => nothing pressured =>
+                // the cascade should be clean for the next arrival).
+                if natural <= MIN_CAP && prev_natural > MIN_CAP {
+                    re_arm_cascade_after_recovery(&mut state, now);
+                }
+                prev_natural = natural;
+
                 let pressured = *decode_budget_pressured.peek();
                 // Presenter-aware shedding (issue #1559): is the LOCAL user
                 // screen-sharing right now? Read every tick so the bias appears
@@ -2904,75 +2952,179 @@ pub fn AttendantsComponent(
                         // `None` longtask (signal unavailable on WebKit/iOS) as
                         // "none", mirroring how `median`/`cur_fps` render their
                         // missing case, so the log never implies a healthy 0.0
-                        // where there is simply no telemetry.
+                        // where there is simply no telemetry. All three are used in
+                        // BOTH cascade arms' logs below, so none is ever unused.
                         let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
                         let cur_fps = samples.last().and_then(|s| s.render_fps);
                         let longtask = samples.last().and_then(|s| s.longtask);
-                        let prev_cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
 
+                        // Issue #1557: latch the controller on the FIRST measured
+                        // down-pressure REGARDLESS of cascade stage. The latch means
+                        // the controller now owns the cap; it MUST latch the moment
+                        // pressure is first measured — even on a LowerLayer tick that
+                        // does not touch the cap — otherwise the loop never re-enters
+                        // this pressured arm to keep cascading (it would fall back to
+                        // the un-pressured branch and re-reveal natural tiles).
                         decode_budget_pressured.set(true);
-                        state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
-                        // Presenter-aware "lower floor" (issue #1559): while
-                        // sharing, clamp the just-latched cap to the presenter
-                        // ceiling (the fraction `ceil(natural * PRESENTER_SHED_FACTOR)`
-                        // bounded above by the absolute `PRESENTER_RESIDUAL_FLOOR`,
-                        // so a large meeting sheds to a small fixed residual) — the
-                        // first shed already frees substantial peer-decode CPU for
-                        // the screen encoder. `None` while not sharing leaves the
-                        // cap exactly as the normal down-step produced it.
-                        if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
-                            state.cap = state.cap.min(ceiling.max(MIN_CAP));
-                        }
-                        state.last_step_ms = now;
-                        state.direction_hold = 0;
-                        decode_budget_cap.set(state.cap);
 
-                        // Pressured-latch edge (false->true): the controller now
-                        // owns the cap. Trigger is the first measured down-step.
-                        log::info!(
-                            "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={} natural={} cap={}",
-                            median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                            cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                            longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                            natural,
-                            state.cap,
-                        );
-                        // Severe-tier entry: a multi-tile down-step. The label
-                        // reproduces `decide_step`'s catastrophic test exactly
-                        // (median FPS + SUSTAINED long-task window), NOT a single
-                        // closing-sample inference. WITHOUT changing decide_step's
-                        // signature.
-                        if magnitude > 1 {
-                            log::info!(
-                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
-                                magnitude,
-                                severe_label(&samples, median),
-                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                            );
+                        // Issue #1557 — tier-before-pause cascade. A Down edge first
+                        // lowers RECEIVED simulcast layers (resolution) and only
+                        // escalates to PAUSING (capping) tiles once those layers are
+                        // at floor AND a settle window has elapsed.
+                        let down_pressure = true;
+                        let settle_elapsed = settle_window_elapsed(now, state.last_layer_drop_ms);
+                        let action =
+                            cascade_action(down_pressure, state.layers_at_floor, settle_elapsed);
+                        match action {
+                            CascadeAction::LowerLayer => {
+                                // Stage 1: drop received layers ONLY — NO tile is
+                                // paused on this edge.
+                                //
+                                // #1557 BLOCKER FIX: the un-pressured phase keeps only
+                                // the LOCAL `state.cap` synced to natural and never
+                                // writes the `decode_budget_cap` SIGNAL (see the
+                                // `!pressured` block above), so the signal still holds
+                                // the Auto seed `MIN_CAP` (1) at this first Down edge.
+                                // The render reads the SIGNAL: `effective_cap` would
+                                // return MIN_CAP and pause N-1 of N tiles — inverting
+                                // #1557. So on a LowerLayer outcome we PIN the cap to
+                                // the displayed (natural) value and WRITE the signal,
+                                // using the SAME device-ceiling clamp the un-pressured
+                                // sync uses (NOT `presenter_cap_ceiling`, which belongs
+                                // to the PauseTiles arm and sheds tiles). Result:
+                                // `effective_cap` returns natural — no tile paused —
+                                // while only received layers drop.
+                                // #1557 perf: dioxus-signals 0.7.3 does NOT dedupe
+                                // equal writes, so an unconditional `.set` every ~1s
+                                // forces an AttendantsComponent re-render each tick.
+                                // Change-gate the write. On the FIRST LowerLayer tick
+                                // the signal still holds the Auto-seed MIN_CAP while
+                                // `new_cap == natural > MIN_CAP`, so the guard is true
+                                // and the write still fires.
+                                let new_cap = lower_layer_cap(natural, device_decode_ceiling);
+                                if new_cap != *decode_budget_cap.peek() {
+                                    decode_budget_cap.set(new_cap);
+                                }
+                                state.cap = new_cap;
+                                // The chooser steps each peer down a rung; when it
+                                // reports nothing moved (`!stepped`) every received
+                                // layer is at base, so the next Down edge can escalate.
+                                let stepped = match client_for_budget
+                                    .apply_local_cpu_pressure_congestion()
+                                {
+                                    Some(s) => {
+                                        state.layers_at_floor = !s;
+                                        // #1557 CRITICAL: advance the settle clock ONLY
+                                        // when a layer ACTUALLY moved (see the steady
+                                        // Down arm for the full rationale): freezing the
+                                        // timestamp at floor lets STEP_DOWN_COOLDOWN_MS
+                                        // accumulate so the cascade can escalate to
+                                        // PauseTiles instead of looping LowerLayer.
+                                        state.last_layer_drop_ms =
+                                            next_layer_drop_ms(state.last_layer_drop_ms, now, s);
+                                        s
+                                    }
+                                    None => {
+                                        // borrow contended: skip this tick, do NOT advance the
+                                        // cascade (layers_at_floor + settle clock frozen). `stepped`
+                                        // logs false but layers_at_floor was NOT set true — that is
+                                        // the intended "no movement" behavior, not an inconsistency.
+                                        false
+                                    }
+                                };
+                                log::info!(
+                                    "DecodeBudget: cascade=lower_layer pressured_latch=true stepped={} layers_at_floor={} natural={} cap={} median_fps={} current_fps={} longtask_ms_per_sec={}",
+                                    stepped,
+                                    state.layers_at_floor,
+                                    natural,
+                                    state.cap,
+                                    median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                    cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                    longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                );
+                            }
+                            CascadeAction::PauseTiles => {
+                                // Stage 2: received layers are at floor and the settle
+                                // window elapsed — NOW pause (cap) a tile. This is the
+                                // ORIGINAL latch-edge down-step logic, unchanged.
+                                let prev_cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+                                state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
+                                // Presenter-aware "lower floor" (issue #1559): while
+                                // sharing, clamp the just-latched cap to the presenter
+                                // ceiling (the fraction `ceil(natural * PRESENTER_SHED_FACTOR)`
+                                // bounded above by the absolute `PRESENTER_RESIDUAL_FLOOR`,
+                                // so a large meeting sheds to a small fixed residual) — the
+                                // first shed already frees substantial peer-decode CPU for
+                                // the screen encoder. `None` while not sharing leaves the
+                                // cap exactly as the normal down-step produced it.
+                                if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
+                                    state.cap = state.cap.min(ceiling.max(MIN_CAP));
+                                }
+                                state.last_step_ms = now;
+                                state.direction_hold = 0;
+                                decode_budget_cap.set(state.cap);
+
+                                // Pressured-latch edge (false->true): the controller now
+                                // owns the cap. Trigger is the first measured down-step.
+                                log::info!(
+                                    "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={} natural={} cap={}",
+                                    median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                    cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                    longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                    natural,
+                                    state.cap,
+                                );
+                                // Severe-tier entry: a multi-tile down-step. The label
+                                // reproduces `decide_step`'s catastrophic test exactly
+                                // (median FPS + SUSTAINED long-task window), NOT a single
+                                // closing-sample inference. WITHOUT changing decide_step's
+                                // signature.
+                                if magnitude > 1 {
+                                    log::info!(
+                                        "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
+                                        magnitude,
+                                        severe_label(&samples, median),
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                    );
+                                }
+                                // First cap transition (un-pressured -> pressured down-step).
+                                // #1001: gate on an actual change (mirroring the steady
+                                // Auto arm) so a clamp-collapsed `prev_cap` can never log a
+                                // no-op `cap N->N`; the log always reflects real movement.
+                                if state.cap != prev_cap {
+                                    log::info!(
+                                        "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
+                                        prev_cap,
+                                        state.cap,
+                                        magnitude,
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                        natural,
+                                    );
+                                }
+                                // At-floor nudge: re-issue the layer-drop seed. Harmless
+                                // and idempotent — every received chooser is already at
+                                // base so `apply` returns false (`layers_at_floor`
+                                // stays true), but it keeps the published preference
+                                // re-advertised. Advance the settle clock ONLY if a
+                                // layer actually moved (at floor it does not, so the
+                                // timestamp stays frozen — keeping settle_elapsed true
+                                // so sustained pressure keeps shedding tiles).
+                                if let Some(stepped) =
+                                    client_for_budget.apply_local_cpu_pressure_congestion()
+                                {
+                                    state.layers_at_floor = !stepped;
+                                    state.last_layer_drop_ms =
+                                        next_layer_drop_ms(state.last_layer_drop_ms, now, stepped);
+                                }
+                                // None (borrow contended): leave layers_at_floor + settle clock unchanged
+                            }
+                            CascadeAction::None => {
+                                // unreachable: down_pressure is true here
+                            }
                         }
-                        // First cap transition (un-pressured -> pressured down-step).
-                        // #1001: gate on an actual change (mirroring the steady
-                        // Auto arm) so a clamp-collapsed `prev_cap` can never log a
-                        // no-op `cap N->N`; the log always reflects real movement.
-                        if state.cap != prev_cap {
-                            log::info!(
-                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
-                                prev_cap,
-                                state.cap,
-                                magnitude,
-                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                                natural,
-                            );
-                        }
-                        // Issue #1569 — option (a) CONCURRENT: layer-down (resolution) and
-                        // tile-shed (count) are complementary actuators fired on the SAME
-                        // Down edge for fastest relief. Lowers RECEIVED simulcast layers
-                        // under local CPU pressure (Stage 1), composing with the relay
-                        // DOWNLINK_CONGESTION path. RECEIVER-ONLY.
-                        client_for_budget.apply_local_cpu_pressure_congestion();
                     }
                     continue;
                 }
@@ -3004,57 +3156,203 @@ pub fn AttendantsComponent(
                 // `Option<f64>` reads; they ride along for locality.)
                 match step {
                     BudgetStep::Down(magnitude) => {
-                        // Proportional/multi-tile down-step (HCL #987 review
-                        // FIX 4): `magnitude` is 1 under mild pressure, larger
-                        // under catastrophic pressure. Floor at MIN_CAP.
-                        // #1001: telemetry computed here in the consuming branch.
-                        // A Down only fires when `cap > MIN_CAP` (decide_step
-                        // guard), so it always strictly lowers the cap and the cap
-                        // log below always fires — these are never unused.
-                        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
-                        let cur_fps = samples.last().and_then(|s| s.render_fps);
-                        let longtask = samples.last().and_then(|s| s.longtask);
-                        let prev_cap = state.cap;
-                        state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
-                        state.last_step_ms = now;
-                        // A down-step ends the recovery streak. Because the
-                        // last_step_ms is updated here, the non-distress growth
-                        // gate below is held off by the up-cooldown, so a machine
-                        // that just dropped a tile under pressure cannot
-                        // instantly re-add it (anti-oscillation).
-                        state.direction_hold = 0;
-                        decode_budget_cap.set(state.cap);
-                        // Severe-tier entry: multi-tile down-step. The label
-                        // reproduces `decide_step`'s catastrophic test exactly
-                        // (median FPS + SUSTAINED long-task window), NOT a single
-                        // closing-sample inference. No `decide_step` signature
-                        // change.
-                        if magnitude > 1 {
-                            log::info!(
-                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
-                                magnitude,
-                                severe_label(&samples, median),
-                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                            );
+                        // Issue #1557 — tier-before-pause cascade on the steady
+                        // pressured Down arm. Drop RECEIVED layers first; pause
+                        // (cap) tiles only once layers are at floor AND the settle
+                        // window has elapsed. `magnitude` is consumed in the
+                        // PauseTiles arm (proportional tile-shed); LowerLayer leaves
+                        // the cap untouched.
+                        let settle_elapsed = settle_window_elapsed(now, state.last_layer_drop_ms);
+                        let action = cascade_action(true, state.layers_at_floor, settle_elapsed);
+                        match action {
+                            CascadeAction::LowerLayer => {
+                                // Stage 1: drop received layers ONLY — no tile is
+                                // paused on this tick.
+                                //
+                                // #1557 BLOCKER FIX (mirrors the latch-site arm): PIN
+                                // the cap to natural and WRITE `decode_budget_cap` so
+                                // `effective_cap` shows ALL natural tiles. The cap may
+                                // currently hold a PAUSED value (a prior PauseTiles
+                                // dropped it, then recovery cleared `layers_at_floor`
+                                // and a fresh Down re-entered LowerLayer); re-pinning
+                                // natural here guarantees a LowerLayer tick never leaves
+                                // a stale paused cap visible. Same device-ceiling clamp
+                                // as the un-pressured sync; NOT `presenter_cap_ceiling`
+                                // (that sheds tiles and belongs to the PauseTiles arm).
+                                // #1557 perf: dioxus-signals 0.7.3 does NOT dedupe
+                                // equal writes, so an unconditional `.set` every ~1s
+                                // forces an AttendantsComponent re-render each tick.
+                                // Change-gate the write. On the FIRST LowerLayer tick
+                                // the signal still holds the Auto-seed MIN_CAP while
+                                // `new_cap == natural > MIN_CAP`, so the guard is true
+                                // and the write still fires.
+                                let new_cap = lower_layer_cap(natural, device_decode_ceiling);
+                                if new_cap != *decode_budget_cap.peek() {
+                                    decode_budget_cap.set(new_cap);
+                                }
+                                state.cap = new_cap;
+                                let prev_layers_at_floor = state.layers_at_floor;
+                                let stepped = match client_for_budget
+                                    .apply_local_cpu_pressure_congestion()
+                                {
+                                    Some(s) => {
+                                        state.layers_at_floor = !s;
+                                        // #1557 CRITICAL: advance the settle clock ONLY
+                                        // when a layer ACTUALLY moved (`s`). Once at
+                                        // floor the apply is a no-op every tick; if we
+                                        // reset the clock on those no-op ticks the
+                                        // `now - last_layer_drop_ms` delta is pinned at
+                                        // one tick-gap and STEP_DOWN_COOLDOWN_MS never
+                                        // elapses, so PauseTiles would be unreachable.
+                                        // By freezing the timestamp at floor, the settle
+                                        // window accumulates from the moment the floor
+                                        // was first reached and the cascade can escalate
+                                        // to pausing tiles.
+                                        state.last_layer_drop_ms =
+                                            next_layer_drop_ms(state.last_layer_drop_ms, now, s);
+                                        s
+                                    }
+                                    None => {
+                                        // borrow contended: skip this tick, do NOT advance the
+                                        // cascade (layers_at_floor + settle clock frozen). `stepped`
+                                        // logs false but layers_at_floor was NOT set true — that is
+                                        // the intended "no movement" behavior, not an inconsistency.
+                                        false
+                                    }
+                                };
+                                // A Down edge ends the recovery streak even when only
+                                // layers dropped (anti-oscillation): the next up-step
+                                // must re-earn RECOVERY_HOLD samples.
+                                state.direction_hold = 0;
+                                // Refresh last_step_ms so the non-distress growth gate
+                                // below is held off by the up-cooldown — a layer-drop
+                                // tick must not let the cap re-grow on the same window.
+                                state.last_step_ms = now;
+                                // #1557 perf: gate the log (and its `median_render_fps`
+                                // Vec-alloc + sort, plus the three `format!`s) on a
+                                // TRANSITION — a real layer move (`stepped`) or the
+                                // floor flip — instead of emitting it every second
+                                // under sustained at-floor pressure. This mirrors the
+                                // movement-gate discipline of the `cap N->N` logs and
+                                // keeps the support-triage signal (each real drop + the
+                                // floor transition) without per-tick log/alloc churn.
+                                let floor_flipped = state.layers_at_floor != prev_layers_at_floor;
+                                if stepped || floor_flipped {
+                                    let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                                    let cur_fps = samples.last().and_then(|s| s.render_fps);
+                                    let longtask = samples.last().and_then(|s| s.longtask);
+                                    log::info!(
+                                        "DecodeBudget: cascade=lower_layer pressured_latch=false stepped={} layers_at_floor={} natural={} cap={} median_fps={} current_fps={} longtask_ms_per_sec={}",
+                                        stepped,
+                                        state.layers_at_floor,
+                                        natural,
+                                        state.cap,
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                    );
+                                }
+                            }
+                            CascadeAction::PauseTiles => {
+                                // Stage 2: received layers at floor + settle elapsed —
+                                // NOW pause (cap) a tile. This is the ORIGINAL steady
+                                // down-step body, unchanged.
+                                // Proportional/multi-tile down-step (HCL #987 review
+                                // FIX 4): `magnitude` is 1 under mild pressure, larger
+                                // under catastrophic pressure. Floor at MIN_CAP.
+                                // #1001: telemetry computed here in the consuming branch.
+                                // A Down only fires when `cap > MIN_CAP` (decide_step
+                                // guard), so it always strictly lowers the cap and the cap
+                                // log below always fires — these are never unused.
+                                let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                                let cur_fps = samples.last().and_then(|s| s.render_fps);
+                                let longtask = samples.last().and_then(|s| s.longtask);
+                                let prev_cap = state.cap;
+                                state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
+                                state.last_step_ms = now;
+                                // A down-step ends the recovery streak. Because the
+                                // last_step_ms is updated here, the non-distress growth
+                                // gate below is held off by the up-cooldown, so a machine
+                                // that just dropped a tile under pressure cannot
+                                // instantly re-add it (anti-oscillation).
+                                state.direction_hold = 0;
+                                decode_budget_cap.set(state.cap);
+                                // Severe-tier entry: multi-tile down-step. The label
+                                // reproduces `decide_step`'s catastrophic test exactly
+                                // (median FPS + SUSTAINED long-task window), NOT a single
+                                // closing-sample inference. No `decide_step` signature
+                                // change.
+                                if magnitude > 1 {
+                                    log::info!(
+                                        "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
+                                        magnitude,
+                                        severe_label(&samples, median),
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                    );
+                                }
+                                if state.cap != prev_cap {
+                                    log::info!(
+                                        "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
+                                        prev_cap,
+                                        state.cap,
+                                        magnitude,
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                        natural,
+                                    );
+                                }
+                                // At-floor nudge: re-issue the layer-drop seed. Harmless
+                                // and idempotent (all received choosers already at base),
+                                // keeps the published preference fresh. As in the
+                                // LowerLayer arm, advance the settle clock ONLY if a
+                                // layer actually moved — at floor this is a no-op so the
+                                // timestamp stays frozen, which is correct: once we are
+                                // pausing tiles we want settle_elapsed to STAY true so
+                                // subsequent ticks keep shedding tiles under sustained
+                                // pressure rather than dropping back to LowerLayer.
+                                if let Some(stepped) =
+                                    client_for_budget.apply_local_cpu_pressure_congestion()
+                                {
+                                    state.layers_at_floor = !stepped;
+                                    state.last_layer_drop_ms =
+                                        next_layer_drop_ms(state.last_layer_drop_ms, now, stepped);
+                                }
+                                // None (borrow contended): leave layers_at_floor + settle clock unchanged
+                            }
+                            CascadeAction::None => {
+                                // unreachable: down_pressure is true here
+                            }
                         }
-                        if state.cap != prev_cap {
-                            log::info!(
-                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
-                                prev_cap,
-                                state.cap,
-                                magnitude,
-                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                                natural,
-                            );
-                        }
-                        // Issue #1569 — option (a) CONCURRENT layer-down on the same Down
-                        // edge as the tile-cap step. RECEIVER-ONLY.
-                        client_for_budget.apply_local_cpu_pressure_congestion();
                     }
                     BudgetStep::Up => {
+                        // Issue #1557: recovery reverses the cascade order. Tiles
+                        // un-pause HERE (the cap raise below); RECEIVED layers
+                        // re-grow via the choosers' existing clean-window recovery on
+                        // the monitor tick (layer_chooser.rs `choose` clean-window /
+                        // sticky cautious recovery) — no explicit layer-raise call is
+                        // needed here.
+                        //
+                        // Recovery RE-ARMS the cascade: clearing `layers_at_floor` and
+                        // re-anchoring `last_layer_drop_ms = now` means the NEXT Down
+                        // edge starts at the LowerLayer stage and must re-earn the
+                        // settle window before pausing a tile — so the re-grown
+                        // received layers are dropped FIRST on the next pressure
+                        // episode (not paused). Without this re-arm the controller
+                        // stays pressured through recovery (the latch is only cleared
+                        // on the Fixed/All->Auto override, never here), so the next
+                        // Down edge would see a STALE `layers_at_floor == true` plus a
+                        // stale `last_layer_drop_ms` and `cascade_action` would route
+                        // straight to PauseTiles — inverting the feature on every
+                        // cycle after the first. These two resets are UNGATED (run on
+                        // every Up-arm execution, NOT behind the `cap != prev_cap` log
+                        // gate below): reaching this arm means decide_step chose an
+                        // up-step, i.e. recovery is in progress, even on the rare tick
+                        // where the cap was already at natural and did not move.
+                        // `re_arm_cascade_after_recovery` is the single source of
+                        // truth for this reset (shared with the Hold-growth path).
+                        re_arm_cascade_after_recovery(&mut state, now);
                         let prev_cap = state.cap;
                         state.cap = (state.cap + 1).min(natural.max(MIN_CAP));
                         // #1286 belt-and-suspenders: never grow past the
@@ -3159,6 +3457,21 @@ pub fn AttendantsComponent(
                             let prev_cap = state.cap;
                             state.cap += 1;
                             state.last_step_ms = now;
+                            // Issue #1557: non-distress growth is also a recovery
+                            // signal (the cap climbs back toward natural while still
+                            // latched-pressured), so RE-ARM the cascade exactly as the
+                            // BudgetStep::Up arm does — clear `layers_at_floor` and
+                            // re-anchor `last_layer_drop_ms = now`. This is reachable
+                            // to a later Down edge with a stale flag: the pressured
+                            // latch persists through recovery, decide_step can return
+                            // Down on a subsequent bad window, and nothing else clears
+                            // the flag — so without this the next Down edge would route
+                            // straight to PauseTiles. Gated INSIDE this block (an
+                            // ACTUAL upward cap move): a steady-state Hold tick that
+                            // does NOT grow must NOT re-arm, or it would perpetually
+                            // reset the settle clock and mask a real at-floor state.
+                            // Shared source of truth with the Up arm.
+                            re_arm_cascade_after_recovery(&mut state, now);
                             decode_budget_cap.set(state.cap);
                             // #1001: telemetry computed only on an actual growth
                             // step; a steady-state Hold tick never reaches here, so
@@ -3183,6 +3496,13 @@ pub fn AttendantsComponent(
                 }
 
                 // Presenter-aware "lower floor" — post-step clamp (issue #1559).
+                //
+                // Issue #1557: this clamp COMPOSES with the tier-before-pause
+                // cascade and is UNCHANGED. On a LowerLayer tick the cap was not
+                // lowered, so this clamp may still shed tiles if sharing AND the cap
+                // is above the presenter ceiling — that is pre-existing,
+                // independent presenter behaviour (it bounds the cap regardless of
+                // the cascade stage) and is intentionally left intact.
                 //
                 // The growth-target cap above prevents the pressured loop from
                 // GROWING past the presenter ceiling, but it does not lower a cap

@@ -2095,19 +2095,44 @@ impl VideoCallClient {
     /// DOWNLINK_CONGESTION path: both want lower layers, and the chooser's one-rung
     /// STEP + clean-window recovery make repeated seeds safe (floors at base; re-grows
     /// when pressure clears). RECEIVER-ONLY: never touches the local publisher's
-    /// encoder. Returns whether any peer was stepped down.
+    /// encoder.
+    ///
+    /// Returns an `Option<bool>` that distinguishes "skipped" from "no movement":
+    ///   - `None` = the `try_borrow_mut` was contended, so the layer step was
+    ///     SKIPPED this tick. The cascade must NOT advance: leave `layers_at_floor`
+    ///     unchanged and do NOT advance `last_layer_drop_ms`. (Previously a skipped
+    ///     tick returned `false`, which the cascade misread as at-floor and could
+    ///     use to flip `layers_at_floor = true` and reach PauseTiles before any
+    ///     received layer had dropped; the `None` arm removes that overload.)
+    ///   - `Some(false)` = apply ran, nothing moved — every droppable/non-exempt
+    ///     received layer is already at floor.
+    ///   - `Some(true)` = apply ran and stepped at least one peer down a rung.
     ///
     /// The wall clock is read HERE at the `&self` boundary (this method only ever
     /// runs on wasm in production) and injected into the `Inner` helper, so the
     /// shared `Inner::seed_local_congestion_and_publish` is itself clock-free and
     /// host-testable with a fixed `now_ms`.
-    pub fn apply_local_cpu_pressure_congestion(&self) -> bool {
+    pub fn apply_local_cpu_pressure_congestion(&self) -> Option<bool> {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             let now_ms = js_sys::Date::now() as u64;
-            inner.seed_local_congestion_and_publish(now_ms)
+            // LOCAL CPU pressure: speaker stays sharp, so `exempt_speakers = true`.
+            Some(inner.seed_local_congestion_and_publish(now_ms, true))
         } else {
             warn!("apply_local_cpu_pressure_congestion: inner busy, layer step skipped this call");
-            false
+            // Option<bool> contract:
+            //   `None`        = borrow contended; the layer step was SKIPPED this
+            //                   tick. The cascade must NOT advance: leave
+            //                   `layers_at_floor` unchanged and do NOT advance
+            //                   `last_layer_drop_ms` — treat as "no movement, NOT at
+            //                   floor". (Previously this returned a `false` that the
+            //                   cascade misread as at-floor, letting a contended tick
+            //                   flip `layers_at_floor = true` and reach PauseTiles
+            //                   before any received layer had dropped; `None` removes
+            //                   that overload.)
+            //   `Some(false)` = apply ran, nothing moved — every droppable/non-exempt
+            //                   received layer is already at floor.
+            //   `Some(true)`  = apply ran and stepped at least one peer down a rung.
+            None
         }
     }
 
@@ -2918,7 +2943,16 @@ impl Inner {
     /// Keeping the clock OUT of this helper makes it host-testable: a plain
     /// `#[test]` can drive it with a fixed timestamp instead of trapping on the
     /// `js_sys::Date::now()` wasm-bindgen import.
-    fn seed_local_congestion_and_publish(&mut self, now_ms: u64) -> bool {
+    ///
+    /// `exempt_speakers` is passed straight through to
+    /// `seed_downlink_congestion_for_connected_peers`; this helper does not choose
+    /// the policy — the CALLERS do. The LOCAL CPU-pressure caller
+    /// (`apply_local_cpu_pressure_congestion`) passes `true` so the active speaker
+    /// stays sharp while the local decoder is the bottleneck, whereas the relay
+    /// DOWNLINK_CONGESTION caller passes `false` so the speaker's video is shed
+    /// under real downlink saturation (in the degenerate 1-on-1 the speaker IS the
+    /// only stream worth shedding).
+    fn seed_local_congestion_and_publish(&mut self, now_ms: u64, exempt_speakers: bool) -> bool {
         // Copy snapshot of the user's receive bounds to avoid aliasing the
         // `&mut peer_decode_manager` borrow below.
         let bounds = self.receive_layer_bounds;
@@ -2928,7 +2962,7 @@ impl Inner {
         // would no-op here because the real sample is not congested.
         let seeded = self
             .peer_decode_manager
-            .seed_downlink_congestion_for_connected_peers(now_ms, &bounds);
+            .seed_downlink_congestion_for_connected_peers(now_ms, &bounds, exempt_speakers);
         // Publish the resulting (possibly held) preference via the existing
         // change-detected sender, exactly as `set_receive_layer_bounds` does.
         let desired = self
@@ -4044,8 +4078,10 @@ impl Inner {
                             self.client_congestion_signals_received_total,
                         );
                     }
-                    // RESPONSE — unchanged, fires on EVERY self-targeted signal:
-                    self.seed_local_congestion_and_publish(now_ms);
+                    // RESPONSE — unchanged, fires on EVERY self-targeted signal.
+                    // exempt_speakers == false: under real downlink saturation the
+                    // speaker's video is the largest stream and must be shed too.
+                    self.seed_local_congestion_and_publish(now_ms, false);
                 }
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
@@ -4789,7 +4825,7 @@ mod cooldown_reset_hardening_tests {
         // The path under test: seed synthetic local-pressure congestion at a
         // FIXED now_ms and publish the resulting preference. Returns whether
         // anything was seeded.
-        let seeded = inner.seed_local_congestion_and_publish(2000);
+        let seeded = inner.seed_local_congestion_and_publish(2000, true);
         assert!(
             seeded,
             "local CPU-pressure seed must report it stepped a connected peer down"
