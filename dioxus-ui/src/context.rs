@@ -1438,6 +1438,13 @@ impl std::str::FromStr for Theme {
 #[derive(Clone, Copy)]
 pub struct ThemePreferenceCtx(pub Signal<Theme>);
 
+/// Context for the user-imported custom theme (single slot).
+///
+/// `Some(name)` = custom theme active (name for display).
+/// `None` = bundled default active.
+#[derive(Clone, Copy)]
+pub struct CustomThemeCtx(pub Signal<Option<String>>);
+
 const THEME_STORAGE_KEY: &str = "ui-theme";
 
 /// Load theme from localStorage; falls back to `Theme::Dark`.
