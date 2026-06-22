@@ -27,7 +27,7 @@ use crate::components::performance_settings::{
 use crate::constants::*;
 use crate::context::{
     load_preferred_device_ids, restore_device_id, save_preferred_camera_id, save_preferred_mic_id,
-    save_preferred_speaker_id, TransportPreferenceCtx, VideoCallClientCtx,
+    save_preferred_speaker_id, ProtectiveModeCtx, TransportPreferenceCtx, VideoCallClientCtx,
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
@@ -773,6 +773,18 @@ pub fn Host(
     // UI's source of truth for the selector positions.
     let performance_preference = use_signal(load_performance_preference);
 
+    // Issue #1558 stage 3 (encoder self-shed): the protective-mode report,
+    // published by the decode-budget loop in `AttendantsComponent`. Read here so
+    // BOTH the live perf-change callback and the reactive effect below compose the
+    // user's send-layer ceiling with protective mode's shed. `try_use_context` so
+    // `Host` mounted outside the attendants subtree (no provider) is a clean
+    // no-op.
+    let protective_mode_ctx = try_use_context::<ProtectiveModeCtx>();
+    // The current protective shed ceiling (a layer COUNT, or `None`), resolved
+    // without subscribing the callback to the signal (callbacks are not reactive).
+    let protective_ceiling_now =
+        move || protective_mode_ctx.and_then(|ctx| ctx.0.peek().encoder_layer_ceiling);
+
     // Apply a changed performance preference: persist it and push the inverted
     // best/worst bounds to the live encoder. The encoder stores them and
     // re-applies on every (re)start, so this works whether or not the camera is
@@ -799,15 +811,61 @@ pub fn Host(
             // the AQ control loop reads each tick (≤1s), composing it as a further
             // `min` with the union hint + ramp — so lowering it sheds the top
             // layer(s) at once and raising it re-earns them. None = Auto.
-            s.camera.set_user_layer_ceiling(pref.video_layers);
-            s.screen.set_user_layer_ceiling(pref.screen_layers);
+            // #1558: compose with the current protective shed so dragging the perf
+            // thumb while protective mode is active does NOT lift the shed (the
+            // more restrictive of the two binds). The reactive effect below also
+            // re-composes on the resulting `performance_preference` change.
+            let shed = protective_ceiling_now();
+            s.camera.set_user_layer_ceiling(
+                crate::components::decode_budget::compose_encoder_ceiling(pref.video_layers, shed),
+            );
+            s.screen.set_user_layer_ceiling(
+                crate::components::decode_budget::compose_encoder_ceiling(pref.screen_layers, shed),
+            );
             // Audio layer ceiling applies LIVE too: the mic encoder's per-layer
             // publish handlers read the shared atomic at publish time, so lowering
             // it stops sending the top audio layer(s) on the next frame and raising
-            // it resumes them — no mic restart, no audio interruption.
+            // it resumes them — no mic restart, no audio interruption. #1558: audio
+            // is NEVER degraded by protective mode, so the mic ceiling is the user's
+            // preference UNCOMPOSED.
             s.microphone.set_user_layer_ceiling(pref.audio_layers);
         })
     };
+
+    // Issue #1558 stage 3 (encoder self-shed): apply protective mode's LOCAL
+    // encoder send-layer ceiling to the camera + screen encoders, composed with
+    // the user's persisted "layers published" preference. The composition
+    // (`compose_encoder_ceiling`) takes the MORE restrictive of {user pref,
+    // protective shed} so neither clobbers the other, and reverts to the user's
+    // preference alone when protective mode releases (`encoder_layer_ceiling ==
+    // None`) — full reversibility. We do NOT touch the MICROPHONE encoder: audio
+    // is never degraded by protective mode (issue #1558 item 3). The actuator
+    // (`set_user_layer_ceiling`) feeds the AQ's top-side `min`, which cannot fight
+    // the encoder's own backpressure controller — so this never competes with the
+    // encoder's congestion control.
+    {
+        let state = state.clone();
+        use_effect(move || {
+            let Some(ProtectiveModeCtx(report_sig)) = protective_mode_ctx else {
+                return;
+            };
+            let report = report_sig();
+            let pref = performance_preference();
+            // VIDEO and SCREEN share the protective shed (both compete for the same
+            // encode CPU); each composes against its OWN user preference.
+            let video_ceiling = crate::components::decode_budget::compose_encoder_ceiling(
+                pref.video_layers,
+                report.encoder_layer_ceiling,
+            );
+            let screen_ceiling = crate::components::decode_budget::compose_encoder_ceiling(
+                pref.screen_layers,
+                report.encoder_layer_ceiling,
+            );
+            let s = state.borrow();
+            s.camera.set_user_layer_ceiling(video_ceiling);
+            s.screen.set_user_layer_ceiling(screen_ceiling);
+        });
+    }
 
     // Live snapshot reader for the VU meters. Returns `None` while the camera is
     // off so the meters show placeholders rather than a stale pinned tier.
