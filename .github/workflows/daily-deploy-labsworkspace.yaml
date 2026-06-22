@@ -365,6 +365,7 @@ jobs:
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n ${NAMESPACE} -o jsonpath='{.data.password}' | base64 -d)
 
           echo "Deploying Meeting API to ${NAMESPACE} with PKCE OAuth enabled..."
+          # NOTE: OAUTH_SECRET env var is intentionally empty for PKCE flow (public client, no static secret)
 
           helm upgrade --install videocall-api helm/meeting-api/ \
             --namespace ${NAMESPACE} \
@@ -386,7 +387,6 @@ jobs:
             --set "env[5].name=OAUTH_CLIENT_ID" \
             --set "env[5].value=client_01KVR3TZ42FAAM76MMKZ81A0TA" \
             --set "env[6].name=OAUTH_SECRET" \
-            # Empty for PKCE flow (public client, no static secret)
             --set "env[6].value=" \
             --set "env[7].name=OAUTH_REDIRECT_URL" \
             --set "env[7].value=https://app.videocall.labsworkspace.fnxlabs.com/auth/callback" \
