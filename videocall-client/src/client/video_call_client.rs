@@ -26,7 +26,7 @@ use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
-use crate::decode::peer_decode_manager::{PeerDecodeError, PeerReceiveDiag};
+use crate::decode::peer_decode_manager::{PeerDecodeError, PeerDeviceInfo, PeerReceiveDiag};
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
+use videocall_types::protos::health_packet::HealthPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
@@ -457,6 +458,16 @@ struct Inner {
     /// self-targeted CONGESTION sets BOTH so both publishers step down. Like the
     /// split `force_camera_keyframe` / `force_screen_keyframe` flags above.
     screen_congestion_step_down_requested: Arc<AtomicBool>,
+    /// Rolling 1-second window start (wall-clock ms) for rate-capping the
+    /// self-targeted DOWNLINK_CONGESTION `warn!`. See `congestion_warn_admit`.
+    congestion_warn_window_start_ms: u64,
+    /// Count of self-targeted CONGESTION `warn!`s emitted in the current
+    /// rolling window. Reset when the window rolls over (see `congestion_warn_admit`).
+    congestion_warn_count_in_window: u32,
+    /// Observability: total self-targeted DOWNLINK_CONGESTION signals received
+    /// (warned OR muted) for the lifetime of this client. Exposed via
+    /// `VideoCallClient::client_congestion_signals_received_total`.
+    client_congestion_signals_received_total: u64,
     /// CONGESTION-driven AUDIO simulcast layer-ceiling (issue #621). Unlike the
     /// camera/screen `AtomicBool` step-down FLAGS above — which are consumed
     /// (`swap(false)`) by an encoder AQ loop — this is a layer-COUNT atom shared
@@ -808,7 +819,7 @@ fn spawn_layer_switch_freshness_observer(inner: &Rc<RefCell<Inner>>) {
             let mut head_age_ms: Option<f64> = None;
             for m in &event.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(v)) => to_peer = Some(v.clone()),
+                    ("to_peer", MetricValue::Text(v)) => to_peer = Some(v.to_string()),
                     ("head_age_ms", MetricValue::F64(v)) => head_age_ms = Some(*v),
                     _ => {}
                 }
@@ -1126,17 +1137,13 @@ impl VideoCallClient {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
 
         let diagnostics = if options.enable_diagnostics {
-            let diagnostics = Rc::new(DiagnosticManager::new(options.user_id.clone()));
+            let mut diagnostics = DiagnosticManager::new(options.user_id.clone());
 
             if let Some(interval) = options.diagnostics_update_interval_ms {
-                let mut diag = DiagnosticManager::new(options.user_id.clone());
-                diag.set_reporting_interval(interval);
-                let diagnostics = Rc::new(diag);
-
-                Some(diagnostics)
-            } else {
-                Some(diagnostics)
+                diagnostics.set_reporting_interval(interval);
             }
+
+            Some(Rc::new(diagnostics))
         } else {
             None
         };
@@ -1266,6 +1273,9 @@ impl VideoCallClient {
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 screen_congestion_step_down_requested: screen_congestion_step_down_requested
                     .clone(),
+                congestion_warn_window_start_ms: 0,
+                congestion_warn_count_in_window: 0,
+                client_congestion_signals_received_total: 0,
                 audio_congestion_layer_ceiling: audio_congestion_layer_ceiling.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
                 // Relay layer-union hint atoms (issue #1108, Stage 3). None until
@@ -1566,6 +1576,13 @@ impl VideoCallClient {
                                 let desired = inner
                                     .peer_decode_manager
                                     .tick_layer_choosers(now_ms, &bounds);
+                                // #1561: snapshot the per-(peer,kind) desired layer
+                                // map into the health reporter for the next packet.
+                                if let Some(hr) = &inner.health_reporter {
+                                    if let Ok(reporter) = hr.try_borrow() {
+                                        reporter.update_received_layers(&desired);
+                                    }
+                                }
                                 if let Some(entries) = inner
                                     .layer_preference_sender
                                     .take_if_changed(&desired, now_ms)
@@ -2072,6 +2089,53 @@ impl VideoCallClient {
         }
     }
 
+    /// Lower this client's RECEIVED simulcast layer preferences in response to
+    /// LOCAL CPU/render pressure (Stage 1 of the #1562 decode-pressure cascade).
+    /// Called from the decode-budget loop on a Down edge. Composes with the relay
+    /// DOWNLINK_CONGESTION path: both want lower layers, and the chooser's one-rung
+    /// STEP + clean-window recovery make repeated seeds safe (floors at base; re-grows
+    /// when pressure clears). RECEIVER-ONLY: never touches the local publisher's
+    /// encoder.
+    ///
+    /// Returns an `Option<bool>` that distinguishes "skipped" from "no movement":
+    ///   - `None` = the `try_borrow_mut` was contended, so the layer step was
+    ///     SKIPPED this tick. The cascade must NOT advance: leave `layers_at_floor`
+    ///     unchanged and do NOT advance `last_layer_drop_ms`. (Previously a skipped
+    ///     tick returned `false`, which the cascade misread as at-floor and could
+    ///     use to flip `layers_at_floor = true` and reach PauseTiles before any
+    ///     received layer had dropped; the `None` arm removes that overload.)
+    ///   - `Some(false)` = apply ran, nothing moved — every droppable/non-exempt
+    ///     received layer is already at floor.
+    ///   - `Some(true)` = apply ran and stepped at least one peer down a rung.
+    ///
+    /// The wall clock is read HERE at the `&self` boundary (this method only ever
+    /// runs on wasm in production) and injected into the `Inner` helper, so the
+    /// shared `Inner::seed_local_congestion_and_publish` is itself clock-free and
+    /// host-testable with a fixed `now_ms`.
+    pub fn apply_local_cpu_pressure_congestion(&self) -> Option<bool> {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            let now_ms = js_sys::Date::now() as u64;
+            // LOCAL CPU pressure: speaker stays sharp, so `exempt_speakers = true`.
+            Some(inner.seed_local_congestion_and_publish(now_ms, true))
+        } else {
+            warn!("apply_local_cpu_pressure_congestion: inner busy, layer step skipped this call");
+            // Option<bool> contract:
+            //   `None`        = borrow contended; the layer step was SKIPPED this
+            //                   tick. The cascade must NOT advance: leave
+            //                   `layers_at_floor` unchanged and do NOT advance
+            //                   `last_layer_drop_ms` — treat as "no movement, NOT at
+            //                   floor". (Previously this returned a `false` that the
+            //                   cascade misread as at-floor, letting a contended tick
+            //                   flip `layers_at_floor = true` and reach PauseTiles
+            //                   before any received layer had dropped; `None` removes
+            //                   that overload.)
+            //   `Some(false)` = apply ran, nothing moved — every droppable/non-exempt
+            //                   received layer is already at floor.
+            //   `Some(true)`  = apply ran and stepped at least one peer down a rung.
+            None
+        }
+    }
+
     /// The user's current RECEIVE-side layer bounds (issue #989, Phase 4), for
     /// the UI to render its current min/max selection. Default fully-open.
     pub fn receive_layer_bounds(&self) -> ReceiveLayerBounds {
@@ -2131,6 +2195,36 @@ impl VideoCallClient {
             .unwrap_or_default()
     }
 
+    /// #1482: returns a remote peer's self-reported device/hardware metrics by
+    /// relay `session_id`, or `None` when the peer is unknown / has reported no
+    /// metric (all fields default). The UI polls this each render via the
+    /// diagnostics-reader closure and the signal-quality popup, so it must read
+    /// LIVE state every call — it does (it locks the inner and reads through to
+    /// [`PeerDecodeManager::peer_device_info`] on every invocation; no value is
+    /// captured or cached at the call site). Read-only on the manager, so it
+    /// borrows the inner immutably; returns `None` on a transient borrow clash
+    /// rather than blocking the render.
+    pub fn peer_device_info(&self, session_id: u64) -> Option<crate::decode::PeerDeviceInfo> {
+        self.inner
+            .try_borrow()
+            .ok()
+            .and_then(|inner| inner.peer_decode_manager.peer_device_info(session_id))
+    }
+
+    /// issue 1482: every known peer's self-reported device info for the
+    /// diagnostics "Device (per peer)" section. Unlike `per_peer_received_snapshots`
+    /// (which lists only peers with media flowing), this returns device metrics for
+    /// ALL peers — including a camera-off peer whose HEALTH packets carry device
+    /// info but who isn't currently in the receive list. Returns `(session_id,
+    /// label, info)`; empty on a transient borrow clash so the render never blocks.
+    pub fn all_peer_device_info(&self) -> Vec<(u64, String, crate::decode::PeerDeviceInfo)> {
+        self.inner
+            .try_borrow()
+            .ok()
+            .map(|inner| inner.peer_decode_manager.all_peer_device_info())
+            .unwrap_or_default()
+    }
+
     /// Returns a shared reference to the camera force-keyframe flag.
     ///
     /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
@@ -2183,6 +2277,15 @@ impl VideoCallClient {
     /// the cut works even when the camera is off (audio-only).
     pub fn audio_congestion_layer_ceiling(&self) -> Arc<AtomicU32> {
         self.inner.borrow().audio_congestion_layer_ceiling.clone()
+    }
+
+    /// Returns the lifetime total of self-targeted DOWNLINK_CONGESTION signals
+    /// received by this client (warned OR muted — see issue #628). Observability
+    /// counterpart to the per-second `warn!` rate cap: muted signals still bump
+    /// this counter, so a signal storm stays measurable even when its logs are
+    /// de-amplified to `debug!`.
+    pub fn client_congestion_signals_received_total(&self) -> u64 {
+        self.inner.borrow().client_congestion_signals_received_total
     }
 
     /// Returns a shared reference to the re-election completed signal.
@@ -2298,6 +2401,12 @@ impl VideoCallClient {
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
+        // #1561: screen + audio layer metrics
+        effective_screen_layers: u32,
+        active_screen_layers: Rc<AtomicU32>,
+        effective_audio_layers: u32,
+        audio_congestion_ceiling: Arc<AtomicU32>,
+        audio_user_layer_ceiling: Rc<AtomicU32>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -2314,6 +2423,11 @@ impl VideoCallClient {
                         dwell_samples,
                         effective_video_layers,
                         active_video_layers,
+                        effective_screen_layers,
+                        active_screen_layers,
+                        effective_audio_layers,
+                        audio_congestion_ceiling,
+                        audio_user_layer_ceiling,
                     );
                 }
             }
@@ -2730,6 +2844,45 @@ impl VideoCallClient {
     }
 }
 
+/// Clamp a peer-controlled label to 64 chars (char-boundary-safe — `chars().take`
+/// never splits a multibyte sequence, unlike `String::truncate`). DoS/bloat guard:
+/// a hostile peer could otherwise push multi-MB strings that stick via the merge.
+fn clamp_label(s: Option<String>) -> Option<String> {
+    s.map(|v| v.chars().take(64).collect())
+}
+
+/// Max self-targeted DOWNLINK_CONGESTION `warn!`s emitted per rolling 1-second
+/// window before the handler drops to `debug!` (issue #628). The congestion
+/// RESPONSE (seed + layer-preference publish) is unaffected — only log verbosity
+/// is capped, so a signal storm cannot stall the wasm console.
+const CONGESTION_WARN_MAX_PER_SEC: u32 = 3;
+
+/// Returns true if this self-targeted congestion signal should be `warn!`-logged
+/// (vs `debug!`), applying a per-second cap. Mutates the rolling window in place:
+/// if `now_ms` is >= 1000ms past `window_start_ms`, the window resets (start =
+/// now, count = 0). Admits (returns true and increments the count) only while the
+/// in-window count is below `max_per_sec`. Pure: no clock, no I/O — caller injects
+/// `now_ms`, so a host `#[test]` can drive it deterministically.
+fn congestion_warn_admit(
+    now_ms: u64,
+    window_start_ms: &mut u64,
+    count_in_window: &mut u32,
+    max_per_sec: u32,
+) -> bool {
+    // saturating_sub: tolerate a non-monotonic clock (now_ms < window_start_ms)
+    // without underflow — treat as "still in window".
+    if now_ms.saturating_sub(*window_start_ms) >= 1000 {
+        *window_start_ms = now_ms;
+        *count_in_window = 0;
+    }
+    if *count_in_window < max_per_sec {
+        *count_in_window += 1;
+        true
+    } else {
+        false
+    }
+}
+
 impl Inner {
     /// Returns `true` if this peer event was already seen recently (within 30 s).
     ///
@@ -2770,6 +2923,60 @@ impl Inner {
         } else {
             true // duplicate
         }
+    }
+
+    /// Seed synthetic downlink congestion into every connected peer's receiver-side
+    /// LayerChooser (video+screen, audio protected) and publish the resulting layer
+    /// preference change through the change-detected sender. Returns whether anything
+    /// was seeded. Shared by BOTH the relay DOWNLINK_CONGESTION arm (#1219 Half 2) and
+    /// the LOCAL CPU-pressure path (#1569) so the two seed+publish bodies cannot drift.
+    /// STEP, not latch: the chooser's clean-window recovery re-grows layers when
+    /// pressure clears. Caller is responsible for any self-target gating (the relay arm
+    /// gates on session_id; local pressure has no session to gate).
+    ///
+    /// LOG-FREE on purpose: the relay arm keeps its own `warn!` above the call and the
+    /// local budget-loop caller relies on its existing cap-transition log, so a `warn!`
+    /// here would double-log on the relay path.
+    ///
+    /// `now_ms` is injected by the caller (one wall clock per cycle), mirroring
+    /// `seed_downlink_congestion_for_connected_peers` / `current_desired_preferences`.
+    /// Keeping the clock OUT of this helper makes it host-testable: a plain
+    /// `#[test]` can drive it with a fixed timestamp instead of trapping on the
+    /// `js_sys::Date::now()` wasm-bindgen import.
+    ///
+    /// `exempt_speakers` is passed straight through to
+    /// `seed_downlink_congestion_for_connected_peers`; this helper does not choose
+    /// the policy — the CALLERS do. The LOCAL CPU-pressure caller
+    /// (`apply_local_cpu_pressure_congestion`) passes `true` so the active speaker
+    /// stays sharp while the local decoder is the bottleneck, whereas the relay
+    /// DOWNLINK_CONGESTION caller passes `false` so the speaker's video is shed
+    /// under real downlink saturation (in the degenerate 1-on-1 the speaker IS the
+    /// only stream worth shedding).
+    fn seed_local_congestion_and_publish(&mut self, now_ms: u64, exempt_speakers: bool) -> bool {
+        // Copy snapshot of the user's receive bounds to avoid aliasing the
+        // `&mut peer_decode_manager` borrow below.
+        let bounds = self.receive_layer_bounds;
+        // Synthetic forced-congestion step-down: feeds a synthetic congested
+        // sample into each peer's chooser, independent of the real (zero on
+        // lossless transports) `last_video_downlink`. The early-seed primitive
+        // would no-op here because the real sample is not congested.
+        let seeded = self
+            .peer_decode_manager
+            .seed_downlink_congestion_for_connected_peers(now_ms, &bounds, exempt_speakers);
+        // Publish the resulting (possibly held) preference via the existing
+        // change-detected sender, exactly as `set_receive_layer_bounds` does.
+        let desired = self
+            .peer_decode_manager
+            .current_desired_preferences(now_ms, &bounds);
+        if let Some(entries) = self
+            .layer_preference_sender
+            .take_if_changed(&desired, now_ms)
+        {
+            let user_id = self.options.user_id.clone();
+            let cc = self.connection_controller.clone();
+            send_layer_preference_via(&cc, &user_id, entries);
+        }
+        seeded
     }
 
     /// Returns `true` if this host action event was already seen within the
@@ -2887,8 +3094,15 @@ impl Inner {
         // video/screen flags use `Release` only to pair with the `swap(false)`
         // `AcqRel` consume in their AQ loops; the audio ceiling has no such
         // consume, so do not "upgrade" this to `Release`.
-        self.audio_congestion_layer_ceiling
-            .store(1, Ordering::Relaxed);
+        let prev = self
+            .audio_congestion_layer_ceiling
+            .swap(1, Ordering::Relaxed);
+        if prev != 1 {
+            log::info!(
+                "MicrophoneEncoder: congestion ceiling cut to 1 layer (was {})",
+                prev
+            );
+        }
     }
 
     /// Returns the [`PeerStatus`] of the (possibly newly-created) peer so the
@@ -3073,10 +3287,73 @@ impl Inner {
                 }
             }
             Ok(PacketType::HEALTH) => {
-                debug!(
-                    "Received unexpected health packet from {}, ignoring",
-                    String::from_utf8_lossy(&response.user_id)
-                );
+                // #1482: a remote peer's self-reported device/hardware metrics.
+                // Never our own — we already publish (not consume) our health,
+                // and a self HEALTH would overwrite a remote slot. Skip first.
+                if self.own_session_id == Some(response.session_id) {
+                    return peer_status;
+                }
+                // FAN-OUT/PERF: HealthPackets arrive ~0.2 Hz PER remote peer
+                // (5 s default interval), so this arm is O(peers) per 5 s. Keep
+                // it CHEAP — parse + update the per-peer fields in place. The arm
+                // body emits no signal/callback and writes no UI state (pull-style;
+                // the UI reads via `peer_device_info`). Note: peer creation and the
+                // resulting on_peer_added are handled by the shared tail return as
+                // for every packet type, not by this arm.
+                match HealthPacket::parse_from_bytes(&response.data) {
+                    Ok(hp) => {
+                        // `hp` is owned and not used after this, so MOVE the
+                        // String fields out instead of cloning them.
+                        let info = PeerDeviceInfo {
+                            // bound peer-controlled core count to a sane range so a
+                            // hostile peer can't report an absurd value; out-of-range
+                            // -> None (no fabricated default), matching the float
+                            // and string guards below. #1482: cores come from the
+                            // TELEM-7 client-metadata field 56 (client_cores), which
+                            // the sender populates from navigator.hardwareConcurrency.
+                            // Absent senders omit it (proto3 None); a hostile/absent 0
+                            // is dropped by the `>= 1` bound (never a fabricated 0).
+                            client_cores: hp.client_cores.filter(|c| *c >= 1 && *c <= 1024),
+                            // clamp peer-controlled labels (DoS/bloat guard): a
+                            // hostile peer could otherwise push multi-MB strings
+                            // that stick via the merge's `incoming.or(existing)`.
+                            // #1482: architecture comes from the TELEM-7 client-metadata
+                            // field 57 (client_architecture), populated from the
+                            // userAgentData high-entropy "architecture". Honest absence:
+                            // the sender only sets field 57 when non-empty, so an honest
+                            // sender yields None here (proto3 absent), never Some("").
+                            client_architecture: clamp_label(hp.client_architecture),
+                            client_os: clamp_label(hp.client_os),
+                            client_device_type: clamp_label(hp.client_device_type),
+                            // sanitize peer-controlled floats (NaN/negative/huge) so
+                            // a hostile value can't drive a broken UI gauge.
+                            client_main_thread_load: hp
+                                .client_main_thread_load
+                                .filter(|v| v.is_finite())
+                                .map(|v| v.clamp(0.0, 1.0)),
+                            // HealthPacket.memory_used_bytes (field 12) is in
+                            // BYTES; convert to the `_mb` field by dividing by
+                            // 1 MiB (1024 * 1024). The unit is mebibytes (MiB),
+                            // matching the codebase's existing heap-size labels;
+                            // it is not decimal megabytes.
+                            client_memory_used_mb: hp
+                                .memory_used_bytes
+                                .map(|b| b as f64 / (1024.0 * 1024.0)),
+                            client_device_memory_gb: hp
+                                .client_device_memory_gb
+                                .filter(|v| v.is_finite() && *v > 0.0),
+                        };
+                        // Keyed by relay session_id (u64) — the SAME key MEDIA
+                        // uses (NOT response.user_id bytes).
+                        self.peer_decode_manager
+                            .set_peer_device_info(response.session_id, info);
+                    }
+                    Err(e) => {
+                        debug!("Failed to parse HEALTH packet: {e}");
+                    }
+                }
+                // Fall through to the shared tail return (like the DIAGNOSTICS
+                // sibling arm); do NOT early-return after storing.
             }
             Ok(PacketType::SESSION_ASSIGNED) => {
                 info!(
@@ -3772,33 +4049,39 @@ impl Inner {
                         response.session_id, self.own_session_id,
                     );
                 } else {
-                    warn!(
-                        "Received DOWNLINK_CONGESTION signal from relay — downlink saturated; \
-                         stepping down receive layer preferences (#1219 Half 2)"
-                    );
                     let now_ms = js_sys::Date::now() as u64;
-                    // Copy snapshot of the user's receive bounds to avoid aliasing the
-                    // `&mut peer_decode_manager` borrow below.
-                    let bounds = self.receive_layer_bounds;
-                    // Synthetic forced-congestion step-down: feeds a synthetic congested
-                    // sample into each peer's chooser, independent of the real (zero on
-                    // lossless transports) `last_video_downlink`. The early-seed primitive
-                    // would no-op here because the real sample is not congested.
-                    self.peer_decode_manager
-                        .seed_downlink_congestion_for_connected_peers(now_ms, &bounds);
-                    // Publish the resulting (possibly held) preference via the existing
-                    // change-detected sender, exactly as `set_receive_layer_bounds` does.
-                    let desired = self
-                        .peer_decode_manager
-                        .current_desired_preferences(now_ms, &bounds);
-                    if let Some(entries) = self
-                        .layer_preference_sender
-                        .take_if_changed(&desired, now_ms)
-                    {
-                        let user_id = self.options.user_id.clone();
-                        let cc = self.connection_controller.clone();
-                        send_layer_preference_via(&cc, &user_id, entries);
+                    // Observability: count EVERY self-targeted signal (warned or muted).
+                    self.client_congestion_signals_received_total += 1;
+                    // Rate-cap ONLY the log verbosity (issue #628). The congestion
+                    // RESPONSE below runs unconditionally on every self-targeted signal.
+                    let admit = congestion_warn_admit(
+                        now_ms,
+                        &mut self.congestion_warn_window_start_ms,
+                        &mut self.congestion_warn_count_in_window,
+                        CONGESTION_WARN_MAX_PER_SEC,
+                    );
+                    if admit {
+                        warn!(
+                            "Received DOWNLINK_CONGESTION signal from relay — downlink saturated; \
+                             stepping down receive layer preferences (#1219 Half 2)"
+                        );
+                    } else {
+                        // Storm de-amplification: dropped to debug! so the info isn't
+                        // lost — carry the per-window warned count (pinned at the cap on
+                        // this muted path) + the lifetime running total. The running
+                        // total is the real storm-magnitude signal, since when this
+                        // branch fires `congestion_warn_count_in_window` is always the cap.
+                        debug!(
+                            "DOWNLINK_CONGESTION signal muted (>{} warn!/s); {} warned this window (cap), {} total (#628)",
+                            CONGESTION_WARN_MAX_PER_SEC,
+                            self.congestion_warn_count_in_window,
+                            self.client_congestion_signals_received_total,
+                        );
                     }
+                    // RESPONSE — unchanged, fires on EVERY self-targeted signal.
+                    // exempt_speakers == false: under real downlink saturation the
+                    // speaker's video is the largest stream and must be shed too.
+                    self.seed_local_congestion_and_publish(now_ms, false);
                 }
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
@@ -4432,6 +4715,9 @@ mod cooldown_reset_hardening_tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use videocall_types::Callback;
+    // Receiver-side layer-chooser types, mirroring the host primitives in
+    // `peer_decode_manager.rs` (e.g. `downlink_congestion_steps_down_with_zero_loss`).
+    use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
 
     fn build_test_client() -> VideoCallClient {
         VideoCallClient::new(VideoCallClientOptions {
@@ -4481,6 +4767,92 @@ mod cooldown_reset_hardening_tests {
             is_guest: false,
             allow_post_rebase_retry: true,
         })
+    }
+
+    /// HOST `#[test]` (NOT `#[wasm_bindgen_test]`): the local CPU-pressure
+    /// seed+publish path is driven through the clock-free `Inner` helper
+    /// `seed_local_congestion_and_publish` (issue #1569), so it runs on the
+    /// native host target under `cargo test -p videocall-client --lib`. This is
+    /// the PER-PR HOST gate for the new shared seed path — unlike the now-deleted
+    /// `#[wasm_bindgen_test]` (which was `run_in_browser` and so ran ONLY under a
+    /// `/run-e2e` browser dispatch, never in per-PR CI). It asserts the REAL
+    /// step-down, not just "the method is wired".
+    ///
+    /// MUTATION CHECK: gut `Inner::seed_local_congestion_and_publish` to
+    /// `return false;` (or remove its
+    /// `seed_downlink_congestion_for_connected_peers` call) and ALL THREE
+    /// assertions below fail: (1) `seeded` becomes `false`; (2) the peer's chooser
+    /// stays at layer 2 instead of stepping to 1 (nothing seeded the synthetic
+    /// congestion); (3) `current_desired_preferences` no longer advertises
+    /// `Some(1)` for the peer's video, because the chooser never dropped below
+    /// the climbed-to top. The seeded peer reports ZERO real loss, so the
+    /// early-seed path cannot mask a gutted helper — only the synthetic seed in
+    /// the helper can produce the step-down.
+    ///
+    /// BORROW NOTE: `inner` is borrowed once for the whole test and the `Inner`
+    /// method is called DIRECTLY on it. We deliberately do NOT call the public
+    /// `client.apply_local_cpu_pressure_congestion()` here — that would re-borrow
+    /// `client.inner` while this guard is held and panic. The public wrapper only
+    /// reads the wall clock and forwards to this same helper, which is what we
+    /// test directly with a fixed `now_ms`.
+    #[test]
+    fn local_cpu_pressure_steps_connected_peer_down_one_rung() {
+        let client = build_test_client();
+        let mut inner = client.inner.borrow_mut();
+
+        // Seed a CONNECTED peer with a learned 3-layer ladder and a ZERO-LOSS
+        // real downlink sample (the WebSocket / reliable-WT blindness case): the
+        // only thing that can step it down is the synthetic seed inside the
+        // helper under test.
+        inner
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(700);
+
+        // One clean unconstrained tick climbs the chooser to the TOP (layer 2),
+        // so the synthetic seed has room to step DOWN from 2 to 1.
+        let open = ReceiveLayerBounds::default();
+        let _ = inner.peer_decode_manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "precondition: chooser climbed to the top before the local-pressure seed"
+        );
+
+        // The path under test: seed synthetic local-pressure congestion at a
+        // FIXED now_ms and publish the resulting preference. Returns whether
+        // anything was seeded.
+        let seeded = inner.seed_local_congestion_and_publish(2000, true);
+        assert!(
+            seeded,
+            "local CPU-pressure seed must report it stepped a connected peer down"
+        );
+
+        // The receiver-side decode guard stepped down exactly one rung: 2 -> 1.
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "local CPU-pressure seed must step the peer's video chooser down one rung (2 -> 1)"
+        );
+
+        // And the lowered preference is advertised through the change-detected
+        // sender's desired map.
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .current_desired_preferences(2000, &open)
+                .get(&(700, PrefMediaKind::Video))
+                .copied(),
+            Some(1),
+            "the stepped-down receive-layer preference must be advertised for the peer"
+        );
     }
 
     #[test]
@@ -4904,6 +5276,63 @@ mod self_peer_suppression_tests {
         assert!(
             suppresses_peer_creation_for_packet(&system, true),
             "system-user packets must be suppressed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod congestion_warn_admit_tests {
+    use super::{congestion_warn_admit, CONGESTION_WARN_MAX_PER_SEC};
+
+    #[test]
+    fn congestion_warn_admit_caps_per_second_and_resets_per_window() {
+        // 1000 signals all inside a single 100ms span (< 1s) => one window =>
+        // at most CONGESTION_WARN_MAX_PER_SEC admits (warns). Mutation guard:
+        // if the cap is removed (always-true), this count becomes 1000 and the
+        // assertion below fails.
+        let base: u64 = 10_000;
+        let mut start_ms: u64 = 0;
+        let mut count: u32 = 0;
+        let mut admits = 0u32;
+        // First call seeds the window (start_ms 0 -> base, since base-0 >= 1000),
+        // so all 1000 fall in one window after the seed.
+        for i in 0..1000u64 {
+            let now = base + (i % 100); // span = [base, base+99] => 100ms < 1s
+            if congestion_warn_admit(now, &mut start_ms, &mut count, CONGESTION_WARN_MAX_PER_SEC) {
+                admits += 1;
+            }
+        }
+        assert!(
+            admits <= CONGESTION_WARN_MAX_PER_SEC,
+            "single-window admits {} must be <= cap {}",
+            admits,
+            CONGESTION_WARN_MAX_PER_SEC
+        );
+        assert!(admits >= 1, "at least one signal must warn");
+
+        // Across a 3000ms span the window resets each second, so admits are
+        // bounded by ~3 windows * cap. Proves the window actually rolls over.
+        let mut start2: u64 = 0;
+        let mut count2: u32 = 0;
+        let mut admits2 = 0u32;
+        for i in 0..1000u64 {
+            let now = base + i * 3; // i in 0..1000 => span 0..2997ms => 3 full seconds
+            if congestion_warn_admit(now, &mut start2, &mut count2, CONGESTION_WARN_MAX_PER_SEC) {
+                admits2 += 1;
+            }
+        }
+        // 3000ms / 1000ms = 3 windows (plus the seed window) => <= 4*cap is a safe
+        // upper bound; the key point vs the single-window case is admits2 > cap.
+        assert!(
+            admits2 > CONGESTION_WARN_MAX_PER_SEC,
+            "multi-second admits {} must exceed single-window cap {} (window must reset)",
+            admits2,
+            CONGESTION_WARN_MAX_PER_SEC
+        );
+        assert!(
+            admits2 <= 4 * CONGESTION_WARN_MAX_PER_SEC,
+            "multi-second admits {} should be bounded by ~window count * cap",
+            admits2
         );
     }
 }

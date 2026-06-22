@@ -643,8 +643,28 @@ impl SessionLogic {
             }
             PacketKind::Health => {
                 trace!("Health packet from {}", self.user_id);
+                // #1482: process for server-side NATS telemetry AND forward to peers
+                // so each peer's client can read the sender's self-reported
+                // device/hardware metrics (peer_device_info). Previously returned
+                // Processed, which consumed the packet and starved the per-peer
+                // Device UI of data. HEALTH carries no media and is unencrypted; the
+                // outbound observer allowlist in ChatServer::handle_msg still drops it
+                // for waiting-room observers, so isolation is preserved.
+                // No observer guard here (unlike Data/KeyframeRequest): an observer
+                // may publish HEALTH and it is forwarded — intentional, as HEALTH is
+                // non-media diagnostics, mirroring the RTT arm's observer policy.
+                //
+                // #1543: the FULL packet goes to the server-side NATS telemetry path
+                // FIRST (operators rely on the heavy per-peer `peer_stats` map). Then
+                // the PEER fan-out is TRIMMED to only the device fields the peer UI
+                // reads (`trim_health_packet_for_peers`), dropping `peer_stats` and
+                // every other unread field — this breaks the O(N²) relay egress at
+                // scale. The trim parses + re-serializes ONCE here (O(1) per inbound
+                // HEALTH), BEFORE the relay's per-recipient fan-out, so it is never
+                // repeated per recipient.
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
-                InboundAction::Processed
+                let trimmed = health_processor::trim_health_packet_for_peers(data);
+                InboundAction::Forward(Arc::new(trimmed))
             }
             PacketKind::KeyframeRequest {
                 target_user_id,

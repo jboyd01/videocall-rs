@@ -864,6 +864,391 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
+  // 3a. LOCAL CPU pressure steps the RECEIVED simulcast layer DOWN (issue #1569).
+  //
+  // WHAT #1569 CHANGED (RECEIVER-ONLY): the dioxus decode-budget loop
+  // (attendants.rs) now, on the SAME Down edge that already pauses/hides peer
+  // tiles (Stage 2), ALSO calls `VideoCallClient::apply_local_cpu_pressure_
+  // congestion()` (Stage 1). That seeds synthetic downlink congestion into every
+  // connected peer's receiver-side LayerChooser and publishes a lower
+  // LAYER_PREFERENCE — i.e. under LOCAL CPU/render pressure this client now
+  // requests a LOWER-RESOLUTION stream from its peers. Before #1569 the decode
+  // budget ONLY shed tiles; it never stepped the received layer down. The only
+  // pre-existing path that lowered received layers was the relay
+  // DOWNLINK_CONGESTION signal (a NETWORK trigger) — never local CPU.
+  //
+  // HOW THIS TEST OBSERVES IT (no network impairment, no toxiproxy):
+  //   1. A 2-context publisher+receiver call with a forced >1-layer ladder
+  //      (`capabilityMaxLayersOverride: 3`), exactly like test #3. The receiver
+  //      climbs above the base layer on a HEALTHY downlink.
+  //   2. We then drive the receiver's decode-budget loop to a sustained Down
+  //      edge purely with the deterministic test hook
+  //      `window.__videocall_inject_render_fps(LOW_FPS)` (registered when
+  //      MOCK_PEERS_ENABLED=true, which the e2e stack sets globally — it does NOT
+  //      block real peers; the real publisher is still a live connected peer in
+  //      the receiver's `connected_peers`). LOW_FPS sits below FPS_STEP_DOWN and
+  //      above FPS_SEVERE so the loop takes a single-tile Down step (no severe
+  //      multi-drop), and on that Down edge fires
+  //      `apply_local_cpu_pressure_congestion()`.
+  //   3. The OBSERVABLE SIGNAL is the same one tests #1/#3 read — the receiver's
+  //      `#perf-vu-recv-video-readout` layer index (`readVideoLayer().layerIndex`).
+  //      With #1569 present it must DROP toward base (the new Stage-1 actuator
+  //      published a lower preference). With #1569 reverted, sustained low FPS
+  //      still sheds tiles but NEVER lowers the received layer, so the index
+  //      would stay at the top rung — this test FAILS on revert. That is the
+  //      mutation-sensitive proof that the new layer-down path actually fired.
+  //
+  // Why the layer-down is feasible here (and why the prerequisites are real):
+  //   - `seed_downlink_congestion_for_connected_peers` only publishes a lower
+  //     preference for a peer whose `highest_available >= 1` (a >=2-layer video
+  //     ladder). The `capabilityMaxLayersOverride: 3` forces that ladder past the
+  //     low-core container clamp; the `layerCount <= 1` skip guard degrades to a
+  //     SKIP (not a false negative) if some future runner still clamps to 1.
+  //   - The DOWN step needs `SUSTAIN_SAMPLES` low samples and respects
+  //     `STEP_DOWN_COOLDOWN_MS`; the inject cadence below mirrors
+  //     decode-budget.spec.ts (the proven driver of this same loop).
+  //
+  // UN-FIXME rationale matches test #3: the serial-describe + launch-flag
+  // renderer mitigation lets the 2-context join survive on CI, and the override
+  // forces the multi-layer headroom the layer-down needs.
+  //
+  // Mirrors of dioxus-ui/src/components/decode_budget.rs (keep in sync; same
+  // consts decode-budget.spec.ts pins — a retune there must update both specs).
+  // -------------------------------------------------------------------------
+  test("local CPU pressure steps the received simulcast layer DOWN (#1569)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_cpu_down_${Date.now()}`;
+
+    // --- Decode-budget loop consts (mirror decode_budget.rs / decode-budget.spec.ts). ---
+    // FPS_SEVERE (12) is the median FPS at/below which a down-step drops MULTIPLE
+    // tiles; LOW_FPS below is kept strictly ABOVE it so the DOWN phase takes
+    // single-tile / single-rung steps (the severe multi-drop is covered by Rust
+    // unit tests, not this timing-sensitive E2E).
+    const FPS_STEP_DOWN = 24; // FPS at/below which the loop considers stepping DOWN
+    const SUSTAIN_SAMPLES = 3; // consecutive 1 Hz samples required before a step
+    const STEP_DOWN_COOLDOWN_MS = 2000; // min ms between two DOWN steps
+    // LOW_FPS sits in the MILD band (above SEVERE=12, below STEP_DOWN=24) so the
+    // DOWN phase takes single-tile / single-rung steps.
+    const LOW_FPS = FPS_STEP_DOWN - 6; // 18: < FPS_STEP_DOWN, > FPS_SEVERE (12)
+    // Slightly above the loop's 1 s bucket cadence so each injection lands in a
+    // fresh bucket and accumulates wall-time for the down cooldown.
+    const INJECT_INTERVAL_MS = 1200;
+    const COOLDOWN_DOWN_SAMPLES = Math.ceil(STEP_DOWN_COOLDOWN_MS / INJECT_INTERVAL_MS) + 1;
+    // A few SUSTAIN windows plus cooldown headroom for CI jitter: enough samples
+    // for at least one Down step (which fires the new layer-down call) to land.
+    const MAX_DOWN_SAMPLES = SUSTAIN_SAMPLES + 4 * COOLDOWN_DOWN_SAMPLES;
+
+    const injectFps = (page: Page, fps: number) =>
+      page.evaluate(
+        (v) =>
+          (
+            window as unknown as { __videocall_inject_render_fps?: (n: number) => void }
+          ).__videocall_inject_render_fps?.(v),
+        fps,
+      );
+    const hasInjectHook = (page: Page) =>
+      page.evaluate(
+        () =>
+          typeof (window as unknown as { __videocall_inject_render_fps?: unknown })
+            .__videocall_inject_render_fps === "function",
+      );
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub-cpu@videocall.rs",
+        "SimPublisherCpu",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx-cpu@videocall.rs",
+        "SimReceiverCpu",
+        uiURL,
+      );
+      // #1093 override forces a multi-layer ladder so the received layer has
+      // headroom to step DOWN (a single-layer runner has nothing below base).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "SimPublisherCpu");
+      await joinMeeting(rxPage, meetingId, "SimReceiverCpu");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
+      // take effect; runs before the skip guard so a broken override fails loud.
+      await assertCapabilityOverrideActive(pubConsole);
+
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      await openPerformancePanel(rxPage);
+
+      // The CPU-pressure layer-down hook is gated on MOCK_PEERS_ENABLED. If the
+      // stack was brought up without it, the new path cannot be driven — skip
+      // rather than assert a false negative. (The e2e compose sets it true.)
+      if (!(await hasInjectHook(rxPage))) {
+        test.skip(
+          true,
+          "window.__videocall_inject_render_fps not registered (MOCK_PEERS_ENABLED off)",
+        );
+      }
+
+      // PHASE 1 — let the receiver climb ABOVE the base layer on a healthy
+      // downlink, so a DOWN step is actually observable (otherwise it is already
+      // pinned at 0 and there is nothing to step down). SKIP on a single-layer
+      // runner (capability ceiling) rather than assert a false negative.
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage)) !== null, {
+          timeout: 45_000,
+          intervals: [500, 1000, 2000],
+        })
+        .toBe(true);
+
+      const before = await readVideoLayer(rxPage);
+      const layerCount = before!.layerCount;
+      test.skip(
+        layerCount <= 1,
+        `single-layer ladder (count=${layerCount}); the received layer has no headroom ` +
+          "to step DOWN under CPU pressure on this runner (capability ceiling). " +
+          "See helpers/simulcast-config.ts",
+      );
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      const startIndex = (await readVideoLayer(rxPage))!.layerIndex;
+      expect(
+        startIndex,
+        "receiver must be above the base layer before we apply CPU pressure",
+      ).toBeGreaterThan(0);
+
+      // PHASE 2 — drive the decode-budget loop to a sustained Down edge purely
+      // with synthetic LOW FPS (no network impairment). On the Down edge the
+      // #1569 actuator publishes a LOWER received-layer preference, so the
+      // receiver's layer index must drop BELOW where it started — and, because
+      // LOW_FPS is held, eventually reach base (index 0). We feed samples until
+      // the index drops or we exhaust the budget.
+      await expect
+        .poll(
+          async () => {
+            await injectFps(rxPage, LOW_FPS);
+            await rxPage.waitForTimeout(INJECT_INTERVAL_MS);
+            // null readout (transient "Not receiving" while re-selecting a lower
+            // rung) counts as 0 = below the start index.
+            return (await readVideoLayer(rxPage))?.layerIndex ?? 0;
+          },
+          {
+            timeout: MAX_DOWN_SAMPLES * (INJECT_INTERVAL_MS + 500),
+            intervals: [INJECT_INTERVAL_MS],
+          },
+        )
+        .toBeLessThan(startIndex);
+
+      // The #1569 actuator steps the received layer down AT LEAST ONE RUNG below
+      // the start index under local CPU pressure (matching the host test, which
+      // proves 2->1, not 2->0): on a lossless transport the synthetic seed steps
+      // the chooser down exactly one rung and then no-ops, and the real {0,0}
+      // telemetry never drives `choose` further down, so the layer settles at
+      // ~startIndex - 1 (NOT necessarily base index 0) and does not climb back
+      // while the pressure holds. Hold the assertion across a few more injected
+      // samples to prove the lower preference is sticky under continued pressure.
+      for (let i = 0; i < SUSTAIN_SAMPLES + 2; i++) {
+        await injectFps(rxPage, LOW_FPS);
+        await rxPage.waitForTimeout(INJECT_INTERVAL_MS);
+        const idx = (await readVideoLayer(rxPage))?.layerIndex ?? 0;
+        expect(
+          idx,
+          `under sustained CPU pressure the received layer must stay at/below the ` +
+            `stepped-down rung (< start ${startIndex}); sample ${i}`,
+        ).toBeLessThan(startIndex);
+      }
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 3b. Per-peer RECEIVE reason chip renders the "Your setting" DISPLAY text
+  //     (issue #1553 — `reason_chip_text` display path).
+  //
+  // #1553 fixed a receiver-side mis-attribution in the per-peer "reason" chip:
+  // the chip's DISPLAY text is produced by `reason_chip_text(DegradeReason)`
+  // (performance_settings.rs): Network → "Your network", Setting → "Your
+  // setting", Sender → "Sender". The pure attribution LOGIC
+  // (`layer_chooser.rs degrade_reason`) — including the #1553 regression case
+  // (a constrained receiver with a collapsed `avail_top` is "Network", not
+  // "Sender") — is locked by HOST unit tests in BOTH crates
+  // (`degrade_reason_*` in layer_chooser.rs and the `reason_chip_text(...)`
+  // string asserts in performance_settings.rs). This E2E covers the part those
+  // host tests CANNOT: that the DISPLAY string actually reaches the DOM through
+  // the per-peer disclosure render (`PeerRow` → `…-peer-{sid}-reason`).
+  //
+  // DRIVABILITY BOUNDARY (why "Your setting" and not "Your network"):
+  //   * "Your setting" (DegradeReason::Setting) is fully drivable from the DOM
+  //     with NO network impairment: this receiver drags its OWN video receive
+  //     max-layer thumb below the full-ladder top, so the snapshot producer
+  //     (`per_peer_received_snapshots`) feeds `user_max = bounds.video.max` and
+  //     `sel == user_max < full_ladder_top` → Setting. Deterministic.
+  //   * "Sender" needs a genuine single-layer/non-simulcast peer (`avail_top <
+  //     full_top && sel == avail_top && !constrained`) — state-dependent on the
+  //     runner's clamped ladder, not deterministically forced here.
+  //   * "Your network" (DegradeReason::Network — the literal #1553 bug state)
+  //     needs `constrained == true`, which only the per-receiver downlink
+  //     congestion infra (the `@impair` netsim/toxiproxy path, grep-inverted out
+  //     of the default suite) can force. It is NOT drivable in this plain
+  //     `make e2e-up` harness, so it stays covered by the host unit tests; this
+  //     E2E asserts the drivable "Your setting" branch of the SAME render path.
+  //
+  // This is the INTENDED reason assertion sketched in the §1b FIXME block below
+  // ("cap the receiver via perf-recv-video-range-max → 0, then assert the
+  // degraded peer's row shows a perf-reason-chip--setting chip"), made real on
+  // the 2-context harness for the ONE publisher the receiver sees.
+  //
+  // UN-FIXME rationale matches test #3: the serial-describe + launch-flag
+  // renderer mitigation lets the 2-context join survive on CI, and
+  // `capabilityMaxLayersOverride: 3` forces a >1-layer ladder so there is
+  // headroom for a manual cap to sit strictly below the full top (a single-layer
+  // ladder has full_top == 0, so no reason chip can ever render).
+  // -------------------------------------------------------------------------
+  test('per-peer receive reason chip shows "Your setting" when the receiver caps below the full ladder (#1553)', async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_reason_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub3b@videocall.rs",
+        "SimPublisher3b",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx3b@videocall.rs",
+        "SimReceiver3b",
+        uiURL,
+      );
+      // Force the full ladder on both ends so the receiver's cap can sit STRICTLY
+      // below the full top (the reason chip only renders below the full-ladder
+      // top; a single-layer runner would never show one).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "SimPublisher3b");
+      await joinMeeting(rxPage, meetingId, "SimReceiver3b");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
+      // take effect; a clamped single-layer ladder has no full top to sit below,
+      // so the chip could never appear and the test would prove nothing.
+      await assertCapabilityOverrideActive(pubConsole);
+
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      const panel = await openPerformancePanel(rxPage);
+
+      // Wait until the receiver is decoding video so the ladder is known and the
+      // per-peer snapshot for the publisher has populated.
+      const before = await (async () => {
+        await expect
+          .poll(async () => (await readVideoLayer(rxPage)) !== null, {
+            timeout: 45_000,
+            intervals: [500, 1000, 2000],
+          })
+          .toBe(true);
+        return readVideoLayer(rxPage);
+      })();
+      const layerCount = before!.layerCount;
+      // Defence-in-depth (the override proof above should already guarantee >1):
+      // a single-layer ladder has full_top == 0, so a manual cap can never sit
+      // BELOW the top and no reason chip can render — skip rather than assert a
+      // false negative.
+      test.skip(
+        layerCount <= 1,
+        `single-layer ladder (count=${layerCount}); the reason chip cannot render ` +
+          "without a full top to sit below on this runner (capability ceiling).",
+      );
+
+      // DRIVE the "Setting" attribution: cap THIS receiver's video receive max to
+      // the base rung (index 0). `per_peer_received_snapshots` threads this bound
+      // as `user_max`; with `sel == user_max == 0 < full_top` the per-peer row's
+      // reason resolves to DegradeReason::Setting.
+      await pinReceiverToBaseLayer(rxPage, "video");
+
+      // The per-peer RECEIVE disclosure (issue #1131) is a native <details>,
+      // collapsed by default (rows are built lazily on expand). Open it.
+      const peersDetails = panel.locator('[data-testid="perf-recv-video-peers"]');
+      await expect(peersDetails).toBeVisible({ timeout: 15_000 });
+      const peersSummary = panel.locator('[data-testid="perf-recv-video-peers-summary"]');
+      await expect(peersSummary).toBeVisible({ timeout: 10_000 });
+      // Expand if not already open (the summary toggles the <details>).
+      if (!(await peersDetails.evaluate((el) => (el as HTMLDetailsElement).open))) {
+        await peersSummary.click();
+      }
+      await expect
+        .poll(async () => peersDetails.evaluate((el) => (el as HTMLDetailsElement).open), {
+          timeout: 10_000,
+          intervals: [250, 500],
+        })
+        .toBe(true);
+
+      // Exactly one publisher → exactly one per-peer video row. Its reason chip
+      // testid is `perf-recv-video-peer-{sessionId}-reason`; match by suffix so we
+      // don't need to know the session id.
+      const reasonChip = panel.locator(
+        '[data-testid$="-reason"][data-testid^="perf-recv-video-peer-"]',
+      );
+
+      // The chip appears once the chooser has clamped the decoded layer to the
+      // capped bound and the snapshot recomputes its reason. Poll for it.
+      await expect(reasonChip).toBeVisible({ timeout: 30_000 });
+
+      // #1553 ASSERTION: the chip renders the exact DISPLAY string from
+      // `reason_chip_text(DegradeReason::Setting)`. This is the part the host
+      // tests cannot prove — that the mapped string reaches the DOM. A regression
+      // that mislabels Setting (or swaps the Network/Sender strings the same
+      // mapping owns) fails here.
+      await expect(reasonChip).toHaveText("Your setting");
+
+      // …and the chip carries the MATCHING modifier class, so the text and the
+      // class can never silently diverge (`reason_chip_modifier(Setting)` ==
+      // "setting"). Pinning both pins the whole `DegradeReason → (text, class)`
+      // contract for the Setting branch at the DOM.
+      const chipClass = (await reasonChip.getAttribute("class")) || "";
+      expect(chipClass).toMatch(/\bperf-reason-chip--setting\b/);
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // 4. Default Auto — with no threshold set the panel shows Auto (full range)
   //    and the needle is free to reflect auto-selection across the full ladder.
   //

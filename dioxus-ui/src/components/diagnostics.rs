@@ -17,14 +17,15 @@
  */
 
 use crate::components::neteq_chart::{
-    push_capped, should_push, single_peer_selected, AdvancedChartType, ChartType,
-    NetEqAdvancedChart, NetEqChart, NetEqHistory, NetEqSample, NetEqStatusDisplay,
+    neteq_history_key, push_capped, should_push, single_peer_selected, AdvancedChartType,
+    ChartType, NetEqAdvancedChart, NetEqChart, NetEqHistory, NetEqSample, NetEqStatusDisplay,
     UnifiedTimelineChart, NETEQ_SAMPLE_CAP,
 };
 use crate::components::performance_settings::{
-    format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
-    format_send_layer_short, format_send_total_kbps, format_simulcast_summary, layer_quality_label,
-    peers_for_kind, DiagnosticsReader, HelpPopover, PerfControlsHandle, PerformanceSettingsPanel,
+    format_kbps_compact, format_mbps, format_peer_device_lines, format_peer_kind_line,
+    format_send_header, format_send_layer, format_send_layer_short, format_send_total_kbps,
+    format_simulcast_summary, layer_quality_label, peers_for_kind, DiagnosticsReader, HelpPopover,
+    PerfControlsHandle, PerformanceSettingsPanel,
 };
 use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use dioxus::prelude::*;
@@ -35,6 +36,14 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 use videocall_client::{PrefMediaKind, VideoCallClient};
 use videocall_diagnostics::{subscribe, MetricValue};
+
+/// #1482: one resolved per-peer device block for the diagnostics "Device (per
+/// peer)" section: `(session_id, peer_label, [(row_label, value)])`. The rows
+/// come from `format_peer_device_lines`; only present (`Some`) metric fields
+/// appear, so an empty rows Vec means the peer reported nothing. Aliased to
+/// keep the `SimulcastReceiveBreakdown` prop / local types readable (clippy
+/// `type_complexity`).
+type DeviceBlock = (u64, String, Vec<(String, String)>);
 
 /// Merged per-(peer, media-kind) reception stats backing the Raw stats →
 /// Reception dump (#1222). TWO producers emit subsystem `"video"` events with
@@ -72,8 +81,8 @@ fn update_reception(
     let mut kf = None;
     for m in &evt.metrics {
         match (m.name, &m.value) {
-            ("to_peer", MetricValue::Text(t)) => peer = Some(t.clone()),
-            ("media_type", MetricValue::Text(t)) => kind = Some(t.clone()),
+            ("to_peer", MetricValue::Text(t)) => peer = Some(t.to_string()),
+            ("media_type", MetricValue::Text(t)) => kind = Some(t.to_string()),
             ("fps_received", MetricValue::F64(v)) => fps = Some(*v),
             ("bitrate_kbps", MetricValue::F64(v)) => bitrate = Some(*v),
             ("video_seq_loss_per_sec", MetricValue::F64(v)) => loss = Some(*v),
@@ -296,7 +305,7 @@ impl ConnectionManagerState {
             match metric.name.as_str() {
                 "election_state" => {
                     if let MetricValue::Text(text) = &metric.value {
-                        state.election_state = text.clone();
+                        state.election_state = text.to_string();
                     }
                 }
                 "election_progress" => {
@@ -323,17 +332,17 @@ impl ConnectionManagerState {
                 }
                 "active_connection_id" => {
                     if let MetricValue::Text(id) = &metric.value {
-                        state.active_connection_id = Some(id.clone());
+                        state.active_connection_id = Some(id.to_string());
                     }
                 }
                 "active_server_url" => {
                     if let MetricValue::Text(url) = &metric.value {
-                        state.active_server_url = Some(url.clone());
+                        state.active_server_url = Some(url.to_string());
                     }
                 }
                 "active_server_type" => {
                     if let MetricValue::Text(server_type) = &metric.value {
-                        state.active_server_type = Some(server_type.clone());
+                        state.active_server_type = Some(server_type.to_string());
                     }
                 }
                 "active_server_rtt" => {
@@ -343,7 +352,7 @@ impl ConnectionManagerState {
                 }
                 "failure_reason" => {
                     if let MetricValue::Text(reason) = &metric.value {
-                        state.failure_reason = Some(reason.clone());
+                        state.failure_reason = Some(reason.to_string());
                     }
                 }
                 _ => {}
@@ -369,17 +378,17 @@ impl ConnectionManagerState {
             match metric.name.as_str() {
                 "server_url" => {
                     if let MetricValue::Text(url) = &metric.value {
-                        server.url = url.clone();
+                        server.url = url.to_string();
                     }
                 }
                 "server_type" => {
                     if let MetricValue::Text(st) = &metric.value {
-                        server.server_type = st.clone();
+                        server.server_type = st.to_string();
                     }
                 }
                 "server_status" => {
                     if let MetricValue::Text(status) = &metric.value {
-                        server.status = status.clone();
+                        server.status = status.to_string();
                     }
                 }
                 "server_rtt" => {
@@ -843,12 +852,12 @@ pub fn Diagnostics(
                             match m.name {
                                 "to_peer" => {
                                     if let MetricValue::Text(t) = &m.value {
-                                        peer_id = Some(t.clone());
+                                        peer_id = Some(t.to_string());
                                     }
                                 }
                                 "peer_transport" => {
                                     if let MetricValue::Text(t) = &m.value {
-                                        transport = Some(t.clone());
+                                        transport = Some(t.to_string());
                                     }
                                 }
                                 _ => {}
@@ -969,17 +978,56 @@ pub fn Diagnostics(
     let current_peer = selected_peer();
     let single_peer = single_peer_selected(&current_peer);
     let stats_map = neteq_stats_per_peer();
-    let neteq_stats_history: Rc<Vec<NetEqSample>> = if single_peer {
-        Rc::new(
-            stats_map
-                .get(&current_peer)
-                .map(|peer_stats| peer_stats.iter().cloned().collect())
-                .unwrap_or_default(),
-        )
-    } else {
-        // "All Peers": no single timeline → empty history (placeholder shown).
-        Rc::new(Vec::new())
-    };
+
+    // MEMOIZE the `Rc<Vec<NetEqSample>>` build so its POINTER identity is STABLE
+    // across parent re-renders that did NOT append a sample to the selected peer
+    // (#1451). Two layers:
+    //
+    // 1. `history_key` re-runs whenever EITHER signal it reads changes
+    //    (`selected_peer` or `neteq_stats_per_peer`, i.e. ANY peer's sample), but
+    //    only PROPAGATES a new value when the SELECTED peer's cheap identity key
+    //    (`peer` + `len` + `last_ts`) actually changed — see `neteq_history_key`.
+    // 2. `neteq_history_memo`'s only reactive dependency is `history_key()`, so it
+    //    rebuilds the `Rc` EXACTLY when the key changes. It reads the map via
+    //    `.peek()` (a NON-reactive read) so the heavy clone is NOT re-tracked on
+    //    every map mutation — the key alone gates the rebuild.
+    //
+    // Net effect: an unrelated parent re-render (toggling a help popover, resizing
+    // the drawer, another peer's sample landing) hands the SAME `Rc` to the
+    // children, so the child `UnifiedTimelineChart`'s `Rc::ptr_eq` prop gate
+    // engages and `unified_series_from_samples` is NOT recomputed. The `Rc` is
+    // rebuilt — and the children re-clip/redraw — only on a real append to the
+    // selected peer (≤1 Hz) or a peer switch. For "All Peers" the key is
+    // (peer="All Peers", len=0, last_ts=None) → a stable empty history. (#1451)
+    let history_key = use_memo(move || {
+        let peer = selected_peer();
+        let map = neteq_stats_per_peer();
+        if single_peer_selected(&peer) {
+            neteq_history_key(&peer, map.get(&peer))
+        } else {
+            // "All Peers": no single timeline → stable empty key.
+            neteq_history_key(&peer, None)
+        }
+    });
+    let neteq_history_memo = use_memo(move || {
+        // Establish the ONLY reactive dependency: the cheap key.
+        let _key = history_key();
+        // Build via `.peek()` (non-reactive) so the clone isn't re-tracked on
+        // every map mutation; the key already gates when we get here.
+        let peer = selected_peer.peek().clone();
+        if single_peer_selected(&peer) {
+            let map = neteq_stats_per_peer.peek();
+            Rc::new(
+                map.get(&peer)
+                    .map(|peer_stats| peer_stats.iter().cloned().collect())
+                    .unwrap_or_default(),
+            )
+        } else {
+            // "All Peers": no single timeline → empty history (placeholder shown).
+            Rc::new(Vec::new())
+        }
+    });
+    let neteq_stats_history: Rc<Vec<NetEqSample>> = neteq_history_memo();
 
     // Cap caption gates on len()==7200 (owner decision 2): the selected peer's
     // deque length. For "All Peers" no charts are shown, so capped stays false.
@@ -1188,29 +1236,55 @@ pub fn Diagnostics(
                             }
                             "Build info"
                         }
-                        div { class: "build-info-table",
-                            div { class: "build-info-header",
-                                span { class: "build-info-cell", "Component" }
-                                span { class: "build-info-cell", "Commit" }
-                                span { class: "build-info-cell", "Branch" }
-                            }
-                            div { class: "build-info-row",
-                                span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
-                                span { class: "build-info-cell monospace", "" }
-                                span { class: "build-info-cell", "" }
-                            }
-                            for comp in backend_versions() {
-                                {
-                                    let svc = comp["service"].as_str().unwrap_or("?").to_string();
-                                    let ver = comp["version"].as_str().unwrap_or("").to_string();
-                                    let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
-                                    let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
-                                    let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
-                                    rsx! {
-                                        div { class: "build-info-row",
-                                            span { class: "build-info-cell build-info-service", "{label}" }
-                                            span { class: "build-info-cell monospace", "{sha}" }
-                                            span { class: "build-info-cell", "{br}" }
+                        {
+                            // Issue #1480: github info (Commit + Branch) is gated on
+                            // showBuildGitInfo. When hidden, columns collapse to
+                            // Component / Built (2). When shown: Component / Commit /
+                            // Branch / Built (4). The grid column count tracks via the
+                            // --git / --nogit modifier so cell count == column count.
+                            let show_git = crate::constants::show_build_git_info();
+                            let table_class = if show_git {
+                                "build-info-table build-info-table--git"
+                            } else {
+                                "build-info-table build-info-table--nogit"
+                            };
+                            rsx! {
+                                div { class: "{table_class}",
+                                    div { class: "build-info-header",
+                                        span { class: "build-info-cell", "Component" }
+                                        if show_git {
+                                            span { class: "build-info-cell", "Commit" }
+                                            span { class: "build-info-cell", "Branch" }
+                                        }
+                                        span { class: "build-info-cell", "Built" }
+                                    }
+                                    div { class: "build-info-row",
+                                        span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
+                                        if show_git {
+                                            span { class: "build-info-cell monospace", "{crate::constants::short_sha(env!(\"GIT_SHA\"))}" }
+                                            span { class: "build-info-cell", "{env!(\"GIT_BRANCH\")}" }
+                                        }
+                                        span { class: "build-info-cell", "{crate::constants::build_datetime(env!(\"BUILD_TIMESTAMP\")).unwrap_or_else(|| env!(\"BUILD_TIMESTAMP\").to_string())}" }
+                                    }
+                                    for comp in backend_versions() {
+                                        {
+                                            let svc = comp["service"].as_str().unwrap_or("?").to_string();
+                                            let ver = comp["version"].as_str().unwrap_or("").to_string();
+                                            let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
+                                            let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
+                                            let raw_ts = comp["build_timestamp"].as_str().unwrap_or("");
+                                            let built = crate::constants::build_datetime(raw_ts).unwrap_or_else(|| if raw_ts.is_empty() { "-".to_string() } else { raw_ts.to_string() });
+                                            let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
+                                            rsx! {
+                                                div { class: "build-info-row",
+                                                    span { class: "build-info-cell build-info-service", "{label}" }
+                                                    if show_git {
+                                                        span { class: "build-info-cell monospace", "{crate::constants::short_sha(&sha)}" }
+                                                        span { class: "build-info-cell", "{br}" }
+                                                    }
+                                                    span { class: "build-info-cell", "{built}" }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1318,7 +1392,7 @@ pub fn Diagnostics(
                                                 div { class: "peer-summary-item",
                                                     strong { "{display}" }
                                                     div {
-                                                        style: "display:flex; gap:8px; align-items:center;",
+                                                        class: "peer-summary-item__metrics",
                                                         span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
                                                         span {
                                                             "Buffer: "
@@ -1709,6 +1783,29 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
     let send_screen_snap = (reader.send_screen)();
     let per_peer_receive = (reader.per_peer_receive)();
 
+    // issue 1482: resolve the per-peer device blocks here (live, each tick)
+    // while the reader is in scope. Iterate the ALL-PEERS device reader (NOT the
+    // media-receive list) so a peer that reports device metrics via HEALTH but
+    // whose media isn't currently flowing (e.g. camera off) still renders. The
+    // label comes from the reader tuple, which mirrors the receive-list label
+    // (display name → user id → session id), so a receiving peer's label is
+    // unchanged. A peer whose formatted lines are empty contributes no block —
+    // never an empty-labeled row; an empty list → no `.diag-device` container.
+    let device_blocks: Vec<DeviceBlock> = {
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut blocks: Vec<DeviceBlock> = Vec::new();
+        for (session_id, label, info) in (reader.per_peer_device_all)().into_iter() {
+            if !seen.insert(session_id) {
+                continue;
+            }
+            let lines = format_peer_device_lines(&info);
+            if !lines.is_empty() {
+                blocks.push((session_id, label, lines));
+            }
+        }
+        blocks
+    };
+
     rsx! {
         div { class: "diagnostics-section",
             h3 { "Simulcast layers" }
@@ -1728,7 +1825,10 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
                 not_sharing_text: "Screen — not sharing",
                 snap: send_screen_snap,
             }
-            SimulcastReceiveBreakdown { peers: per_peer_receive }
+            SimulcastReceiveBreakdown {
+                peers: per_peer_receive,
+                device_blocks,
+            }
         }
     }
 }
@@ -1842,7 +1942,16 @@ fn SimulcastSendLadder(
 /// the top-3 peers (highest layer first) + a "+N more" tail. Fed by the live
 /// per-peer snapshot list.
 #[component]
-fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> Element {
+fn SimulcastReceiveBreakdown(
+    peers: Vec<videocall_client::PeerReceiveDiag>,
+    /// #1482: pre-resolved per-peer device blocks, one entry per peer that
+    /// reported something: `(session_id, peer_label, [(row_label, value)])`.
+    /// Resolved in the parent (`SimulcastLayersSection`) where the live reader
+    /// is in scope, so this component takes a plain `PartialEq` value prop
+    /// rather than an `Rc<dyn Fn>` (which the `#[component]` macro can't derive
+    /// `PartialEq` for). Empty → the Device section renders nothing.
+    device_blocks: Vec<DeviceBlock>,
+) -> Element {
     rsx! {
         div { class: "simulcast-recv",
             span { class: "simulcast-recv-title", "Receiving (per peer)" }
@@ -1927,6 +2036,26 @@ fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> E
                     }
                 }
             }
+            // #1482: per-peer device / hardware block. Rendered only when at
+            // least one peer reported something ("if available"); each block
+            // lists the present `label: value` rows from `format_peer_device_lines`.
+            if !device_blocks.is_empty() {
+                div { class: "diag-device",
+                    span { class: "diag-device-title", "Device (per peer)" }
+                    for (session_id , peer_label , lines) in device_blocks.into_iter() {
+                        div { class: "diag-device-peer",
+                            "data-testid": "diag-device-peer-{session_id}",
+                            span { class: "diag-device-peer-label", "{peer_label}" }
+                            for (label , value) in lines.into_iter() {
+                                div { class: "diag-device-row",
+                                    span { class: "diag-device-row-label", "{label}" }
+                                    span { class: "diag-device-row-value", "{value}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1954,9 +2083,9 @@ mod tests {
             metrics: vec![
                 m("fps_received", MetricValue::F64(30.0)),
                 m("bitrate_kbps", MetricValue::F64(850.0)),
-                m("media_type", MetricValue::Text("VIDEO".to_string())),
-                m("from_peer", MetricValue::Text("self-id".to_string())),
-                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("from_peer", MetricValue::Text("self-id".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
             ],
         };
         assert!(update_reception(&mut map, &evt), "keyed event must fold");
@@ -1999,8 +2128,8 @@ mod tests {
             metrics: vec![
                 m("fps_received", MetricValue::F64(30.0)),
                 m("bitrate_kbps", MetricValue::F64(850.0)),
-                m("media_type", MetricValue::Text("VIDEO".to_string())),
-                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
             ],
         };
         let loss = DiagEvent {
@@ -2008,8 +2137,8 @@ mod tests {
             stream_id: None,
             ts_ms: 1_500_000,
             metrics: vec![
-                m("media_type", MetricValue::Text("VIDEO".to_string())),
-                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
                 m("video_seq_loss_per_sec", MetricValue::F64(2.5)),
                 m("keyframe_requests_per_sec", MetricValue::F64(0.5)),
             ],
@@ -2051,8 +2180,8 @@ mod tests {
             metrics: vec![
                 m("fps_received", MetricValue::F64(30.0)),
                 m("bitrate_kbps", MetricValue::F64(850.0)),
-                m("media_type", MetricValue::Text("VIDEO".to_string())),
-                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
             ],
         };
         let mut map = BTreeMap::new();

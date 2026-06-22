@@ -238,20 +238,17 @@ pub async fn list_joined_meetings(
     let rows = db_meetings::list_joined_by_user(&state.db, &user_id, limit).await?;
 
     let mut meetings = Vec::with_capacity(rows.len());
-    // Note: participant_count / waiting_count are read after the main SELECT
-    // in separate queries, so they may reflect a slightly newer DB snapshot
-    // than `last_joined_at`. Acceptable for this advisory home-page surface.
+    // participant_count / waiting_count are folded into the same SELECT
+    // (LEFT JOIN LATERAL) in `list_joined_by_user`, so the whole list is a
+    // single round-trip regardless of length.
     for row in &rows {
-        let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
-        let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
-
         meetings.push(JoinedMeetingSummary {
             meeting_id: row.room_id.clone(),
             state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
             started_at: row.started_at.timestamp_millis(),
             ended_at: row.ended_at.map(|t| t.timestamp_millis()),
-            participant_count,
-            waiting_count,
+            participant_count: row.participant_count,
+            waiting_count: row.waiting_count,
             has_password: row.password_hash.is_some(),
             is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
             created_at: row.created_at.timestamp_millis(),

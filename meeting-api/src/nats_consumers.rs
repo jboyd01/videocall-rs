@@ -31,7 +31,11 @@
 //! not configured.
 
 use crate::db::meetings as db_meetings;
-use crate::nats_events::{MEETING_BECAME_EMPTY_SUBJECT, MEETING_ENDED_BY_HOST_SUBJECT};
+use crate::db::participants as db_participants;
+use crate::nats_events::{
+    ParticipantLeftPayload, MEETING_BECAME_EMPTY_SUBJECT, MEETING_ENDED_BY_HOST_SUBJECT,
+    PARTICIPANT_LEFT_SUBJECT,
+};
 use futures::future::BoxFuture;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
@@ -119,6 +123,144 @@ pub fn spawn_meeting_became_empty_consumer_inner(
         "room-empty DB-write fanout (empty->idle)",
         |pool, meeting_id| Box::pin(async move { db_meetings::set_idle(&pool, meeting_id).await }),
     )
+}
+
+/// Spawn the consumer for [`PARTICIPANT_LEFT_SUBJECT`].
+///
+/// When `actix-api` observes a single participant's session leave a room (a
+/// transport disconnect that did NOT go through REST `/leave`, or an explicit
+/// transport leave), it publishes a [`ParticipantLeftPayload`]. We look the
+/// meeting up by `room_id` and mark `(meeting_id, user_id)` as `status='left',
+/// left_at=NOW()` via [`db_participants::mark_left_by_disconnect`], so the
+/// participant stops being counted as present (issue #1551).
+///
+/// Idempotent and reconnect-safe: the UPDATE only matches rows currently
+/// `status IN ('admitted','waiting')`, so it is a no-op on a participant who has
+/// already left, been kicked, or has no row. The relay only publishes after the
+/// reconnect grace period AND when the user has no other live session, so a
+/// brief disconnect+reconnect (or a multi-tab user) never marks a present
+/// participant left.
+///
+/// Graceful degradation: when `nats` is `None`, this returns without spawning.
+/// The DB then stays consistent only via the REST `/leave` endpoint, matching
+/// the pre-fix behavior (an abnormal disconnect leaves a stale `admitted` row,
+/// the very gap this consumer closes when NATS is configured).
+pub fn spawn_participant_left_consumer(
+    nats: Option<async_nats::Client>,
+    pool: PgPool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_participant_left_consumer_inner(nats, pool, None)
+}
+
+/// Internal variant used by tests to eliminate the publish-before-subscribe
+/// race (see [`spawn_meeting_ended_by_host_consumer_inner`]).
+#[doc(hidden)]
+pub fn spawn_participant_left_consumer_inner(
+    nats: Option<async_nats::Client>,
+    pool: PgPool,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let nats = nats?;
+    let subject = PARTICIPANT_LEFT_SUBJECT;
+    let description = "participant-disconnect DB-write fanout (mark left)";
+    let handle = tokio::spawn(async move {
+        let mut ready_tx = ready_tx;
+        loop {
+            match nats.subscribe(subject).await {
+                Ok(mut sub) => {
+                    tracing::info!("Subscribed to {} ({})", subject, description);
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    while let Some(msg) = sub.next().await {
+                        let payload =
+                            match serde_json::from_slice::<ParticipantLeftPayload>(&msg.payload) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::warn!("Dropping malformed {} payload: {e}", subject);
+                                    continue;
+                                }
+                            };
+
+                        // Defensive bounds, matching the room-state consumers.
+                        if payload.room_id.is_empty() || payload.room_id.len() > 256 {
+                            tracing::warn!(
+                                "Ignoring {} with invalid room_id length: {}",
+                                subject,
+                                payload.room_id.len()
+                            );
+                            continue;
+                        }
+                        if payload.user_id.is_empty() || payload.user_id.len() > 256 {
+                            tracing::warn!(
+                                "Ignoring {} with invalid user_id length: {}",
+                                subject,
+                                payload.user_id.len()
+                            );
+                            continue;
+                        }
+
+                        match db_meetings::get_by_room_id(&pool, &payload.room_id).await {
+                            Ok(Some(meeting)) => {
+                                match db_participants::mark_left_by_disconnect(
+                                    &pool,
+                                    meeting.id,
+                                    &payload.user_id,
+                                )
+                                .await
+                                {
+                                    Ok(rows) => {
+                                        tracing::info!(
+                                            "Applied {} for meeting {} (id={}) user {} \
+                                             (rows_affected={})",
+                                            subject,
+                                            payload.room_id,
+                                            meeting.id,
+                                            payload.user_id,
+                                            rows
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to mark participant {} left for meeting {} \
+                                             (id={}) on {}: {e}",
+                                            payload.user_id,
+                                            payload.room_id,
+                                            meeting.id,
+                                            subject
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    "Received {} for unknown room {}; ignoring",
+                                    subject,
+                                    payload.room_id
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "DB error looking up room {} for {} event: {e}",
+                                    payload.room_id,
+                                    subject
+                                );
+                            }
+                        }
+                    }
+                    tracing::warn!(
+                        "{} subscription stream ended, re-subscribing in 1s",
+                        subject
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to subscribe to {}: {e}, retrying in 1s", subject);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    Some(handle)
 }
 
 /// Extract the `room_id` from a deserialized internal payload.
@@ -282,6 +424,20 @@ mod tests {
             .connect_lazy("postgres://stub")
             .expect("connect_lazy should not contact the database");
         let handle = spawn_meeting_became_empty_consumer(None, lazy_pool);
+        assert!(
+            handle.is_none(),
+            "spawn must return None when NATS is not configured"
+        );
+    }
+
+    /// Same graceful-degradation contract for the participant-left (mark-left)
+    /// consumer (issue #1551).
+    #[tokio::test]
+    async fn spawn_participant_left_returns_none_when_nats_disabled() {
+        let lazy_pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://stub")
+            .expect("connect_lazy should not contact the database");
+        let handle = spawn_participant_left_consumer(None, lazy_pool);
         assert!(
             handle.is_none(),
             "spawn must return None when NATS is not configured"

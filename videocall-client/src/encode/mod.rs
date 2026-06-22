@@ -30,6 +30,7 @@ use std::sync::Arc;
 use crate::VideoCallClient;
 use videocall_types::Callback;
 
+pub(crate) use camera_encoder::layer_ceiling_to_count;
 pub use camera_encoder::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
@@ -68,6 +69,12 @@ pub trait MicrophoneEncoderTrait {
     /// self-targeted server CONGESTION signal cuts the audio simulcast ladder to
     /// base-only. See [`MicrophoneEncoder::set_congestion_layer_ceiling`].
     fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>);
+    /// Returns the effective audio simulcast layer count (#1561).
+    fn effective_audio_layers(&self) -> u32;
+    /// Returns the shared CONGESTION audio layer-ceiling atom (#1561).
+    fn congestion_layer_ceiling(&self) -> Arc<AtomicU32>;
+    /// Returns the shared USER audio layer-ceiling atom (#1561).
+    fn shared_user_layer_ceiling(&self) -> Rc<AtomicU32>;
 }
 
 // Implement trait for Safari microphone encoder
@@ -103,14 +110,28 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
     fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>) {
         self.set_congestion_layer_ceiling(ceiling)
     }
+
+    fn effective_audio_layers(&self) -> u32 {
+        self.effective_audio_layers()
+    }
+
+    fn congestion_layer_ceiling(&self) -> Arc<AtomicU32> {
+        self.congestion_layer_ceiling()
+    }
+
+    fn shared_user_layer_ceiling(&self) -> Rc<AtomicU32> {
+        self.shared_user_layer_ceiling()
+    }
 }
 
 /// Factory function to create the appropriate microphone encoder based on platform detection.
 ///
-/// `shared_audio_tier_bitrate` and `shared_audio_tier_fec` are optional shared
-/// atomics from the `CameraEncoder`. When provided, the microphone encoder
-/// reads the audio quality tier from the camera encoder's quality manager
-/// instead of creating its own `EncoderBitrateController`.
+/// `shared_audio_tier_bitrate`, `shared_audio_tier_fec`, and
+/// `shared_audio_tier_index` are optional shared atomics from the
+/// `CameraEncoder`. When provided, the microphone encoder reads the audio
+/// quality tier from the camera encoder's quality manager instead of creating
+/// its own `EncoderBitrateController`. `shared_audio_tier_index` (issue #1567)
+/// additionally drives the live Opus FEC ctl-reconfig on a mid-call tier change.
 #[allow(clippy::too_many_arguments)]
 pub fn create_microphone_encoder(
     client: VideoCallClient,
@@ -120,6 +141,7 @@ pub fn create_microphone_encoder(
     vad_threshold: Option<f32>,
     shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
     shared_audio_tier_fec: Option<Rc<AtomicBool>>,
+    shared_audio_tier_index: Option<Rc<AtomicU32>>,
     max_layers: u32,
 ) -> Box<dyn MicrophoneEncoderTrait> {
     Box::new(MicrophoneEncoder::new(
@@ -130,6 +152,7 @@ pub fn create_microphone_encoder(
         vad_threshold,
         shared_audio_tier_bitrate,
         shared_audio_tier_fec,
+        shared_audio_tier_index,
         max_layers,
     ))
 }
