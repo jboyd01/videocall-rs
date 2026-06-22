@@ -1730,6 +1730,29 @@ impl CameraEncoder {
         self.screen_sharing_active.clone()
     }
 
+    /// Returns the camera ENABLED flag (`Arc<AtomicBool>`): the camera-on/off
+    /// signal (issue #1398).
+    ///
+    /// This is the SAME `EncoderState::enabled` atom that [`Self::set_enabled`]
+    /// writes (`set_enabled(true)` → camera ON, `set_enabled(false)` / `stop()`
+    /// → camera OFF). The `Host` toggles it directly: it calls
+    /// `camera.set_enabled(true)` when video is on and `camera.set_enabled(false)`
+    /// (plus `stop()`) when video is off (audio-only). So `false` is an
+    /// UNAMBIGUOUS, always-current "camera off / audio-only" indication — unlike
+    /// the shared audio-tier atoms, whose values (top-tier 50 kbps / index 0) are
+    /// indistinguishable between "camera off" and "camera on and healthy".
+    ///
+    /// Shared into the [`MicrophoneEncoder`] (via
+    /// [`MicrophoneEncoder::set_camera_active_signal`]) so the mic-side
+    /// single-layer uplink-distress detector (#1398) can GATE itself to
+    /// camera-off: the mic bitrate-floor lever and the camera AQ loop's audio
+    /// downshift are then mutually exclusive (no compounding). `Arc` (not `Rc`)
+    /// because the atom is `EncoderState`'s `Arc<AtomicBool>` and it crosses into
+    /// the mic encoder, matching the congestion-flag wiring.
+    pub fn camera_enabled_flag(&self) -> Arc<AtomicBool> {
+        self.state.enabled.clone()
+    }
+
     /// Returns the current video quality tier index (0 = best, 7 = minimal).
     pub fn shared_video_tier_index(&self) -> Rc<AtomicU32> {
         self.shared_video_tier_index.clone()

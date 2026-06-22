@@ -69,6 +69,20 @@ pub trait MicrophoneEncoderTrait {
     /// self-targeted server CONGESTION signal cuts the audio simulcast ladder to
     /// base-only. See [`MicrophoneEncoder::set_congestion_layer_ceiling`].
     fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>);
+    /// Share the single-layer audio BITRATE floor atom (issue #1398). The
+    /// client owns it to reset on reconnect; the mic-side uplink-distress detector
+    /// writes it. See [`MicrophoneEncoder::set_congestion_bitrate_floor`].
+    fn set_congestion_bitrate_floor(&mut self, floor: Arc<AtomicU32>);
+    /// Share the CAMERA's enabled flag (issue #1398) so the mic-side uplink
+    /// distress detector can gate itself to the camera being off, and so the FEC
+    /// reconfig timer can select the effective single-layer audio bitrate by
+    /// camera state. See [`MicrophoneEncoder::set_camera_active_signal`].
+    fn set_camera_active_signal(&mut self, camera_active: Arc<AtomicBool>);
+    /// Share the connection RECONNECT-reseed flag (issue #1398 reconnect P1) so the
+    /// mic-side uplink-distress detector forces a window re-seed on every
+    /// (re)connect, preventing a cross-reconnect counter delta from cashing a
+    /// spurious cut. See [`MicrophoneEncoder::set_reconnect_reseed_signal`].
+    fn set_reconnect_reseed_signal(&mut self, reconnect_reseed: Arc<AtomicBool>);
     /// Returns the effective audio simulcast layer count (#1561).
     fn effective_audio_layers(&self) -> u32;
     /// Returns the shared CONGESTION audio layer-ceiling atom (#1561).
@@ -109,6 +123,18 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>) {
         self.set_congestion_layer_ceiling(ceiling)
+    }
+
+    fn set_congestion_bitrate_floor(&mut self, floor: Arc<AtomicU32>) {
+        self.set_congestion_bitrate_floor(floor)
+    }
+
+    fn set_camera_active_signal(&mut self, camera_active: Arc<AtomicBool>) {
+        self.set_camera_active_signal(camera_active)
+    }
+
+    fn set_reconnect_reseed_signal(&mut self, reconnect_reseed: Arc<AtomicBool>) {
+        self.set_reconnect_reseed_signal(reconnect_reseed)
     }
 
     fn effective_audio_layers(&self) -> u32 {

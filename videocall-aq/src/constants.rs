@@ -1688,6 +1688,124 @@ const _: () = assert!(
      cannot shed a layer."
 );
 
+// ---------------------------------------------------------------------------
+// Single-Layer AUDIO Uplink-Distress Self-Detection (#1398)
+// ---------------------------------------------------------------------------
+//
+// A SINGLE-LAYER audio publisher (device capability-gated to 1 audio layer, or
+// audio simulcast disabled) has no upper layer to shed under congestion, so the
+// only available downshift is lowering the ONE running Opus stream's bitrate
+// live (#1398). The CAMERA's AQ loop already self-detects publisher-uplink
+// distress directly from the process-global transport counters — slow
+// `writer.ready()` (`unistream_ready_stall_count`, WT bandwidth cliff) and WS
+// send-buffer overflows (`websocket_drop_count`) — via `evaluate_self_congestion`
+// with the WT/WS constants above. But that loop only runs while the CAMERA is
+// on; an AUDIO-ONLY publisher has no such detector. #1398 therefore re-targets
+// the audio bitrate floor onto the SAME live uplink counters, evaluated by a
+// mic-side detector that runs even when the camera is off.
+//
+// These constants are the AUDIO analogue of the video WT/WS constants, but
+// deliberately NOT a verbatim copy: AUDIO must shed AFTER VIDEO. The relationship
+// is expressed against the existing video constants (drift-resistant, with the
+// compile-time invariants below) rather than as bare literals.
+//
+// Why "after video", and why the WINDOW (not the count) does the heavy lifting:
+//   The WT stall counter is a WEAK discriminator. A single sustained `ready()`
+//   stall with K frames in flight produces ~K increments at once (see
+//   WT_SATURATION_STALL_THRESHOLD's note), so a slightly higher COUNT threshold
+//   (+2) is only a coarse nudge — it does not reliably make audio fire after
+//   video. The dominant lever is the WINDOW: a longer tumbling window requires
+//   the distress to PERSIST across more ticks before the audio detector fires,
+//   so a transient cliff that the video detector already shed for (over its
+//   shorter window) is given time to recover before audio — which costs more
+//   per-bit to the call — is touched. Hence the audio windows are MULTIPLES of
+//   the video windows (2x saturation, 4x WS), and that temporal ordering — not
+//   the +2 count — is what implements "audio sheds after video".
+
+/// Number of client-side WT slow-`ready()` (uplink-saturation) events within
+/// [`AUDIO_UPLINK_SATURATION_WINDOW_MS`] that trips the SINGLE-LAYER audio
+/// bitrate downshift (#1398). Two above the video saturation threshold so audio
+/// requires marginally more evidence than video; the longer window does the
+/// real "after video" work (see the module note above).
+pub const AUDIO_UPLINK_SATURATION_STALL_THRESHOLD: u64 = WT_SATURATION_STALL_THRESHOLD + 2;
+
+/// Number of client-side WS send-buffer drops within
+/// [`AUDIO_UPLINK_WS_WINDOW_MS`] that trips the SINGLE-LAYER audio bitrate
+/// downshift (#1398). Two above the WS self-congestion threshold.
+pub const AUDIO_UPLINK_WS_DROP_THRESHOLD: u64 = WS_SELF_CONGESTION_DROP_THRESHOLD + 2;
+
+/// Tumbling window (ms) for the audio WT-saturation detector (#1398). TWICE the
+/// video saturation window: the audio detector must see the cliff persist across
+/// roughly double the ticks the video detector needs before it sheds, so a
+/// transient cliff already handled by video recovers before audio is touched.
+pub const AUDIO_UPLINK_SATURATION_WINDOW_MS: f64 = 2.0 * WT_SATURATION_WINDOW_MS;
+
+/// Tumbling window (ms) for the audio WS-backpressure detector (#1398). FOUR
+/// times the video WS window: WS overflows are softer/faster-edged than WT
+/// stalls, so a wider multiplier is needed to give the same "audio after video"
+/// temporal separation.
+pub const AUDIO_UPLINK_WS_WINDOW_MS: f64 = 4.0 * WS_SELF_CONGESTION_WINDOW_MS;
+
+/// Number of client-side WT persistent-unistream media-frame DROPS within
+/// [`AUDIO_UPLINK_WT_DROP_WINDOW_MS`] that trips the SINGLE-LAYER audio bitrate
+/// downshift (#1398). Two above the video WT-drop threshold
+/// ([`WT_SELF_CONGESTION_DROP_THRESHOLD`]) so audio requires marginally more
+/// evidence than video; the wider window does the real "after video" work (see
+/// the module note above). This is the AUDIO analogue of the camera AQ's
+/// WT-DROP self-shed axis (`wt_drop_step_down_decision`) — the THIRD uplink
+/// axis (alongside saturation and WS) that the mic-side detector ORs over, so a
+/// hard unistream-reset cliff (drop counter climbing, not slow-`ready()`) sheds
+/// audio just as the camera sheds video on the same counter.
+pub const AUDIO_UPLINK_WT_DROP_THRESHOLD: u64 = WT_SELF_CONGESTION_DROP_THRESHOLD + 2;
+
+/// Tumbling window (ms) for the audio WT-DROP detector (#1398). TWICE the video
+/// WT-drop window ([`WT_SELF_CONGESTION_WINDOW_MS`]), NOT 4x like the WS window.
+/// RATIONALE (matching the saturation 2x note): a WT unistream DROP is a
+/// HARD-EDGED stream-reset/write-failure event — the same hard-edged class as
+/// the WT slow-`ready()` saturation signal, and unlike the soft/faster-edged WS
+/// send-buffer overflow. Hard-edged WT signals are already sparse and persist
+/// across multiple ticks before they fire video, so a 2x window gives the same
+/// "audio after video" temporal separation that the saturation axis gets at 2x;
+/// the 4x multiplier the WS axis needs is specific to WS's softer edge.
+pub const AUDIO_UPLINK_WT_DROP_WINDOW_MS: f64 = 2.0 * WT_SELF_CONGESTION_WINDOW_MS;
+
+// --- Compile-time invariants (#1398) ---
+// Audio must shed STRICTLY AFTER video on both axes. These pin the
+// "audio-after-video" contract at build time so a future edit to the video
+// constants that would let audio shed first (or simultaneously) fails the build,
+// not a meeting. Mirrors the #1104 / #1219-prereq invariant asserts above.
+const _: () = assert!(
+    AUDIO_UPLINK_SATURATION_STALL_THRESHOLD > WT_SATURATION_STALL_THRESHOLD,
+    "audio saturation threshold must exceed the video one so audio requires \
+     more stall evidence than video before shedding (audio sheds after video)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_WS_DROP_THRESHOLD > WS_SELF_CONGESTION_DROP_THRESHOLD,
+    "audio WS drop threshold must exceed the video one (audio sheds after video)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_SATURATION_WINDOW_MS > WT_SATURATION_WINDOW_MS,
+    "audio saturation window must be WIDER than the video one: the longer window \
+     (not the +2 count) is what makes audio shed after video, because the WT \
+     stall counter is a weak count discriminator (see the module note)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_WS_WINDOW_MS > WS_SELF_CONGESTION_WINDOW_MS,
+    "audio WS window must be WIDER than the video one (audio sheds after video)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_WT_DROP_THRESHOLD > WT_SELF_CONGESTION_DROP_THRESHOLD,
+    "audio WT-drop threshold must exceed the video one so audio requires more \
+     unistream-drop evidence than video before shedding (audio sheds after video)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_WT_DROP_WINDOW_MS > WT_SELF_CONGESTION_WINDOW_MS,
+    "audio WT-drop window must be WIDER than the video one (audio sheds after \
+     video). It is 2x (not 4x like WS): a WT drop is hard-edged like the WT \
+     saturation signal, so it gets the same 2x separation the saturation axis \
+     gets — see the AUDIO_UPLINK_WT_DROP_WINDOW_MS doc."
+);
+
 /// Pure decision helper for the client-side self-congestion self-trigger
 /// (used by the WebTransport uplink-backpressure block; #1104).
 ///

@@ -269,6 +269,45 @@ pub fn Host(
         // the mic has no AQ loop of its own, so the cut + recovery work even when
         // the camera is off (audio-only).
         microphone.set_congestion_layer_ceiling(client.audio_congestion_layer_ceiling());
+        // Issue #1398: also give the microphone encoder the single-layer audio
+        // BITRATE floor atom. A single-layer publisher has no upper layer to shed,
+        // so the lever is to lower the one running Opus stream's bitrate live
+        // (worklet ctl 4002). The DOWN trigger is NOT a self-targeted CONGESTION:
+        // it is the mic-side WT/WS uplink-distress detector (the congestion-recovery
+        // Interval in microphone_encoder.rs's `start`), GATED to single-layer AND
+        // the camera being OFF (audio-only), which steps THIS floor down one tier on
+        // sustained distress. The client still OWNS the atom for TWO reasons: to
+        // RESET it to the fail-open sentinel on reconnect even when Inner is busy
+        // (so a stale cut does not pin audio low on a fresh session; #1398 FIX D),
+        // and to share it into the mic. The mic's FEC/bitrate reconfig timer READS
+        // the floor (camera-off) and the recovery timer CLIMBS it back, so the cut +
+        // recovery work even when the camera is off.
+        microphone.set_congestion_bitrate_floor(client.audio_congestion_bitrate_floor());
+        // Issue #1398: give the microphone encoder the CAMERA's enabled flag. It
+        // GATES the mic-side uplink-distress detector to camera-off (audio-only)
+        // AND selects the effective single-layer audio bitrate by camera state
+        // (camera-on → camera AQ tier; camera-off → the mic congestion floor). When
+        // the camera is ON, `effective_audio_bitrate` returns the camera AQ tier
+        // and IGNORES the mic floor entirely, so the floor cannot apply regardless;
+        // gating the detector to camera-off just keeps it from cutting a floor that
+        // would never be read (and the camera-on uplink→audio downshift is the
+        // deferred #1611 backstop — the camera AQ's uplink self-shed steps VIDEO,
+        // not audio). When the camera is OFF (this flag reads false) the gate is
+        // satisfied. The screen encoder is NOT a gate term — it writes no
+        // audio-tier atom, so a screen-sharing publisher relies on this detector
+        // for its only audio downshift.
+        microphone.set_camera_active_signal(camera.camera_enabled_flag());
+        // Issue #1398 reconnect P1: give the microphone encoder the client's
+        // RECONNECT-reseed flag. The client sets it on every (re)connect (in its
+        // `Connected` handler, next to the bitrate-floor reset); the mic-side
+        // uplink-distress detector tick consumes it and forces its tumbling windows
+        // to re-anchor to "now". Without this, a plain reconnect (which does NOT
+        // restart the mic) leaves the detector measuring across the reconnect, so
+        // the monotonic transport counters bumped by the teardown/rebuild would
+        // cash a spurious audio cut on the fresh session even though its uplink is
+        // healthy. The client owns the atom (like the floor) so the reset runs even
+        // when Inner is contended.
+        microphone.set_reconnect_reseed_signal(client.audio_detector_reconnect_reseed());
 
         // Wire the relay layer-union hint atoms (issue #1108, Stage 3). Each
         // encoder OWNS its `shared_union_requested_layer` atom (initialized to the
