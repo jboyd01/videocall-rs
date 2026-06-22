@@ -228,24 +228,20 @@ fn format_device_memory_gb(gb: f64) -> String {
     format!("{gb} GB")
 }
 
-/// Format the main-thread busy fraction (0.0-1.0) as a rounded integer
-/// percentage, e.g. `0.42` → `"42%"`. This is the honest CPU-PROXY figure
-/// (sender main-thread load), deliberately NOT labeled "CPU usage". (#1482.)
-fn format_main_thread_load_pct(load: f64) -> String {
-    let clamped = if load.is_finite() {
-        load.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    format!("{}%", (clamped * 100.0).round() as i64)
-}
-
 /// Build the ordered `(label, value)` device-info rows for a peer (#1482).
 ///
 /// Only fields that are `Some` produce a pair; a `None` field is OMITTED
 /// entirely (never an empty value). The fixed order is:
-/// OS, Device, Cores, Architecture, Memory, Main-thread load.
+/// OS, Device, Cores, Architecture, Memory.
 /// Returns an empty `Vec` when the peer has reported nothing ("if available").
+///
+/// The `client_main_thread_load` field is deliberately NOT surfaced here
+/// (issue 1606): in the browser it is `sum(longtask_ms) / interval_ms`, which
+/// is a genuine `0.0` whenever the main thread is idle (the common case), so it
+/// read `0% load` for nearly everyone. True process/CPU % is not obtainable in
+/// browser JS, so the user-facing device line drops the segment entirely. The
+/// field still flows to the proto + health reporter + Prometheus/Grafana, where
+/// the 0-vs-None distinction is meaningful for analysis.
 ///
 /// Pure + host-testable: the diagnostics panel and the signal-quality popup
 /// both render from this single source of truth, so the labels/format live in
@@ -267,24 +263,19 @@ pub fn format_peer_device_lines(info: &PeerDeviceInfo) -> Vec<(String, String)> 
     if let Some(mem) = info.client_device_memory_gb {
         rows.push(("Memory".to_string(), format_device_memory_gb(mem)));
     }
-    if let Some(load) = info.client_main_thread_load {
-        rows.push((
-            "Main-thread load".to_string(),
-            format_main_thread_load_pct(load),
-        ));
-    }
     rows
 }
 
 /// Render the per-peer device rows as a single COMPACT dot-separated line for
 /// the small signal-quality popup, e.g.
-/// `"macOS 14.5 · desktop · 8 cores · 8 GB · 42% load"`. Returns `None` when
+/// `"macOS 14.5 · desktop · 8 cores · arm · 8 GB"`. Returns `None` when
 /// there is nothing to show so the caller can omit the block. (#1482.)
 ///
 /// Built on the same `format_peer_device_lines` source of truth: it relabels
-/// the verbose panel rows into compact tokens (Cores → "N cores", Main-thread
-/// load → "N% load", OS/Device/Architecture/Memory as-is) so the panel and the
-/// popup can never drift apart on which fields are present.
+/// the verbose panel rows into compact tokens (Cores → "N cores",
+/// OS/Device/Architecture/Memory as-is) so the panel and the popup can never
+/// drift apart on which fields are present. The always-`0%` main-thread "load"
+/// segment was dropped from the user-facing line in issue 1606.
 pub fn format_peer_device_compact(info: &PeerDeviceInfo) -> Option<String> {
     let rows = format_peer_device_lines(info);
     if rows.is_empty() {
@@ -294,7 +285,6 @@ pub fn format_peer_device_compact(info: &PeerDeviceInfo) -> Option<String> {
         .into_iter()
         .map(|(label, value)| match label.as_str() {
             "Cores" => format!("{value} cores"),
-            "Main-thread load" => format!("{value} load"),
             // OS / Device / Architecture / Memory render as the bare value.
             _ => value,
         })
@@ -5893,12 +5883,14 @@ mod tests {
     // ── #1482 per-peer device formatter ────────────────────────────────
     // These pin the EXACT label + value strings the diagnostics panel and
     // the signal popup render, so mutating any format string (e.g. "{} GB"
-    // → "{} G", or the "Main-thread load" label, or the "%" suffix) fails
-    // the assertion against a real literal (not X==X).
+    // → "{} G", or the "%" suffix) fails the assertion against a real literal
+    // (not X==X). Issue 1606 removed the always-0% "Main-thread load" row from
+    // the user-facing line; the absence is pinned below.
 
     /// (a) Every field present → every expected pair, in the fixed order
-    /// OS, Device, Cores, Architecture, Memory, Main-thread load, with the
-    /// exact formatted value strings.
+    /// OS, Device, Cores, Architecture, Memory, with the exact formatted value
+    /// strings. The `client_main_thread_load` field is set here but MUST NOT
+    /// appear in the user-facing rows (issue 1606).
     #[test]
     fn format_peer_device_lines_all_fields_in_order() {
         let info = PeerDeviceInfo {
@@ -5919,7 +5911,6 @@ mod tests {
                 ("Cores".to_string(), "8".to_string()),
                 ("Architecture".to_string(), "arm".to_string()),
                 ("Memory".to_string(), "8 GB".to_string()),
-                ("Main-thread load".to_string(), "42%".to_string()),
             ]
         );
     }
@@ -5950,26 +5941,44 @@ mod tests {
         );
     }
 
-    /// (d) Main-thread load 0.42 → exactly "42%" (rounded integer percent).
+    /// (d) Issue 1606: a reported main-thread load is NOT surfaced on the
+    /// user-facing device line. With ONLY `client_main_thread_load` set the
+    /// row list is empty, and even alongside other fields no "load" row/value
+    /// appears. Mutation-meaningful: re-adding the `Main-thread load` push to
+    /// `format_peer_device_lines` fails this test.
     #[test]
-    fn format_peer_device_lines_main_thread_load_pct() {
-        let info = PeerDeviceInfo {
+    fn format_peer_device_lines_omits_main_thread_load() {
+        // Load alone → nothing to render (no load-only block).
+        let load_only = PeerDeviceInfo {
             client_main_thread_load: Some(0.42),
             ..Default::default()
         };
-        let rows = format_peer_device_lines(&info);
-        assert_eq!(
-            rows,
-            vec![("Main-thread load".to_string(), "42%".to_string())]
+        assert!(
+            format_peer_device_lines(&load_only).is_empty(),
+            "main-thread load must not produce a user-facing row (issue 1606)"
         );
-        // Rounds to nearest integer (0.426 → 43%, not truncated 42%).
-        let info2 = PeerDeviceInfo {
-            client_main_thread_load: Some(0.426),
+
+        // Load alongside real fields → only the real fields, no load row.
+        let with_others = PeerDeviceInfo {
+            client_os: Some("macOS 14.5".to_string()),
+            client_cores: Some(8),
+            client_main_thread_load: Some(0.42),
             ..Default::default()
         };
+        let rows = format_peer_device_lines(&with_others);
+        assert!(
+            !rows.iter().any(|(label, value)| label.contains("load")
+                || label.contains("Load")
+                || value.contains("load")
+                || value == "42%"),
+            "no load label/value may appear in the device rows (issue 1606): {rows:?}"
+        );
         assert_eq!(
-            format_peer_device_lines(&info2),
-            vec![("Main-thread load".to_string(), "43%".to_string())]
+            rows,
+            vec![
+                ("OS".to_string(), "macOS 14.5".to_string()),
+                ("Cores".to_string(), "8".to_string()),
+            ]
         );
     }
 
@@ -5995,8 +6004,10 @@ mod tests {
         );
     }
 
-    /// Compact popup form: dot-separated, with "N cores" and "N% load"
-    /// relabels. Pins the exact compact string the small popup renders.
+    /// Compact popup form: dot-separated, with the "N cores" relabel. Pins the
+    /// exact compact string the small popup renders. Issue 1606: even though
+    /// `client_main_thread_load` is set, NO `% load` segment (and no dangling
+    /// trailing ` · `) appears.
     #[test]
     fn format_peer_device_compact_full_line() {
         let info = PeerDeviceInfo {
@@ -6008,9 +6019,17 @@ mod tests {
             client_memory_used_mb: None,
             client_device_memory_gb: Some(8.0),
         };
-        assert_eq!(
-            format_peer_device_compact(&info),
-            Some("macOS 14.5 · desktop · 8 cores · arm · 8 GB · 42% load".to_string())
+        let line = format_peer_device_compact(&info)
+            .expect("a fully-populated peer must produce a compact device line");
+        assert_eq!(line, "macOS 14.5 · desktop · 8 cores · arm · 8 GB");
+        // No load token, no dangling separator from the removed segment.
+        assert!(
+            !line.contains("load"),
+            "compact line must not contain a load segment (issue 1606): {line}"
+        );
+        assert!(
+            !line.ends_with(" · "),
+            "compact line must not end with a dangling separator: {line}"
         );
         // Nothing reported → None so the popup omits the block.
         assert_eq!(format_peer_device_compact(&PeerDeviceInfo::default()), None);

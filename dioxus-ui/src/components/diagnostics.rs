@@ -2039,17 +2039,44 @@ fn SimulcastReceiveBreakdown(
             // #1482: per-peer device / hardware block. Rendered only when at
             // least one peer reported something ("if available"); each block
             // lists the present `label: value` rows from `format_peer_device_lines`.
+            //
+            // issue 1606: with many attendees this section grew unbounded, so it
+            // is wrapped in a native `<details>` disclosure that is COLLAPSED by
+            // DEFAULT (no `open` attr) — the space-saving goal. It reuses the
+            // drawer's existing `diag-disclosure` pattern (summary + chevron) for
+            // visual consistency with the Raw-stats / Build-info / Per-metric
+            // disclosures above. The summary shows the peer COUNT so the user
+            // knows how many blocks are hidden without expanding.
             if !device_blocks.is_empty() {
-                div { class: "diag-device",
-                    span { class: "diag-device-title", "Device (per peer)" }
-                    for (session_id , peer_label , lines) in device_blocks.into_iter() {
-                        div { class: "diag-device-peer",
-                            "data-testid": "diag-device-peer-{session_id}",
-                            span { class: "diag-device-peer-label", "{peer_label}" }
-                            for (label , value) in lines.into_iter() {
-                                div { class: "diag-device-row",
-                                    span { class: "diag-device-row-label", "{label}" }
-                                    span { class: "diag-device-row-value", "{value}" }
+                {
+                    let device_count = device_blocks.len();
+                    rsx! {
+                        details { class: "diag-disclosure diag-device",
+                            summary { id: "diag-h-device", class: "diag-disclosure-summary",
+                                svg {
+                                    class: "diag-disclosure-chev",
+                                    width: "12",
+                                    height: "12",
+                                    view_box: "0 0 12 12",
+                                    path {
+                                        d: "M4 2 L8 6 L4 10",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "1.5",
+                                    }
+                                }
+                                "Per-peer hardware ({device_count})"
+                            }
+                            for (session_id , peer_label , lines) in device_blocks.into_iter() {
+                                div { class: "diag-device-peer",
+                                    "data-testid": "diag-device-peer-{session_id}",
+                                    span { class: "diag-device-peer-label", "{peer_label}" }
+                                    for (label , value) in lines.into_iter() {
+                                        div { class: "diag-device-row",
+                                            span { class: "diag-device-row-label", "{label}" }
+                                            span { class: "diag-device-row-value", "{value}" }
+                                        }
+                                    }
                                 }
                             }
                         }
