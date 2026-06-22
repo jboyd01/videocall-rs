@@ -516,6 +516,34 @@ pub fn layer_quality_label(index: u32, count: u32, compact: bool) -> &'static st
     }
 }
 
+/// SEND-side simulcast LED predicate (issue #1607): is layer `layer_id` currently
+/// being ENCODED + SENT? A layer is lit (ON) when it is below the shed-aware
+/// active boundary (`layer_id < active_layers`) and dark (OFF) otherwise.
+///
+/// `active_layers` is the live, shed-aware active-layer count carried on
+/// [`SimulcastSendSnapshot`](videocall_client::SimulcastSendSnapshot) — for a
+/// 3-rung ladder with 2 active, layers 0 and 1 are ON and layer 2 (shed under
+/// congestion) is OFF. This is the same `layer_id < active_layers` boundary the
+/// SEND ladder already used to pick the `is-active`/`is-shed` rung class; pulling
+/// it into a named pure fn makes the LED on/off decision host-testable and
+/// mutation-meaningful. Pure / host-tested.
+pub fn layer_led_on(layer_id: u32, active_layers: u32) -> bool {
+    layer_id < active_layers
+}
+
+/// RECEIVE-side simulcast LED predicate (issue #1607): is layer `layer_id` the
+/// one this receiver is CURRENTLY decoding for a kind from a peer?
+///
+/// Unlike the SEND side (where every layer at or below the active boundary is
+/// simultaneously encoded), a receiver decodes EXACTLY ONE simulcast layer per
+/// kind at a time — the post-clamp selected `layer_index` on
+/// [`ReceivedLayerSnapshot`]. So the LED is lit (ON) only for the exact received
+/// index and dark (OFF) for every other rung — an equality, NOT a `<=` threshold.
+/// Pure / host-tested.
+pub fn received_layer_led_on(layer_id: u32, received_index: u32) -> bool {
+    layer_id == received_index
+}
+
 /// Format the RECEIVE per-kind layer spread across peers by quality LETTER, e.g.
 /// `"L–H"`, or a single letter `"H"` when every peer is on the same layer.
 /// `layers` is the list of 0-based `layer_index` values; `count` is the ladder
@@ -4449,6 +4477,47 @@ mod tests {
         assert_eq!(layer_quality_label(1, 4, false), "Medium");
         assert_eq!(layer_quality_label(2, 4, false), "Medium");
         assert_eq!(layer_quality_label(3, 4, false), "High");
+    }
+
+    /// SEND LED predicate (issue #1607): ON for layers BELOW the shed-aware active
+    /// boundary, OFF at/above it. This is the source of truth for the per-rung LED
+    /// dot — for a 3-rung ladder with 2 active, L0/L1 light and L2 (shed) is dark.
+    /// Mutating the predicate to `<=` would light the first shed rung → the
+    /// `!layer_led_on(2, 2)` assertion fails; mutating to `>` flips every case.
+    #[test]
+    fn send_led_on_only_below_active_boundary() {
+        // 3-rung ladder, 2 active: L0, L1 ON; L2 (shed) OFF.
+        assert!(layer_led_on(0, 2), "base layer is sent → ON");
+        assert!(layer_led_on(1, 2), "second active layer → ON");
+        assert!(!layer_led_on(2, 2), "shed top layer → OFF");
+        // Full ladder (all active): every rung ON.
+        assert!(layer_led_on(0, 3));
+        assert!(layer_led_on(1, 3));
+        assert!(layer_led_on(2, 3));
+        // Base-only (active == 1): only L0 ON, the rest OFF.
+        assert!(layer_led_on(0, 1));
+        assert!(!layer_led_on(1, 1));
+        assert!(!layer_led_on(2, 1));
+    }
+
+    /// RECEIVE LED predicate (issue #1607): a receiver decodes EXACTLY ONE layer
+    /// per kind, so the LED is ON only for the exact received index and OFF for
+    /// every other rung — an equality, not a `<=` threshold. Mutating to `<=`
+    /// would light L0 while receiving L1 → `!received_layer_led_on(0, 1)` fails;
+    /// mutating to `<` would dark the received rung → `received_layer_led_on(1, 1)`
+    /// fails.
+    #[test]
+    fn receive_led_on_only_for_exact_received_index() {
+        // Receiving L1 of a 3-rung ladder: ONLY L1 lit.
+        assert!(!received_layer_led_on(0, 1), "below received index → OFF");
+        assert!(received_layer_led_on(1, 1), "received index → ON");
+        assert!(!received_layer_led_on(2, 1), "above received index → OFF");
+        // Receiving the base (L0): only L0 lit.
+        assert!(received_layer_led_on(0, 0));
+        assert!(!received_layer_led_on(1, 0));
+        // Receiving the top (L2): only L2 lit.
+        assert!(!received_layer_led_on(1, 2));
+        assert!(received_layer_led_on(2, 2));
     }
 
     #[test]

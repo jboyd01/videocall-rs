@@ -9932,9 +9932,57 @@ details.perf-peers[open] .perf-peers__chev {
   opacity: 0.5;
 }
 
+/* issue 1607: the LED dot sits to the LEFT of the quality letter on its own
+   header row so the on/off state reads at a glance. */
+.simulcast-rung-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .simulcast-rung-id {
   font-weight: 600;
   color: var(--text-secondary);
+}
+
+/* issue 1607: simulcast layer LED — an unambiguous on/off dot shared by the SEND
+   ladder rungs and the RECEIVE per-peer rows. ON = filled green (the layer is
+   actually being sent / received); OFF = hollow grey ring (the layer is shed /
+   not received). The shed rung also dims (see `.is-shed` above), but the hollow
+   dot is the primary affordance so "off" never reads as "on, slightly faded". */
+.simulcast-led {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+}
+
+.simulcast-led.is-on {
+  background: var(--success);
+  border: 1px solid var(--success);
+  box-shadow: 0 0 3px var(--success-glow-vivid);
+}
+
+.simulcast-led.is-off {
+  /* hollow ring on the panel surface: no fill, grey border. */
+  background: transparent;
+  border: 1px solid var(--text-tertiary);
+  opacity: 0.7;
+}
+
+/* issue 1607: compact LED strip for the RECEIVE per-peer rows (one dot per
+   ladder layer, lit for the layer that peer is currently decoding). */
+.simulcast-led-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-bottom: 1px;
+}
+
+.simulcast-recv-peer-line {
+  display: block;
 }
 
 .simulcast-rung-res,
