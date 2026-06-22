@@ -391,7 +391,8 @@ jobs:
             --set "env[5].name=OAUTH_CLIENT_ID" \
             --set "env[5].value=client_01KRGZ7VSEAEMBJW0RF110J8R2" \
             --set "env[6].name=OAUTH_SECRET" \
-            --set "env[6].value=" \  # Empty for PKCE flow (public client, no static secret)
+            # Empty for PKCE flow (public client, no static secret)
+            --set "env[6].value=" \
             --set "env[7].name=OAUTH_REDIRECT_URL" \
             --set "env[7].value=https://app.videocall.conceptcar7.com/auth/callback" \
             --set "env[8].name=AFTER_LOGIN_URL" \

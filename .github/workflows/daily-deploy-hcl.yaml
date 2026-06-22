@@ -1,5 +1,11 @@
 name: Daily Deploy to HCL Daily-Dev
 
+# NOTE: workflow_run trigger is currently non-functional due to GitHub Actions API limitation.
+# The REST API /repos/.../actions/runs/{id}/jobs endpoint does not expose job outputs,
+# so the image tag cannot be retrieved from the build workflow. This workflow must be
+# manually triggered via workflow_dispatch with the image_tag input.
+# See: https://github.com/orgs/community/discussions/26639
+
 on:
   workflow_run:
     workflows: ["Daily Build Images (HCL)"]
@@ -403,11 +409,11 @@ jobs:
             --set "env[14].name=COOKIE_SECURE" \
             --set-string "env[14].value=true" \
             --set "env[15].name=SERVICE_VERSION_URLS" \
-            --set "env[14].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
-            --set "env[15].name=TOKEN_TTL_SECS" \
-            --set-string "env[15].value=86400" \
-            --set "env[16].name=NATS_URL" \
-            --set "env[16].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
+            --set "env[15].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
+            --set "env[16].name=TOKEN_TTL_SECS" \
+            --set-string "env[16].value=86400" \
+            --set "env[17].name=NATS_URL" \
+            --set "env[17].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
             --set ingress.enabled=true \
             --set "ingress.hosts[0].host=api.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
