@@ -108,13 +108,13 @@ canvas {
 
 h2 {
   margin: 0;
-  font-size: 18px;
+  font-size: var(--fs-8);
   font-weight: 600;
 }
 
 h3 {
   margin: 20px 0 10px 0;
-  font-size: 16px;
+  font-size: var(--fs-7);
   font-weight: 500;
   color: var(--text-secondary);
 }
@@ -152,7 +152,7 @@ h3 {
 
 .peer-list li {
   margin-top: 10px;
-  font-size: 16px;
+  font-size: var(--fs-7);
   border-radius: 5px;
 }
 
@@ -500,7 +500,7 @@ h3 {
   border: 2px solid var(--color-border-emphasis);
   border-radius: 10px;
   color: var(--text-secondary);
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
   font-weight: 600;
   gap: 4px;
 }
@@ -628,7 +628,7 @@ h3 {
   justify-content: center;
   border-radius: var(--radius-md, 10px);
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   cursor: pointer;
   color: var(--warning);
@@ -1141,7 +1141,7 @@ select {
 
 .diagnostics-data {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-3);
   white-space: pre-wrap;
 }
 
@@ -1188,7 +1188,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
   margin: 20px 0 8px;
   padding-top: 16px;
   border-top: 1px solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1224,7 +1224,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
      (`.diag-disclosure-chev`) inside the summary so the open/closed affordance
      is consistent across browsers (Fix B), mirroring `.perf-peers__summary`. */
   list-style: none;
-  font-size: 16px;
+  font-size: var(--fs-7);
   font-weight: 600;
   color: var(--text-primary);
   padding: 4px 0;
@@ -1269,7 +1269,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .diag-neteq-placeholder {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 14px;
+  font-size: var(--fs-5);
 }
 /* Each folded raw-stats block (Reception / Sending / Encoder / Media Status)
    keeps its own sub-heading inside the one disclosure. */
@@ -1278,7 +1278,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 .diag-raw-block h4 {
   margin: 0 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -1323,7 +1323,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 #diagnostics-sidebar .diagnostics-section h3 {
   color: var(--text-primary);
-  font-size: 16px;
+  font-size: var(--fs-7);
   margin-bottom: 10px;
   padding-bottom: 5px;
   border-bottom: 1px solid var(--glass-bg-hover);
@@ -1334,7 +1334,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    (iteration 3 polish). */
 #diagnostics-sidebar .diagnostics-data pre {
   font-family: monospace;
-  font-size: 13px;
+  font-size: var(--fs-4);
   white-space: pre-wrap;
   color: var(--diag-mono-text);
   background-color: var(--surface);
@@ -1372,7 +1372,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 #diagnostics-sidebar .sidebar-header h2 {
   margin: 0;
-  font-size: 18px;
+  font-size: var(--fs-8);
   color: var(--text-primary);
 }
 
@@ -1380,7 +1380,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: none;
   border: none;
   color: var(--text-primary);
-  font-size: 24px;
+  font-size: var(--fs-10);
   cursor: pointer;
   padding: 0 5px;
 }
@@ -1441,7 +1441,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   transition: all 0.2s ease;
   color: var(--text-primary);
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
 }
 
 .close-button:hover {
@@ -1558,7 +1558,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .neteq-chart .chart-title {
-  font-size: 10px;
+  font-size: var(--fs-1);
   color: var(--text-secondary);
   margin-bottom: 5px;
   text-align: center;
@@ -1581,7 +1581,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .neteq-advanced-chart .chart-title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: bold;
   margin-bottom: 10px;
   color: var(--text-primary);
@@ -1604,7 +1604,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .neteq-advanced-chart .chart-title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 600;
   color: var(--text-primary);
   margin-bottom: 6px;
@@ -1650,16 +1650,16 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-variant-numeric: tabular-nums;
 }
 .neteq-status .status-stat__label {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   color: var(--text-secondary);
 }
 .neteq-status .status-stat__unit {
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--text-tertiary);
 }
 .neteq-status .status-stat__reason {
-  font-size: 11px;
+  font-size: var(--fs-2);
   line-height: 1.3;
   margin-top: 2px;
   color: var(--text-secondary);
@@ -1680,11 +1680,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-bottom: 1px solid var(--border);
 }
 .neteq-status .status-row__label {
-  font-size: 13px;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
 }
 .neteq-status .status-row__value {
-  font-size: 16px;
+  font-size: var(--fs-7);
   font-weight: 600;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
@@ -1697,7 +1697,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   align-items: baseline;
   gap: 4px 12px;
   padding-top: 4px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
 }
 .neteq-status .status-reorder__head {
@@ -1705,7 +1705,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.4px;
-  font-size: 11px;
+  font-size: var(--fs-2);
 }
 
 /* Quality tinting — VALUE color only; canonical tokens (Directive 5) */
@@ -1754,7 +1754,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin-bottom: 6px;
 }
 .neteq-charts-stack .diag-chart-head__title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 600;
   color: var(--text-primary);
 }
@@ -1782,7 +1782,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--border-emphasis);
   border-radius: 4px;
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: var(--fs-5);
   margin: 8px 0;
   /* ≥44px tap target for the Peer Selection AND Transport Preference selects
      (both use this class) on touch devices (iteration 3 polish). */
@@ -1796,7 +1796,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-info {
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
   margin: 5px 0 0 0;
   font-style: italic;
@@ -1831,12 +1831,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .peer-summary-item strong {
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: var(--fs-4);
 }
 
 .peer-summary-item span {
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
 }
 
@@ -1867,7 +1867,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .peer-summary-item span {
-    font-size: 10px;
+    font-size: var(--fs-1);
   }
 }
 
@@ -2122,7 +2122,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: transparent;
   border: none;
   color: var(--text-primary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   text-align: left;
   cursor: pointer;
   display: flex;
@@ -2161,7 +2161,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-info-compact {
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--glass-bg-hover);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 .info-row {
@@ -2419,7 +2419,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .connection-quality-label {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 500;
   color: var(--text-on-glass-high);
   white-space: nowrap;
@@ -2484,7 +2484,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: transparent;
   border: none;
   color: var(--text-secondary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -2504,7 +2504,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meetings-list-toggle .meeting-count {
   margin-left: auto;
   color: var(--text-quaternary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 .meetings-list-content {
@@ -2522,7 +2522,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 1rem;
   text-align: center;
   color: var(--text-tertiary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 .meetings-auth-prompt {
@@ -2535,7 +2535,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .meetings-auth-text {
   color: var(--text-secondary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   margin: 0;
 }
@@ -2576,7 +2576,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button, 10px);
   color: var(--text-primary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -2672,7 +2672,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: #fff
     /* @token-exempt: badge text on accent fill */
   ;
-  font-size: 0.625rem;
+  font-size: var(--fs-1);
   font-weight: 700;
   line-height: 1;
 }
@@ -2687,7 +2687,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button, 10px);
   color: var(--text-secondary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
     color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
@@ -2802,7 +2802,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0;
   margin-bottom: 0.125rem;
   text-align: left;
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -2819,7 +2819,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin: 0;
   padding: 0.25rem;
   text-align: left;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
   cursor: pointer;
   border-radius: var(--radius-button, 8px);
@@ -2856,7 +2856,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: none;
   border-radius: var(--radius-button, 8px);
   color: var(--text-secondary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   cursor: pointer;
 }
 
@@ -2891,7 +2891,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button, 10px);
   color: var(--text-primary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -2982,7 +2982,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     "SF Mono", "Fira Code", "Cascadia Code", ui-monospace, Menlo, monospace;
   font-weight: 600;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   letter-spacing: 0.02em;
   color: var(--text-primary);
   padding: 0.125rem 0.4375rem;
@@ -2995,7 +2995,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .meeting-state {
-  font-size: 0.625rem;
+  font-size: var(--fs-1);
   padding: 0.125rem 0.4375rem;
   border-radius: var(--radius-pill, 9999px);
   font-weight: 500;
@@ -3023,7 +3023,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   gap: 0.375rem;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-quaternary);
   flex-wrap: nowrap;
   overflow: hidden;
@@ -3122,14 +3122,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .meeting-time {
   color: var(--text-on-glass-faint);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   white-space: nowrap;
   flex-shrink: 0;
 }
 
 .meeting-time-separator {
   color: var(--text-on-glass-ghost);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   flex-shrink: 0;
 }
 
@@ -3142,7 +3142,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-bg-hover);
   border-radius: 8px;
   padding: 0.3125rem 0.5rem;
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   color: var(--text-on-glass);
   white-space: nowrap;
   pointer-events: none;
@@ -3181,7 +3181,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .meeting-info-tooltip-label {
   color: var(--text-on-glass-fainter);
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   font-weight: 400;
 }
 
@@ -3269,7 +3269,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .waiting-room-card h2 {
   margin: 0 0 0.5rem 0;
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
   font-weight: 600;
 }
 
@@ -3288,7 +3288,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .waiting-room-error {
   color: var(--error-text-vivid);
   margin-bottom: 1rem;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
 }
 
 .waiting-room-spinner {
@@ -3357,7 +3357,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: transparent;
   border: none;
   color: var(--text-primary);
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   cursor: pointer;
   transition: background-color 0.2s ease;
 }
@@ -3380,7 +3380,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-primary);
   padding: 0.125rem 0.5rem;
   border-radius: 10px;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   font-weight: 600;
   min-width: 20px;
   text-align: center;
@@ -3421,7 +3421,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .participant-email {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   color: var(--text-on-glass-high);
   max-width: 200px;
   overflow: hidden;
@@ -3480,7 +3480,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: none;
   background: var(--success-bg-soft);
   color: var(--success);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   display: flex;
   align-items: center;
@@ -3531,7 +3531,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .rejected-card h2,
 .error-card h2 {
   margin: 1rem 0 0.5rem 0;
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
   font-weight: 600;
 }
 
@@ -3561,7 +3561,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   height: 44px;
   letter-spacing: 0.01em;
   outline: none;
@@ -3679,7 +3679,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   height: 44px;
   letter-spacing: 0.01em;
   outline: none;
@@ -3757,7 +3757,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 500;
   height: 44px;
   letter-spacing: 0.01em;
@@ -3826,7 +3826,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: none;
   border: none;
   color: var(--accent);
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 500;
   cursor: pointer;
   padding: 0.625rem 0.75rem;
@@ -3862,7 +3862,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-card-title {
   margin: 0 0 1.25rem 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -4038,7 +4038,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .prejoin-select-group label {
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -4126,7 +4126,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-secondary);
   font-family:
     "SF Mono", "Fira Code", "Cascadia Code", ui-monospace, Menlo, monospace;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   letter-spacing: 0.02em;
   line-height: 1.4;
@@ -4137,7 +4137,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .join-meeting-subtitle {
   margin: 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 400;
   line-height: 1.45;
   color: var(--text-secondary);
@@ -4150,7 +4150,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .join-meeting-id {
-    font-size: 0.8125rem;
+    font-size: var(--fs-4);
     padding: 0.125rem 0.5rem;
   }
 }
@@ -4174,7 +4174,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-field-label {
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 500;
   color: var(--text-primary);
   flex-shrink: 0;
@@ -4182,7 +4182,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-field-value {
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   color: var(--text-secondary);
   text-align: right;
   min-width: 0;
@@ -4193,7 +4193,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-field-mono {
   font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   letter-spacing: 0.02em;
 }
 
@@ -4203,7 +4203,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    This modifier restores wrapping for the long URL so it stays inside the card.
    `min-width: 0` lets it shrink as a flex child of the column-layout row. */
 .settings-guest-link {
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   white-space: normal;
   overflow: visible;
   text-overflow: clip;
@@ -4232,7 +4232,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-field .meeting-state {
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   padding: 0.1875rem 0.5625rem;
 }
 
@@ -4259,13 +4259,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-stat-label {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-tertiary);
 }
 
 .settings-stat-value {
   margin-left: auto;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 400;
   color: var(--text-secondary);
   white-space: nowrap;
@@ -4304,7 +4304,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-option-label {
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 500;
   color: var(--text-primary);
 }
@@ -4426,7 +4426,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 3px 7px;
   border-radius: 6px;
   gap: 2px;
-  font-size: 13px;
+  font-size: var(--fs-4);
   max-width: 70%;
   white-space: normal;
   text-overflow: clip;
@@ -4456,7 +4456,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   height: 40px;
 }
 .split-peer-tile .placeholder-text {
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
 }
 
 /* Top icon bar */
@@ -4533,7 +4533,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--settings-tooltip-border);
   border-radius: 8px;
   padding: 0.5rem 0.75rem;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   line-height: 1.4;
   color: var(--text-secondary);
   white-space: normal;
@@ -4565,7 +4565,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 0.5rem;
   width: 100%;
   height: 40px;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
 }
 
@@ -4598,7 +4598,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-danger-label {
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -4629,7 +4629,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 1rem;
   min-height: 200px;
   color: var(--text-secondary);
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
 }
 
 .settings-loading-state .loading-spinner {
@@ -4651,13 +4651,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-empty-state h2 {
   margin: 0.5rem 0 0;
-  font-size: 1.25rem;
+  font-size: var(--fs-9);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .settings-empty-state p {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   color: var(--text-tertiary);
   max-width: 280px;
 }
@@ -4675,12 +4675,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .settings-field-label {
-    font-size: 0.875rem;
+    font-size: var(--fs-5);
     margin-right: 1.5rem;
   }
 
   .settings-field-value {
-    font-size: 0.875rem;
+    font-size: var(--fs-5);
   }
 }
 
@@ -4808,7 +4808,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 500;
   line-height: 1.3;
   animation: decode-banner-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
@@ -4849,7 +4849,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .decode-budget-banner-action {
   padding: 0 14px;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--warning);
   background: var(--btn-warning-bg);
@@ -4913,7 +4913,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   .decode-budget-banner {
     gap: 8px;
     padding: 6px 8px 6px 12px;
-    font-size: 12px;
+    font-size: var(--fs-3);
   }
   .decode-budget-banner-text {
     display: none;
@@ -4923,7 +4923,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
   .decode-budget-banner-action {
     padding: 0 10px;
-    font-size: 12px;
+    font-size: var(--fs-3);
   }
 }
 
@@ -4988,7 +4988,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex: 1;
   min-width: 0;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 500;
 }
 
@@ -4998,7 +4998,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex: 1;
   min-width: 0;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
 }
 
@@ -5019,7 +5019,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: var(--btn-warning-bg);
   border: 1px solid var(--btn-warning-border);
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   cursor: pointer;
 }
@@ -5104,10 +5104,10 @@ html[data-theme="light"] .decode-paused-pill-action {
   }
   .decode-paused-pill-count {
     display: inline-block;
-    font-size: 12px;
+    font-size: var(--fs-3);
   }
   .decode-paused-pill-action {
-    font-size: 12px;
+    font-size: var(--fs-3);
   }
 }
 
@@ -5150,7 +5150,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 500;
   line-height: 1.3;
   box-shadow:
@@ -5353,7 +5353,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
   .peer-toast {
     padding: 8px 12px;
-    font-size: 12px;
+    font-size: var(--fs-3);
     border-radius: 10px;
   }
 
@@ -5434,7 +5434,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   margin: 0 0 14px;
   padding: 18px 30px 18px;
 
-  font-size: 28px;
+  font-size: var(--fs-11);
   font-weight: 420;
   line-height: 1;
   letter-spacing: -0.028em;
@@ -5503,7 +5503,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
   border-radius: 999px;
 
-  font-size: 15px;
+  font-size: var(--fs-6);
   font-weight: 560;
   letter-spacing: -0.012em;
   text-align: left;
@@ -5630,7 +5630,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .settings-section-description {
   margin: -4px 0 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 400;
   line-height: 1.55;
   letter-spacing: -0.002em;
@@ -5647,7 +5647,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   border: 1px dashed var(--settings-placeholder-border);
   background: var(--settings-placeholder-bg);
   color: var(--text-tertiary);
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   line-height: 1.5;
 }
 
@@ -5671,7 +5671,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .settings-section .device-setting-group label {
   color: var(--text-primary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
   margin-bottom: 10px;
 }
@@ -5703,7 +5703,7 @@ html[data-theme="light"] .decode-paused-pill-action {
     box-shadow 0.2s ease,
     background 0.2s ease;
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-family: inherit;
   text-align: left;
 }
@@ -5777,7 +5777,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   border-radius: 6px;
   color: var(--text-primary);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-5);
   transition: background 0.15s ease;
   white-space: nowrap;
   overflow: hidden;
@@ -5829,7 +5829,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .transport-preference-note {
   margin: 8px 0 0;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
   font-style: italic;
 }
@@ -5861,7 +5861,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   /* Override the default 600 / 10px-bottom-margin label styling used by the
      dropdowns above — this label sits inline with a toggle, not above an
      input. */
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   margin-bottom: 0;
   cursor: pointer;
@@ -5870,7 +5870,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .sticky-protocol-hint {
   margin: 0;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   line-height: 1.4;
   color: var(--text-secondary);
 }
@@ -5911,7 +5911,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .settings-info-panel-title {
   margin: 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   letter-spacing: 0.01em;
   color: var(--text-primary);
@@ -5919,7 +5919,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .settings-info-panel-text {
   margin: 0;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   line-height: 1.45;
   color: var(--text-secondary);
 }
@@ -5937,7 +5937,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 .transport-segmented-label {
   display: block;
   color: var(--text-primary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
   margin-bottom: 10px;
 }
@@ -5969,7 +5969,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   /* @token-exempt: calm secondary */
   cursor: pointer;
   font-family: inherit;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   letter-spacing: 0.01em;
   padding: 8px 12px;
@@ -6093,7 +6093,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   color: var(--text-primary);
   cursor: pointer;
   font-family: inherit;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
   letter-spacing: 0.01em;
   height: 36px;
@@ -6230,7 +6230,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 .appearance-section-title--sm {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
 }
 
@@ -6254,7 +6254,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
   max-width: 560px;
 
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 400;
   line-height: 1.55;
   letter-spacing: -0.01em;
@@ -6277,7 +6277,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .appearance-control-label {
   /* Quiet control label — regular weight, primary color so it stays
      readable while sitting clearly below section titles. */
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 400;
   letter-spacing: -0.003em;
   color: var(--text-primary);
@@ -6486,7 +6486,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   flex: 1;
   min-width: 0;
   padding: 6px 10px;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-family: monospace;
   color: var(--text-primary);
   background: var(--settings-input-bg);
@@ -6511,7 +6511,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-add-btn {
   padding: 6px 14px;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--text-primary);
   background: var(--glass-bg-hover);
@@ -6579,7 +6579,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-modal-title {
   margin: 0;
-  font-size: 1rem;
+  font-size: var(--fs-7);
   font-weight: 600;
   color: var(--text-primary);
   letter-spacing: -0.005em;
@@ -6587,7 +6587,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-modal-subtitle {
   margin: 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
   line-height: 1.35;
 }
@@ -6766,7 +6766,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 .color-picker-hex-label {
-  font-size: 0.625rem;
+  font-size: var(--fs-1);
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -6844,7 +6844,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-cancel-btn {
   padding: 6px 14px;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--text-secondary);
   background: transparent;
@@ -6878,7 +6878,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 /* Error message for settings inputs */
 .input-error-message {
   color: var(--error-text);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   margin-top: 0.25rem;
   display: block;
 }
@@ -6894,14 +6894,14 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .slider-header label,
 .preview-label {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 400;
   letter-spacing: -0.003em;
   color: var(--text-primary);
 }
 
 .slider-value {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
 }
 
@@ -6949,7 +6949,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .speaker-highlight-preview-caption {
   margin-top: 10px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   line-height: 1.25;
   color: var(--text-tertiary);
   white-space: normal;
@@ -6999,7 +6999,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .slider-row-label,
 .appearance-slider-label {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 400;
   letter-spacing: -0.003em;
   color: var(--text-primary);
@@ -7007,7 +7007,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .slider-row-value,
 .appearance-slider-value {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 500;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
@@ -7180,7 +7180,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   height: 32px;
   min-width: 92px;
   padding: 0 18px;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 500;
   letter-spacing: -0.005em;
   box-shadow: none;
@@ -7520,7 +7520,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   }
 
   .settings-section-title {
-    font-size: 1rem;
+    font-size: var(--fs-7);
   }
 
   .settings-placeholder {
@@ -7622,7 +7622,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .signal-quality-popup .popup-title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 600;
 }
 
@@ -7644,7 +7644,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .signal-quality-popup .connection-type {
   padding: 2px 8px;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   line-height: 1;
   letter-spacing: 0.02em;
@@ -7683,7 +7683,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .connection-type {
   padding: 2px 8px;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: var(--fs-2);
 }
 .type-websocket {
   background: #1c1c1e;
@@ -7701,7 +7701,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: none;
   color: var(--signal-popup-close-text);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-5);
   width: 28px;
   height: 28px;
   display: flex;
@@ -7728,7 +7728,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: none;
   color: var(--signal-popup-close-text);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-5);
   width: 28px;
   height: 28px;
   display: flex;
@@ -7874,7 +7874,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 /* The 2-hour retention caption, shown only when a peer's deque is at cap. */
 .neteq-chart-cap-note {
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-style: italic;
   color: var(--text-tertiary);
 }
@@ -7892,7 +7892,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   flex-wrap: wrap;
   gap: 12px;
   margin-top: 8px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--text-secondary);
 }
 
@@ -7997,7 +7997,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border-top: 1px solid var(--signal-popup-border);
 }
 .signal-popup-layers__head {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -8027,7 +8027,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 .signal-popup-device__head {
   display: block;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -8036,7 +8036,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 .signal-popup-device__line {
   display: block;
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--text-tertiary);
   word-break: break-word;
 }
@@ -8089,7 +8089,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .search-modal-input {
   width: 100%;
   background: transparent;
-  font-size: 18px;
+  font-size: var(--fs-8);
   color: var(--text-primary);
   outline: none;
   border: none;
@@ -8143,7 +8143,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .search-modal-row-id {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 500;
   color: var(--text-primary);
   white-space: nowrap;
@@ -8152,7 +8152,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .search-modal-row-host {
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
   margin-top: 2px;
 }
@@ -8162,7 +8162,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   flex-shrink: 0;
   border-radius: var(--radius-pill);
   padding: 3px 10px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -8191,7 +8191,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
   font-weight: 600;
   color: var(--text-on-glass-soft);
 }
@@ -8232,12 +8232,12 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: none;
   color: var(--text-tertiary);
   cursor: pointer;
-  font-size: 1rem;
+  font-size: var(--fs-7);
   padding: 0 4px;
 }
 
 .mock-peers-popover-body label {
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
   margin-bottom: 6px;
   display: block;
@@ -8320,12 +8320,12 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .density-option-label {
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
 }
 
 .density-option-range {
-  font-size: 11px;
+  font-size: var(--fs-2);
   opacity: 0.6;
 }
 
@@ -8455,7 +8455,7 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
 
   color: rgba(255, 255, 255, 0.96);
   /* @token-exempt: theme variant */
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 700;
   letter-spacing: 0.18em;
   text-transform: uppercase;
@@ -8910,7 +8910,7 @@ html[data-theme="light"] .settings-divider {
   gap: 8px;
   background-color: var(--chat-surface-notice);
   color: var(--chat-text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-3);
   padding: 8px 16px;
   border-bottom: 1px solid var(--chat-border);
 }
@@ -8968,7 +8968,7 @@ html[data-theme="light"] .settings-divider {
   border-radius: 50%;
   background-color: var(--chat-accent);
   color: var(--chat-on-accent);
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   display: flex;
   align-items: center;
@@ -8989,7 +8989,7 @@ html[data-theme="light"] .settings-divider {
 
 /* Sender name */
 .chat-sender {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   color: var(--chat-text-secondary);
   margin-bottom: 4px;
@@ -9001,7 +9001,7 @@ html[data-theme="light"] .settings-divider {
   color: var(--chat-text-primary);
   padding: 8px 12px;
   border-radius: 18px;
-  font-size: 14px;
+  font-size: var(--fs-5);
   line-height: 1.4;
   word-break: break-word;
 }
@@ -9014,7 +9014,7 @@ html[data-theme="light"] .settings-divider {
 
 /* Timestamp */
 .chat-timestamp {
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--chat-text-muted);
   margin-top: 4px;
   padding: 0 4px;
@@ -9037,7 +9037,7 @@ html[data-theme="light"] .settings-divider {
   border: none;
   border-radius: 24px;
   color: var(--chat-text-primary);
-  font-size: 14px;
+  font-size: var(--fs-5);
   padding: 10px 16px;
   outline: none;
   transition: background-color 0.2s;
@@ -9089,14 +9089,14 @@ html[data-theme="light"] .settings-divider {
 .chat-loading,
 .chat-empty {
   color: var(--chat-text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-4);
   text-align: center;
   padding: 32px 16px;
 }
 
 .chat-error {
   color: var(--chat-error-text);
-  font-size: 13px;
+  font-size: var(--fs-4);
   background-color: var(--chat-error-bg);
   border-radius: 8px;
   padding: 12px 16px;
@@ -9120,7 +9120,7 @@ html[data-theme="light"] .settings-divider {
    the meaning is legible without opening the "?" popover. */
 .perf-side__consequence,
 .perf-stream-consequence {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 500;
   color: var(--text-secondary);
 }
@@ -9140,7 +9140,7 @@ html[data-theme="light"] .settings-divider {
   align-items: center;
   gap: 6px;
   padding: 6px 2px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
   border-bottom: 1px solid var(--border);
 }
@@ -9173,7 +9173,7 @@ html[data-theme="light"] .settings-divider {
    here — flex gap + child margins are additive. */
 
 .perf-kind-card__title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 600;
   color: var(--text-primary);
   margin-bottom: 4px;
@@ -9224,7 +9224,7 @@ html[data-theme="light"] .settings-divider {
 }
 
 .perf-side__title {
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--text-primary);
   display: inline-flex;
@@ -9307,7 +9307,7 @@ html[data-theme="light"] .settings-divider {
 }
 
 .perf-meter__readout {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
   line-height: 1.2;
@@ -9333,7 +9333,7 @@ html[data-theme="light"] .settings-divider {
 /* The always-visible per-card summary line (the §3 live copy). */
 .perf-summary-line {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-variant-numeric: tabular-nums;
   color: var(--text-tertiary);
 }
@@ -9365,7 +9365,7 @@ html[data-theme="light"] .settings-divider {
   border: 1px dashed var(--border-emphasis);
 }
 .perf-rung__label {
-  font-size: 10px;
+  font-size: var(--fs-1);
   line-height: 1;
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
@@ -9384,7 +9384,7 @@ html[data-theme="light"] .settings-divider {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
   cursor: pointer;
   list-style: none;
@@ -9427,7 +9427,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   line-height: 1.4;
   min-width: 0;
   font-variant-numeric: tabular-nums;
@@ -9453,7 +9453,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 12px;
+  font-size: var(--fs-3);
   line-height: 1;
 }
 .perf-q-dot--optimal {
@@ -9470,7 +9470,7 @@ details.perf-peers[open] .perf-peers__chev {
    border-color + faint background from the per-state quality var. ── */
 .perf-reason-chip {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: var(--fs-2);
   line-height: 1.3;
   font-weight: 500;
   padding: 0 6px;
@@ -9508,7 +9508,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 700;
   line-height: 1;
   color: var(--text-secondary);
@@ -9584,13 +9584,13 @@ details.perf-peers[open] .perf-peers__chev {
 
 .perf-help-popover-text {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--fs-4);
   line-height: 1.5;
   color: var(--text-secondary);
 }
 
 .perf-fixed-badge {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -9616,7 +9616,7 @@ details.perf-peers[open] .perf-peers__chev {
   align-items: center;
   height: 22px;
   padding: 0 8px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 500;
   line-height: 1;
   color: var(--accent);
@@ -9657,7 +9657,7 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .perf-range-end-label {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-variant-numeric: tabular-nums;
   color: var(--text-tertiary);
   flex-shrink: 0;
@@ -9846,7 +9846,7 @@ details.perf-peers[open] .perf-peers__chev {
 
 .perf-range-value {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
@@ -9862,13 +9862,13 @@ details.perf-peers[open] .perf-peers__chev {
    Performance panel's expandable footers). ── */
 .simulcast-effective {
   margin: 0 0 8px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
 }
 
 .simulcast-note {
   margin: 0 0 8px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-style: italic;
   color: var(--text-quaternary);
 }
@@ -9881,14 +9881,14 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .simulcast-send-title {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   color: var(--text-secondary);
 }
 
 .simulcast-send-static,
 .simulcast-send-header {
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
 }
 
@@ -9918,7 +9918,7 @@ details.perf-peers[open] .perf-peers__chev {
   padding: 4px 6px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-variant-numeric: tabular-nums;
 }
 
@@ -9949,7 +9949,7 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .simulcast-recv-title {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -9961,18 +9961,18 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .simulcast-recv-kind-head {
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
 }
 
 .simulcast-recv-peer {
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--text-tertiary);
   padding-left: 8px;
 }
 
 .simulcast-recv-more {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-style: italic;
   color: var(--text-tertiary);
   padding-left: 8px;
@@ -9989,7 +9989,7 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .diag-device-title {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -10002,7 +10002,7 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .diag-device-peer-label {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   color: var(--text-tertiary);
 }
@@ -10011,7 +10011,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: flex;
   justify-content: space-between;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--text-tertiary);
   padding-left: 8px;
 }

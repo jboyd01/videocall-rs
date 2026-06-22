@@ -1465,6 +1465,36 @@ html[data-theme="light"] #invite-overlay p {
   --radius-button: 10px;
   --radius-pill: 9999px;
 
+  /* ─── Type scale ──────────────────────────────────────────────────────────
+     Theme-independent font-size tokens.  All values in px to match codebase
+     convention.  The ordinal scale (--fs-N) covers the full 10–32 px range
+     used across the app; semantic aliases point into that scale and are the
+     preferred tokens for new code.
+     ─────────────────────────────────────────────────────────────────────── */
+  --fs-1:  10px;   /* tiny labels, chart badges, "(Host)" indicator          */
+  --fs-2:  11px;   /* compact UI: status chips, legend labels, diagnostics   */
+  --fs-3:  12px;   /* captions, small buttons, secondary metadata            */
+  --fs-4:  13px;   /* body-small, floating names, control labels, toasts     */
+  --fs-5:  14px;   /* body text, form inputs, list items                     */
+  --fs-6:  15px;   /* emphasis body, nav buttons, sign-in buttons            */
+  --fs-7:  16px;   /* root size, h3, peer list items                         */
+  --fs-8:  18px;   /* section headings, h2, search modal input               */
+  --fs-9:  20px;   /* page sub-headings (mobile responsive)                  */
+  --fs-10: 24px;   /* page headings, waiting-room h2, overflow badge         */
+  --fs-11: 28px;   /* hero headings, settings sidebar title                  */
+  --fs-12: 32px;   /* large hero / display text                              */
+
+  /* Semantic aliases — prefer these over ordinal --fs-N in component CSS */
+  --fs-caption:     var(--fs-1);   /* 10px — chart badges, micro indicators  */
+  --fs-label:       var(--fs-3);   /* 12px — labels, captions, badges        */
+  --fs-body-sm:     var(--fs-4);   /* 13px — secondary body, floating names  */
+  --fs-body:        var(--fs-5);   /* 14px — primary body, inputs            */
+  --fs-body-lg:     var(--fs-7);   /* 16px — default/large body, h3          */
+  --fs-heading:     var(--fs-8);   /* 18px — section headings                */
+  --fs-subheading:  var(--fs-9);   /* 20px — page sub-headings               */
+  --fs-title:       var(--fs-10);  /* 24px — page-level headings             */
+  --fs-display:     var(--fs-12);  /* 32px — hero display                    */
+
   /* Vertical room to reserve below the controls dock: dock bottom 20px + dock
      height ~79px + ~12px gap = 112px. (The ~79px = .video-control-button 3.1rem
      ≈49.6px + .video-controls-container padding 0.85rem×2 ≈27.2px + 2px border;
@@ -1572,7 +1602,7 @@ html[data-theme="light"] #invite-overlay p {
   justify-content: center;
   height: 44px;
   padding: 0 1.25rem;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 600;
   border-radius: var(--radius-button);
   outline: none;
@@ -1621,14 +1651,14 @@ html[data-theme="light"] #invite-overlay p {
 .btn-sm {
   height: 36px;
   padding: 0 0.75rem;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 /* Input — iOS-native sizing (44px tap target) */
 .input-apple {
   height: 44px;
   padding: 0 0.875rem;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-input);
@@ -1719,7 +1749,7 @@ html[data-theme="light"] #invite-overlay p {
   color: var(--error);
   font-weight: 600;
   margin-bottom: 1rem;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
 }
 
 .instructions-gif {
@@ -1866,7 +1896,7 @@ html[data-theme="light"] #invite-overlay p {
   font-weight: 600;
   height: 48px;
   padding: 0 1.5rem;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   border-radius: var(--radius-button);
   border: 1px solid rgba(255, 255, 255, 0.12);
   cursor: pointer;
@@ -1918,7 +1948,7 @@ html[data-theme="light"] #invite-overlay p {
   border-radius: var(--radius-button);
   background: var(--glass-bg);
   color: var(--text-primary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   border: 1px solid var(--glass-border);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
@@ -2242,7 +2272,7 @@ html[data-theme="light"] #invite-overlay p {
   justify-content: center;
   background: #ff453a;
   color: #ffffff;
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 700;
   border-radius: 50%;
   box-shadow:
@@ -2296,7 +2326,7 @@ html[data-theme="light"] #invite-overlay p {
   padding: 0.4rem 0.8rem;
   background-color: rgba(13, 19, 31, 0.95);
   color: white;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   font-weight: 500;
   border-radius: 0.5rem;
   white-space: nowrap;
@@ -2444,7 +2474,7 @@ html[data-theme="light"] #invite-overlay p {
 
 /* Hero typography */
 .hero-title {
-  font-size: 2rem;
+  font-size: var(--fs-12);
   font-weight: 700;
   margin-bottom: 0.25rem;
   color: var(--text-primary);
@@ -2453,7 +2483,7 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .hero-tagline {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 400;
   color: var(--text-tertiary);
   letter-spacing: 0.04em;
@@ -2582,7 +2612,7 @@ html[data-theme="light"] #invite-overlay p {
     width: 95%;
   }
   .hero-title {
-    font-size: 1.75rem;
+    font-size: var(--fs-11);
   }
 }
 
@@ -2595,7 +2625,7 @@ html[data-theme="light"] #invite-overlay p {
     margin: 0.5rem;
   }
   .hero-title {
-    font-size: 1.5rem;
+    font-size: var(--fs-10);
   }
 
   .floating-element-1 {
@@ -2670,7 +2700,7 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .hero-content form h3 {
-  font-size: 1.125rem;
+  font-size: var(--fs-8);
   font-weight: 600;
   margin-bottom: 1.25rem;
   color: var(--text-primary);
@@ -2683,7 +2713,7 @@ html[data-theme="light"] #invite-overlay p {
 .hero-content form label {
   color: var(--text-secondary);
   font-weight: 500;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   margin-bottom: 0.5rem;
   display: block;
 }
@@ -2691,7 +2721,7 @@ html[data-theme="light"] #invite-overlay p {
 .hero-content form input {
   height: 44px;
   padding: 0 0.875rem;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--border);
   border-radius: var(--radius-input);
@@ -2719,7 +2749,7 @@ html[data-theme="light"] #invite-overlay p {
 
 .hero-content form p {
   color: var(--text-quaternary);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
 }
 
 /*
@@ -2755,7 +2785,7 @@ html[data-theme="light"] #invite-overlay p {
   flex: 0 0 auto;
   color: var(--text-secondary);
   font-weight: 500;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   display: inline-flex;
   align-items: center;
   gap: 0.375rem;
@@ -2827,7 +2857,7 @@ html[data-theme="light"] #invite-overlay p {
     0 10px 30px rgba(0, 0, 0, 0.45),
     0 1px 0 rgba(255, 255, 255, 0.04) inset;
   color: rgba(255, 255, 255, 0.92);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   font-weight: 400;
   line-height: 1.4;
   text-align: left;
@@ -2882,7 +2912,7 @@ html[data-theme="light"] #invite-overlay p {
   text-align: right;
   /* See --error-text definition: --error fails AA on the glass surface. */
   color: var(--error-text);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   font-weight: 500;
   line-height: 1.25;
   white-space: nowrap;
@@ -2987,7 +3017,7 @@ html[data-theme="light"] #invite-overlay p {
 
 .username-form h1 {
   margin: 0;
-  font-size: 1.25rem;
+  font-size: var(--fs-9);
   font-weight: 600;
 }
 
@@ -2998,7 +3028,7 @@ html[data-theme="light"] #invite-overlay p {
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.05);
   color: var(--text-primary);
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
@@ -3014,7 +3044,7 @@ html[data-theme="light"] #invite-overlay p {
 
 .error {
   color: var(--error);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 /* Hide pin/crop on mobile -- tap tile to pin instead */
@@ -3305,7 +3335,7 @@ html[data-theme="light"] #invite-overlay p {
 .login-footer {
   margin-top: 2rem;
   text-align: center;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-quaternary);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
@@ -3336,7 +3366,7 @@ html[data-theme="light"] #invite-overlay p {
 /* Responsive — phone */
 @media (max-width: 480px) {
   .login-title {
-    font-size: 2rem;
+    font-size: var(--fs-12);
   }
   .login-card {
     padding: 2rem 1.5rem;
@@ -3369,7 +3399,7 @@ html[data-theme="light"] #invite-overlay p {
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-pill, 9999px);
   color: var(--text-primary, rgba(255, 255, 255, 0.95));
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -3406,14 +3436,14 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .auth-dropdown-name {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
   color: var(--text-primary, rgba(255, 255, 255, 0.95));
   margin: 0;
 }
 
 .auth-dropdown-email {
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-secondary, rgba(255, 255, 255, 0.6));
   margin: 4px 0 0 0;
   overflow: hidden;
@@ -3429,7 +3459,7 @@ html[data-theme="light"] #invite-overlay p {
   border: none;
   text-align: left;
   color: #ff6b6b;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   cursor: pointer;
   transition: background 0.15s ease;
 }
@@ -3455,14 +3485,14 @@ html[data-theme="light"] #invite-overlay p {
 
 .participant-name {
   color: var(--text-primary);
-  font-size: 15px;
+  font-size: var(--fs-6);
   font-weight: 600;
   line-height: 1.2;
 }
 
 .participant-email {
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-3);
   line-height: 1.2;
   margin-top: 2px;
   word-break: break-all;
@@ -3492,7 +3522,7 @@ html[data-theme="light"] #invite-overlay p {
   background: transparent;
   border: 0;
   padding: 0.25rem 0.5rem;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   letter-spacing: 0.01em;
   color: var(--text-tertiary);
   cursor: pointer;
@@ -3532,7 +3562,7 @@ html[data-theme="light"] #invite-overlay p {
 .about-modal-title {
   margin: 0;
   color: var(--text-primary);
-  font-size: 1.25rem;
+  font-size: var(--fs-9);
   font-weight: 600;
 }
 
@@ -3546,7 +3576,7 @@ html[data-theme="light"] #invite-overlay p {
 
 .about-modal-section-title {
   margin: 0 0 0.5rem 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -3575,7 +3605,7 @@ html[data-theme="light"] #invite-overlay p {
   padding: 0.5rem 0.75rem;
   background: var(--glass-bg);
   align-items: baseline;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   color: var(--text-primary);
   min-width: 0;
 }
@@ -3597,7 +3627,7 @@ html[data-theme="light"] #invite-overlay p {
 
 .about-modal-row--header {
   background: var(--glass-bg-hover);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--text-secondary);
@@ -3605,7 +3635,7 @@ html[data-theme="light"] #invite-overlay p {
 
 .about-modal-label {
   color: var(--text-secondary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 /* issue 1480: nowrap lives on the BASE value rule so EVERY About cell never
@@ -3633,13 +3663,13 @@ html[data-theme="light"] #invite-overlay p {
   font-family:
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
     monospace;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
 }
 
 .about-modal-status {
   padding: 0.75rem;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   color: var(--text-secondary);
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
