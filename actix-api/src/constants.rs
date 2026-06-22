@@ -785,6 +785,30 @@ pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 /// compose without double-counting.
 pub const LAYER_HINT_RECOMPUTE_COALESCE_MS: u64 = 300;
 
+/// Trailing-debounce window for coalescing cross-server presence re-announces.
+///
+/// On a join, a peer publishes one `PARTICIPANT_LIST_REQUEST` and every existing
+/// active peer answers with its own `PARTICIPANT_JOINED`. A reconnection wave of
+/// M joiners would otherwise make each of N peers publish M replies. Instead a
+/// peer records itself once and arms one trailing timer of this length; when it
+/// fires, the flush re-announces that peer exactly once, so the wave's publishes
+/// drop from M·N to N. (The M·N inbound request messages still arrive, but the
+/// arm path is a cheap O(1) per message.)
+///
+/// The flush broadcasts to `room.{room}.system` for a wave (≥2 distinct
+/// requesters) but unicasts to the lone requester for an ordinary single join, so
+/// the common path keeps its O(N) relay→client fan-out instead of O(N²).
+///
+/// This is safe for late joiners: the join flow subscribes to the room wildcard
+/// before publishing its request, so any joiner counted in the window is
+/// subscribed before the trailing re-announce fires. A broadcast's already-present
+/// recipients get the same packet they got at activation and dedup it.
+///
+/// Separate from [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] (unrelated concern) but the
+/// same 300 ms reasoning: long enough to swallow a wave's request cluster, short
+/// enough that a late joiner still learns every peer well within a second.
+pub const PARTICIPANT_REBROADCAST_COALESCE_MS: u64 = 300;
+
 /// Period of the [`ChatServer`](crate::actors::chat_server) sweep that publishes
 /// the DEMAND-side simulcast gauge `relay_layer_preference_sessions{room, kind,
 /// layer_id}` (#1170 item 2).
