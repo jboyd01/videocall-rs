@@ -21,25 +21,34 @@ import { waitForServices } from "../helpers/wait-for-services";
  * (OS / device_type / device_memory_gb / architecture) from `navigator.*` +
  * `userAgentData.getHighEntropyValues`; `navigator.hardwareConcurrency` feeds the
  * Cores field directly. All of OS / Device / Cores / Architecture / Memory are
- * reliably populated under the headless-Chromium runner used by Playwright. The
- * one field that may legitimately be absent is "Main-thread load", which is only
- * reported once a `'longtask'` PerformanceObserver entry has been seen — so it is
- * NOT asserted as required (its presence is treated as a bonus, never a gate).
+ * reliably populated under the headless-Chromium runner used by Playwright.
+ *
+ * Note (issue #1606): the always-`0%` "Main-thread load" segment was REMOVED
+ * from both user-facing device lines below. In the browser the value is
+ * `sum(longtask_ms) / interval_ms`, a genuine `0.0` while the main thread is
+ * idle, so it read `0% load` for nearly everyone; true process/CPU % is not
+ * obtainable in browser JS. The field still flows to the proto + health reporter
+ * + Prometheus, but no longer appears on the popup line or as a device-row.
  *
  * ## Surface 1 — Signal-quality popup ("Device" line)
  *
  *   div.signal-popup-device  [data-testid="signal-popup-device-{peer_id}"]
  *     span.signal-popup-device__head   "Device"
- *     span.signal-popup-device__line   "macOS 14.5 · desktop · 8 cores · arm · 8 GB · 42% load"
+ *     span.signal-popup-device__line   "macOS 14.5 · desktop · 8 cores · arm · 8 GB"
  *
  * The popup resolves device info per OPEN tile and is NOT gated on the receive
  * list — it renders the moment the peer's HealthPacket device fields have been
  * seen. (`signal_quality.rs::SignalQualityPopup`.)
  *
- * ## Surface 2 — Diagnostics drawer ("Device (per peer)" sub-block)
+ * ## Surface 2 — Diagnostics drawer ("Per-peer hardware" sub-block)
  *
- *   div.diag-device
- *     span.diag-device-title   "Device (per peer)"
+ * issue #1606: this sub-block is now a collapsible `<details>` (collapsed by
+ * default to save vertical space with many attendees), reusing the drawer's
+ * `diag-disclosure` pattern. The block's rows are hidden until the summary is
+ * clicked, so this spec EXPANDS the disclosure before reading the rows.
+ *
+ *   details.diag-disclosure.diag-device
+ *     summary.diag-disclosure-summary   "Per-peer hardware (N)"
  *     div.diag-device-peer     [data-testid="diag-device-peer-{session_id}"]
  *       span.diag-device-peer-label   {peer label}
  *       div.diag-device-row
@@ -371,10 +380,10 @@ async function openDiagnosticsDrawer(page: Page) {
 }
 
 /**
- * The fixed device-row labels the panel emits, in render order
- * (`performance_settings.rs::format_peer_device_lines`). "Main-thread load" is
- * intentionally excluded from the REQUIRED set: it is reported only after a
- * `'longtask'` is observed, so on a quiet runner it may be legitimately absent.
+ * The complete set of device-row labels the panel can emit, in render order
+ * (`performance_settings.rs::format_peer_device_lines`). As of issue #1606 the
+ * "Main-thread load" row was removed from the user-facing line entirely (it read
+ * `0%` for nearly everyone), so it must NEVER appear as a device-row label.
  */
 const ALWAYS_AVAILABLE_DEVICE_LABELS = ["OS", "Device", "Cores", "Architecture", "Memory"];
 
@@ -479,9 +488,15 @@ test.describe("Per-peer device / hardware metrics (#1482)", () => {
       // (`all_peer_device_info`), NOT the receive list, so it does not require
       // media flowing — but a camera-on peer trivially satisfies it too. Poll
       // through at least one ~5 s health interval.
-      const deviceContainer = drawer.locator(".diag-device");
+      const deviceContainer = drawer.locator("details.diag-device");
       await expect(deviceContainer).toBeVisible({ timeout: 45_000 });
-      await expect(deviceContainer.locator(".diag-device-title")).toHaveText("Device (per peer)");
+      // issue #1606: the section is a collapsible `<details>` (collapsed by
+      // default). Its summary is always visible and reads "Per-peer hardware (N)";
+      // expand it before reading the now-hidden rows.
+      const deviceSummary = deviceContainer.locator(".diag-disclosure-summary");
+      await expect(deviceSummary).toHaveText(/^Per-peer hardware \(\d+\)$/);
+      await deviceSummary.click();
+      await expect(deviceContainer).toHaveAttribute("open", "");
 
       // Exactly one remote peer → exactly one per-peer block, keyed by session_id.
       const peerBlock = deviceContainer.locator('[data-testid^="diag-device-peer-"]');
@@ -519,7 +534,9 @@ test.describe("Per-peer device / hardware metrics (#1482)", () => {
       // superset we don't gate on individually to avoid runner-specific flake,
       // but every rendered label must be one of the known device-row labels.
       expect(labels).toContain("Cores");
-      const knownLabels = [...ALWAYS_AVAILABLE_DEVICE_LABELS, "Main-thread load"];
+      // issue #1606: "Main-thread load" is NO LONGER an allowed label, so a
+      // re-introduced load row would fail this assertion as unexpected.
+      const knownLabels = [...ALWAYS_AVAILABLE_DEVICE_LABELS];
       for (const label of labels) {
         expect(knownLabels, `unexpected device-row label "${label}"`).toContain(label);
       }
@@ -605,9 +622,14 @@ test.describe("Per-peer device / hardware metrics (#1482)", () => {
       // device fields have been parsed (~5 s health interval). On the OLD code this
       // container never renders for a camera-off peer — this is the assertion that
       // fails before the fix and passes after it.
-      const deviceContainer = drawer.locator(".diag-device");
+      const deviceContainer = drawer.locator("details.diag-device");
       await expect(deviceContainer).toBeVisible({ timeout: 45_000 });
-      await expect(deviceContainer.locator(".diag-device-title")).toHaveText("Device (per peer)");
+      // issue #1606: collapsible `<details>` — its summary is always visible;
+      // expand it before reading the now-hidden per-peer rows.
+      const deviceSummary = deviceContainer.locator(".diag-disclosure-summary");
+      await expect(deviceSummary).toHaveText(/^Per-peer hardware \(\d+\)$/);
+      await deviceSummary.click();
+      await expect(deviceContainer).toHaveAttribute("open", "");
 
       // Exactly one remote peer (the camera-off guest) → exactly one per-peer
       // block, keyed by session_id.
@@ -640,7 +662,8 @@ test.describe("Per-peer device / hardware metrics (#1482)", () => {
       // HealthPacket independently of the camera — so it is present even for a
       // camera-off peer. Assert it, and that every rendered label is a known one.
       expect(labels).toContain("Cores");
-      const knownLabels = [...ALWAYS_AVAILABLE_DEVICE_LABELS, "Main-thread load"];
+      // issue #1606: "Main-thread load" is NO LONGER an allowed label.
+      const knownLabels = [...ALWAYS_AVAILABLE_DEVICE_LABELS];
       for (const label of labels) {
         expect(knownLabels, `unexpected device-row label "${label}"`).toContain(label);
       }

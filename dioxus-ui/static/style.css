@@ -9989,10 +9989,16 @@ details.perf-peers[open] .perf-peers__chev {
   margin-top: 6px;
 }
 
-.diag-device-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
+/* issue 1606: the per-peer hardware section is now a collapsible
+   `<details class="diag-disclosure diag-device">` (collapsed by default to save
+   vertical space with many attendees). A `<details>` must lay out as a block so
+   the native summary toggle works; the flex column above is meant for the legacy
+   plain-div form, so neutralize it here. The 4px row rhythm is preserved by the
+   per-peer blocks' own `gap`/padding, and the summary inherits the shared
+   `.diag-disclosure-summary` typography for visual parity with the drawer's
+   other disclosures. */
+details.diag-device {
+  display: block;
 }
 
 .diag-device-peer {

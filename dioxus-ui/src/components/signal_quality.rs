@@ -2938,8 +2938,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
             }
             // ── Device section (#1482, per-peer hardware "if available") ────
             // A single COMPACT dot-separated line (OS · device · N cores · arch
-            // · N GB · N% load). Rendered only when the peer reported something;
-            // omitted entirely otherwise (no empty-labeled placeholder).
+            // · N GB). The always-0% main-thread "load" segment was dropped from
+            // this user-facing line in issue 1606. Rendered only when the peer
+            // reported something; omitted entirely otherwise (no empty-labeled
+            // placeholder).
             if let Some(device_line) = device_line {
                 div {
                     class: "signal-popup-device",
