@@ -43,7 +43,8 @@ The kubeconfig should point to the cluster API endpoint at `https://k3s.labswork
 
 ```bash
 # From the location where the Ascend kubeconfig is stored
-cat /home/jboyd/ascend/ascend-cluster-config | base64 -w0
+# Replace /path/to/your/ascend-cluster-config with your actual path
+cat /path/to/your/ascend-cluster-config | base64 -w0
 ```
 
 The kubeconfig should point to the cluster API endpoint at `https://10.244.8.238:6443`.

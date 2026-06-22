@@ -375,7 +375,7 @@ jobs:
             --set "env[5].name=OAUTH_CLIENT_ID" \
             --set "env[5].value=client_01KVR3TZ42FAAM76MMKZ81A0TA" \
             --set "env[6].name=OAUTH_SECRET" \
-            --set "env[6].value=" \
+            --set "env[6].value=" \  # Empty for PKCE flow (public client, no static secret)
             --set "env[7].name=OAUTH_REDIRECT_URL" \
             --set "env[7].value=https://app.videocall.labsworkspace.fnxlabs.com/auth/callback" \
             --set "env[8].name=AFTER_LOGIN_URL" \
@@ -390,7 +390,9 @@ jobs:
             --set "env[12].value=info" \
             --set "env[13].name=COOKIE_NAME" \
             --set "env[13].value=videocall-session" \
-            --set "env[14].name=SERVICE_VERSION_URLS" \
+            --set "env[14].name=COOKIE_SECURE" \
+            --set-string "env[14].value=true" \
+            --set "env[15].name=SERVICE_VERSION_URLS" \
             --set "env[14].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
             --set "env[15].name=TOKEN_TTL_SECS" \
             --set-string "env[15].value=86400" \
