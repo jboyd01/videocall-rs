@@ -94,17 +94,37 @@ async fn join(pool: &sqlx::PgPool, room_id: &str, email: &str) {
 }
 
 /// Spawn the participant-left consumer and await its subscription-ready signal.
+///
+/// Returns the consumer's `JoinHandle` plus a `Receiver` on the feed-change
+/// broadcast the consumer feeds, so a test can assert the consumer pushes a
+/// `ParticipantLeft` nudge (issue #1081) when it marks a participant left.
+fn spawn_ready_consumer_with_feed(
+    pool: &sqlx::PgPool,
+    nats: &async_nats::Client,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::broadcast::Receiver<meeting_api::feed_events::FeedChange>,
+) {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (feed_tx, feed_rx) = meeting_api::feed_events::new_feed_channel();
+    let handle = meeting_api::nats_consumers::spawn_participant_left_consumer_inner(
+        Some(nats.clone()),
+        pool.clone(),
+        feed_tx,
+        Some(ready_tx),
+    )
+    .expect("Consumer should be spawned when NATS is available");
+    (ready_rx, handle, feed_rx)
+}
+
+/// Spawn the participant-left consumer and await its subscription-ready signal,
+/// discarding the feed receiver (for tests that only assert DB state).
 async fn spawn_ready_consumer(
     pool: &sqlx::PgPool,
     nats: &async_nats::Client,
 ) -> tokio::task::JoinHandle<()> {
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = meeting_api::nats_consumers::spawn_participant_left_consumer_inner(
-        Some(nats.clone()),
-        pool.clone(),
-        Some(ready_tx),
-    )
-    .expect("Consumer should be spawned when NATS is available");
+    let (ready_rx, handle, _feed_rx) = spawn_ready_consumer_with_feed(pool, nats);
     ready_rx
         .await
         .expect("Consumer must signal subscription readiness");
@@ -378,4 +398,60 @@ async fn participant_left_for_unknown_room_is_ignored() {
     // Give the consumer time to (not) act. The test passes if nothing panics and
     // the consumer task is still alive afterwards.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// TEST (issue #1081): after the consumer marks a participant left, it pushes a
+// `ParticipantLeft` feed-change nudge onto the LOCAL broadcast — so this
+// instance's SSE clients re-fetch the homepage feed and drop the ghost count.
+//
+// This asserts the nudge is on the SUCCESS path (a row actually flipped to
+// 'left'), guarding against "published before the DB write" and "not published
+// on a real change". It FAILS if the `feed_tx.send(...)` in the participant-left
+// consumer is removed or moved off the `rows > 0` success arm.
+// ──────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial]
+async fn participant_left_consumer_pushes_feed_nudge() {
+    use meeting_api::feed_events::FeedChangeReason;
+
+    let Some(nats) = maybe_connect_nats().await else {
+        eprintln!("NATS_URL not set — skipping participant_left feed-nudge test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room_id = "test-participant-left-feed-nudge";
+    let host = "plf-host@example.com";
+    let ghost = "plf-ghost@example.com";
+
+    create_and_activate(&pool, room_id, host).await;
+    join(&pool, room_id, ghost).await;
+
+    let (ready_rx, _handle, mut feed_rx) = spawn_ready_consumer_with_feed(&pool, &nats);
+    ready_rx
+        .await
+        .expect("consumer must signal subscription readiness");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The ghost's tab crashes — actix-api publishes PARTICIPANT_LEFT. The
+    // consumer marks them left (count drops 2 -> 1) AND nudges the feed.
+    let count = publish_and_poll_count(&pool, &nats, room_id, ghost, 1).await;
+    assert_eq!(count, 1, "precondition: the participant was marked left");
+
+    // The nudge must have been pushed onto the local broadcast.
+    let change = tokio::time::timeout(std::time::Duration::from_secs(5), feed_rx.recv())
+        .await
+        .expect("a feed-change nudge must be pushed within 5s")
+        .expect("broadcast must not be closed");
+    assert_eq!(
+        change.reason,
+        FeedChangeReason::ParticipantLeft,
+        "the nudge must name the ParticipantLeft reason"
+    );
+    assert_eq!(
+        change.meeting_id, room_id,
+        "the nudge must carry the affected room_id"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
 }

@@ -32,6 +32,7 @@
 
 use crate::db::meetings as db_meetings;
 use crate::db::participants as db_participants;
+use crate::feed_events::{FeedChange, FeedChangeReason};
 use crate::nats_events::{
     ParticipantLeftPayload, MEETING_BECAME_EMPTY_SUBJECT, MEETING_ENDED_BY_HOST_SUBJECT,
     PARTICIPANT_LEFT_SUBJECT,
@@ -41,6 +42,7 @@ use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// Spawn the consumer for [`MEETING_ENDED_BY_HOST_SUBJECT`].
 ///
@@ -61,8 +63,9 @@ use std::time::Duration;
 pub fn spawn_meeting_ended_by_host_consumer(
     nats: Option<async_nats::Client>,
     pool: PgPool,
+    feed_tx: broadcast::Sender<FeedChange>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_meeting_ended_by_host_consumer_inner(nats, pool, None)
+    spawn_meeting_ended_by_host_consumer_inner(nats, pool, feed_tx, None)
 }
 
 /// Spawn the consumer for [`MEETING_BECAME_EMPTY_SUBJECT`].
@@ -82,8 +85,9 @@ pub fn spawn_meeting_ended_by_host_consumer(
 pub fn spawn_meeting_became_empty_consumer(
     nats: Option<async_nats::Client>,
     pool: PgPool,
+    feed_tx: broadcast::Sender<FeedChange>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_meeting_became_empty_consumer_inner(nats, pool, None)
+    spawn_meeting_became_empty_consumer_inner(nats, pool, feed_tx, None)
 }
 
 /// Internal variant used by tests to eliminate the publish-before-subscribe
@@ -93,11 +97,14 @@ pub fn spawn_meeting_became_empty_consumer(
 pub fn spawn_meeting_ended_by_host_consumer_inner(
     nats: Option<async_nats::Client>,
     pool: PgPool,
+    feed_tx: broadcast::Sender<FeedChange>,
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     spawn_room_state_consumer::<crate::nats_events::MeetingEndedByHostPayload, _>(
         nats,
         pool,
+        feed_tx,
+        FeedChangeReason::Ended,
         ready_tx,
         MEETING_ENDED_BY_HOST_SUBJECT,
         "host-disconnect DB-write fanout",
@@ -113,11 +120,14 @@ pub fn spawn_meeting_ended_by_host_consumer_inner(
 pub fn spawn_meeting_became_empty_consumer_inner(
     nats: Option<async_nats::Client>,
     pool: PgPool,
+    feed_tx: broadcast::Sender<FeedChange>,
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     spawn_room_state_consumer::<crate::nats_events::MeetingBecameEmptyPayload, _>(
         nats,
         pool,
+        feed_tx,
+        FeedChangeReason::BecameIdle,
         ready_tx,
         MEETING_BECAME_EMPTY_SUBJECT,
         "room-empty DB-write fanout (empty->idle)",
@@ -148,8 +158,9 @@ pub fn spawn_meeting_became_empty_consumer_inner(
 pub fn spawn_participant_left_consumer(
     nats: Option<async_nats::Client>,
     pool: PgPool,
+    feed_tx: broadcast::Sender<FeedChange>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_participant_left_consumer_inner(nats, pool, None)
+    spawn_participant_left_consumer_inner(nats, pool, feed_tx, None)
 }
 
 /// Internal variant used by tests to eliminate the publish-before-subscribe
@@ -158,6 +169,7 @@ pub fn spawn_participant_left_consumer(
 pub fn spawn_participant_left_consumer_inner(
     nats: Option<async_nats::Client>,
     pool: PgPool,
+    feed_tx: broadcast::Sender<FeedChange>,
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let nats = nats?;
@@ -219,6 +231,24 @@ pub fn spawn_participant_left_consumer_inner(
                                             payload.user_id,
                                             rows
                                         );
+                                        // Nudge the local SSE clients only when a
+                                        // row actually flipped to 'left' — a
+                                        // duplicate/redelivered event matches zero
+                                        // rows (the participant is already gone) and
+                                        // changes nothing in the feed, so we skip it
+                                        // to keep nudge cardinality tight. This
+                                        // consumer runs on EVERY instance (fan-out,
+                                        // no queue group), so feeding the LOCAL
+                                        // broadcast here — rather than re-publishing
+                                        // to NATS — nudges each instance's own SSE
+                                        // clients exactly once and avoids an echo
+                                        // loop on `internal.feed_changed`.
+                                        if rows > 0 {
+                                            let _ = feed_tx.send(FeedChange::new(
+                                                payload.room_id.clone(),
+                                                FeedChangeReason::ParticipantLeft,
+                                            ));
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::error!(
@@ -290,9 +320,12 @@ impl RoomIdPayload for crate::nats_events::MeetingBecameEmptyPayload {
 /// `meeting.id`). Centralises the defensive `room_id` bounds, the
 /// re-subscribe-on-stream-end behavior, and the ready-signal hook so each
 /// consumer differs only in its subject and DB transition.
+#[allow(clippy::too_many_arguments)]
 fn spawn_room_state_consumer<P, F>(
     nats: Option<async_nats::Client>,
     pool: PgPool,
+    feed_tx: broadcast::Sender<FeedChange>,
+    reason: FeedChangeReason,
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     subject: &'static str,
     description: &'static str,
@@ -360,6 +393,25 @@ where
                                         room_id,
                                         meeting.id
                                     );
+                                    // Nudge local SSE clients AFTER the DB write
+                                    // succeeds (additive, never on the error path).
+                                    // The room-state DB actions return `()` not a
+                                    // rows-affected count, and their guards make a
+                                    // duplicate a SQL-level no-op (`set_idle` only
+                                    // matches `state='active'`, `end_meeting` only
+                                    // `state <> 'ended'`). Upstream `actix-api`
+                                    // already fires these events ONCE per
+                                    // transition, so a redundant nudge is rare and
+                                    // harmless (the client re-fetches and sees no
+                                    // change) — a spurious nudge is acceptable, a
+                                    // MISSED change is not. This consumer runs on
+                                    // EVERY instance (fan-out, no queue group), so
+                                    // we feed the LOCAL broadcast here rather than
+                                    // re-publishing to NATS: that nudges each
+                                    // instance's own SSE clients exactly once and
+                                    // avoids an echo loop on `internal.feed_changed`.
+                                    let _ =
+                                        feed_tx.send(FeedChange::new(room_id.to_string(), reason));
                                 }
                             }
                             Ok(None) => {
@@ -409,7 +461,8 @@ mod tests {
         let lazy_pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://stub")
             .expect("connect_lazy should not contact the database");
-        let handle = spawn_meeting_ended_by_host_consumer(None, lazy_pool);
+        let (feed_tx, _feed_rx) = crate::feed_events::new_feed_channel();
+        let handle = spawn_meeting_ended_by_host_consumer(None, lazy_pool, feed_tx);
         assert!(
             handle.is_none(),
             "spawn must return None when NATS is not configured"
@@ -423,7 +476,8 @@ mod tests {
         let lazy_pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://stub")
             .expect("connect_lazy should not contact the database");
-        let handle = spawn_meeting_became_empty_consumer(None, lazy_pool);
+        let (feed_tx, _feed_rx) = crate::feed_events::new_feed_channel();
+        let handle = spawn_meeting_became_empty_consumer(None, lazy_pool, feed_tx);
         assert!(
             handle.is_none(),
             "spawn must return None when NATS is not configured"
@@ -437,7 +491,8 @@ mod tests {
         let lazy_pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://stub")
             .expect("connect_lazy should not contact the database");
-        let handle = spawn_participant_left_consumer(None, lazy_pool);
+        let (feed_tx, _feed_rx) = crate::feed_events::new_feed_channel();
+        let handle = spawn_participant_left_consumer(None, lazy_pool, feed_tx);
         assert!(
             handle.is_none(),
             "spawn must return None when NATS is not configured"
