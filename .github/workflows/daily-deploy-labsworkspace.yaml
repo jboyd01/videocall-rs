@@ -246,12 +246,13 @@ jobs:
             --set service.port=4433 \
             --set service.healthPort=444 \
             --set "command[0]=webtransport_server" \
+            --set tlsSecret=webtransport-tls \
             --set certificateDomain=webtransport.videocall.labsworkspace.fnxlabs.com \
             --set "env[0].name=JWT_SECRET" \
             --set "env[0].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[0].valueFrom.secretKeyRef.key=secret" \
             --set "env[1].name=RUST_LOG" \
-            --set "env[1].value=warn,quinn=warn,web-transport-quinn=warn,async_nats=warn" \
+            --set "env[1].value=warn" \
             --set "env[2].name=NATS_URL" \
             --set "env[2].value=nats:4222" \
             --set "env[3].name=LISTEN_URL" \
@@ -272,6 +273,8 @@ jobs:
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-webtransport" \
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
+            --set "ingress.tls[0].secretName=webtransport-tls" \
+            --set "ingress.tls[0].hosts[0]=webtransport.videocall.labsworkspace.fnxlabs.com" \
             --set "ingress.annotations.cert-manager\.io/cluster-issuer=letsencrypt-prod" \
             --wait --timeout 5m
 
@@ -312,6 +315,8 @@ jobs:
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-websocket" \
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
+            --set "ingress.tls[0].secretName=websocket-tls" \
+            --set "ingress.tls[0].hosts[0]=websocket.videocall.labsworkspace.fnxlabs.com" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
             --set "ingress.annotations.cert-manager\.io/cluster-issuer=letsencrypt-prod" \
@@ -369,8 +374,8 @@ jobs:
             --set "env[4].value=https://id.labsworkspace.fnxlabs.com" \
             --set "env[5].name=OAUTH_CLIENT_ID" \
             --set "env[5].value=client_01KVR3TZ42FAAM76MMKZ81A0TA" \
-            --set "env[6].name=OAUTH_BROWSER_PKCE" \
-            --set-string "env[6].value=true" \
+            --set "env[6].name=OAUTH_SECRET" \
+            --set "env[6].value=" \
             --set "env[7].name=OAUTH_REDIRECT_URL" \
             --set "env[7].value=https://app.videocall.labsworkspace.fnxlabs.com/auth/callback" \
             --set "env[8].name=AFTER_LOGIN_URL" \
@@ -391,12 +396,18 @@ jobs:
             --set-string "env[15].value=86400" \
             --set "env[16].name=NATS_URL" \
             --set "env[16].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
+            --set "env[17].name=OAUTH_BROWSER_PKCE" \
+            --set-string "env[17].value=true" \
+            --set "env[18].name=AFTER_LOGOUT_URL" \
+            --set "env[18].value=https://app.videocall.labsworkspace.fnxlabs.com/" \
             --set ingress.enabled=true \
             --set "ingress.hosts[0].host=api.videocall.labsworkspace.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-api" \
             --set "ingress.hosts[0].paths[0].service.port.number=8081" \
+            --set "ingress.tls[0].secretName=api-tls" \
+            --set "ingress.tls[0].hosts[0]=api.videocall.labsworkspace.fnxlabs.com" \
             --set "ingress.annotations.cert-manager\.io/cluster-issuer=letsencrypt-prod" \
             --set consoleLogs.enabled=true \
             --set consoleLogs.storageSize=5Gi \
@@ -432,6 +443,7 @@ jobs:
             --set "runtimeConfig.oauthClientId=client_01KVR3TZ42FAAM76MMKZ81A0TA" \
             --set-string "runtimeConfig.e2eeEnabled=false" \
             --set-string "runtimeConfig.firefoxEnabled=false" \
+            --set-string "runtimeConfig.hardwareMetricsEnabled=true" \
             --set "runtimeConfig.usersAllowedToStream=" \
             --set "runtimeConfig.serverElectionPeriodMs=2000" \
             --set "runtimeConfig.audioBitrateKbps=65" \
@@ -442,6 +454,8 @@ jobs:
             --set "ingress.hosts[0].host=app.videocall.labsworkspace.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.tls[0].secretName=dioxus-ui-tls" \
+            --set "ingress.tls[0].hosts[0]=app.videocall.labsworkspace.fnxlabs.com" \
             --set "ingress.annotations.cert-manager\.io/cluster-issuer=letsencrypt-prod" \
             --wait --timeout 5m
 
