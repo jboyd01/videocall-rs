@@ -141,11 +141,17 @@ impl FeedChangeReason {
 
 /// A single "the homepage feed may have changed" notification.
 ///
-/// Intentionally minimal: the affected meeting's `room_id` (so a future client
-/// could scope an animation to one row) and a [`FeedChangeReason`]. It does NOT
-/// carry the feed payload — see the module docs for why. Serialized as JSON
-/// both on the [`FEED_CHANGED_SUBJECT`] NATS subject and as the SSE event
-/// `data` line.
+/// Intentionally minimal: the affected meeting's `room_id` (used for
+/// server-to-server routing / debug logging) and a [`FeedChangeReason`]. It does
+/// NOT carry the feed payload — see the module docs for why.
+///
+/// This type is the INTERNAL wire: it is serialized as JSON on the
+/// [`FEED_CHANGED_SUBJECT`] NATS subject for fan-out between `meeting-api`
+/// instances. It is NOT what reaches SSE clients — the client-facing
+/// `feed-changed` event carries a fixed content-free nudge that omits
+/// `meeting_id` entirely, to avoid leaking every meeting's id to every
+/// connected client. See
+/// [`crate::routes::feed_stream::feed_change_to_sse_event`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FeedChange {
     /// The `room_id` of the meeting whose feed entry changed. Empty for a
@@ -312,11 +318,14 @@ mod tests {
 
     #[test]
     fn reason_wire_strings_match_serde() {
-        // The SSE `data` JSON is produced by `serde_json::to_string(&change)`,
-        // while logs/metrics use `reason.as_str()`. They MUST agree or the
-        // frontend contract and the logs would name the same event differently.
-        // This fails if either the `as_str` arm or the `rename_all` mapping
-        // drifts.
+        // The INTERNAL NATS payload JSON is produced by
+        // `serde_json::to_string(&change)`, while logs/metrics use
+        // `reason.as_str()`. They MUST agree or the server-to-server
+        // `internal.feed_changed` contract and the logs would name the same
+        // event differently. (The CLIENT-facing SSE `data:` line is a fixed
+        // content-free nudge and does NOT serialize the reason — see
+        // `crate::routes::feed_stream::FEED_NUDGE_DATA`.) This fails if either
+        // the `as_str` arm or the `rename_all` mapping drifts.
         for (reason, expected) in [
             (FeedChangeReason::Created, "created"),
             (FeedChangeReason::Joined, "joined"),
@@ -334,9 +343,14 @@ mod tests {
 
     #[test]
     fn feed_change_json_round_trips_and_pins_wire_shape() {
-        // Pin the exact JSON the SSE `data:` line and the NATS payload carry,
-        // so a field rename on the publisher side is caught here rather than
-        // silently breaking the (separate-crate) frontend EventSource client.
+        // Pin the exact JSON the INTERNAL `internal.feed_changed` NATS payload
+        // carries between `meeting-api` instances, so a field rename on the
+        // publisher side is caught here rather than silently breaking the
+        // server-to-server fan-out (the consumer in `spawn_feed_change_consumer`
+        // deserializes this shape). This is the internal wire ONLY — the
+        // client-facing SSE `data:` line is a fixed content-free nudge that does
+        // NOT carry `meeting_id` (see
+        // `crate::routes::feed_stream::feed_change_to_sse_event`).
         let change = FeedChange::new("standup-42", FeedChangeReason::Joined);
         let json = serde_json::to_string(&change).unwrap();
         assert_eq!(json, r#"{"meeting_id":"standup-42","reason":"joined"}"#);
