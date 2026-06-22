@@ -170,39 +170,70 @@ pub enum CodecMessages<Options: Serialize> {
     Decode {
         pages: Vec<u8>,
     },
-    /// Live Opus ctl re-application on the RUNNING encoder (issue #1567), with
-    /// NO destroy/create — so a mid-call AQ audio-tier drop can actually engage
-    /// inband FEC without an audio gap or buffer re-alloc storm.
+    /// Live Opus ctl re-application on the RUNNING encoder (issues #1567, #1578,
+    /// #1398), with NO destroy/create — so a mid-call AQ audio-tier drop can
+    /// actually engage inband FEC AND (in single-layer mode) lower the running
+    /// Opus stream's bitrate without an audio gap or buffer re-alloc storm.
     ///
     /// Serializes (via `tag = "command"`, `rename_all = "camelCase"`) to
-    /// `{"command":"reconfigOpus","fec":<bool>,"packetLossPerc":<u32>}`. The
-    /// AudioWorklet (`encoderWorker.min.js`) handles the `reconfigOpus` command
-    /// by calling, on the live `OggOpusEncoder`,
-    /// `setOpusControl(4012, fec?1:0)` (OPUS_SET_INBAND_FEC) and
-    /// `setOpusControl(4014, packetLossPerc|0)` (OPUS_SET_PACKET_LOSS_PERC).
+    /// `{"command":"reconfigOpus","fec":<bool>,"packetLossPerc":<u32>}` when
+    /// `bit_rate` is `None`, and adds `"bitRate":<u32>` when it is `Some(bps)`.
+    /// The AudioWorklet (`encoderWorker.min.js`) handles the `reconfigOpus`
+    /// command by calling, on the live `OggOpusEncoder`,
+    /// `setOpusControl(4012, fec?1:0)` (OPUS_SET_INBAND_FEC),
+    /// `setOpusControl(4014, packetLossPerc|0)` (OPUS_SET_PACKET_LOSS_PERC), and
+    /// — guarded by `if (data.bitRate)` —
+    /// `setOpusControl(4002, bitRate)` (OPUS_SET_BITRATE). The ctl 4002 path is
+    /// the SAME control libopus is initialized with (the worklet's init code
+    /// calls `setOpusControl(4002, this.config.encoderBitRate)`), so re-applying
+    /// it live just sets a new target bitrate on the running encoder.
     ///
-    /// This is the runtime-engagement half of #619/#1568: init still applies the
-    /// initial tier's FEC/DTX/loss (via [`EncoderInitOptions`]); this re-applies
-    /// FEC + loss-% when the tier later changes. DTX is intentionally NOT touched
-    /// here — every tier inits with DTX on, so it is already live for the whole
-    /// call and needs no runtime toggle. This is the INBAND-FEC ctl, separate
-    /// from the application-level RED path (`AUDIO_REDUNDANCY_ENABLED`).
+    /// `bit_rate` (`#[serde(skip_serializing_if = "Option::is_none")]`):
+    ///   * `None` OMITS the `bitRate` key entirely, so a FEC-only reconfig is
+    ///     BYTE-IDENTICAL to the pre-#1398 wire shape and the worklet's
+    ///     `if (data.bitRate)` guard sees `undefined` → falsy → makes NO ctl 4002
+    ///     call (bitrate untouched). This is the multi-layer path: the
+    ///     layer-ceiling lever handles audio congestion there, so we never
+    ///     double-dip on bitrate.
+    ///   * `Some(bps)` emits `bitRate: bps`, making the worklet call
+    ///     `setOpusControl(4002, bps)`. This is the SINGLE-LAYER path (#1398):
+    ///     a single-encoder publisher has no upper layer to shed, so the only way
+    ///     to downshift audio under congestion is to lower the one running Opus
+    ///     stream's bitrate live.
+    ///
+    /// This is the runtime-engagement family of #619/#1568/#621: init still
+    /// applies the initial tier's FEC/DTX/loss/bitrate (via
+    /// [`EncoderInitOptions`]); this re-applies FEC + loss-% (always) and bitrate
+    /// (single-layer only) when the tier/congestion-floor later changes. DTX is
+    /// intentionally NOT touched here — every tier inits with DTX on, so it is
+    /// already live for the whole call and needs no runtime toggle. The FEC ctl
+    /// here is the INBAND-FEC ctl, separate from the application-level RED path
+    /// (`AUDIO_REDUNDANCY_ENABLED`).
     ///
     /// Safety: if this message is never sent, the worklet's behavior is
     /// byte-identical to today; the worklet's `reconfigOpus` case lives inside
     /// its `if (this.encoder)` guard, so a missing/destroyed encoder is a safe
-    /// no-op (not a throw).
+    /// no-op (not a throw). A zero/absent `bitRate` is likewise a no-op for the
+    /// ctl 4002 call (the `if (data.bitRate)` guard).
     ///
     /// The enum-level `rename_all` renames the VARIANT (→ `"reconfigOpus"` tag),
     /// not the inline fields, so the per-variant `rename_all` below is required
-    /// to emit `packetLossPerc` (the key the worklet reads as
-    /// `data.packetLossPerc`). Without it the field would serialize as
-    /// `packet_loss_perc` and the worklet would read `undefined` → `|0` → 0,
-    /// silently dropping the loss hint. The serde tests pin this.
+    /// to emit `packetLossPerc` and `bitRate` (the keys the worklet reads as
+    /// `data.packetLossPerc` / `data.bitRate`). Without it the fields would
+    /// serialize as `packet_loss_perc` / `bit_rate` and the worklet would read
+    /// `undefined` → `|0` → 0, silently dropping the hint. The serde tests pin
+    /// the exact `bitRate` key and the omit-when-`None` contract.
     #[serde(rename_all = "camelCase")]
     ReconfigOpus {
         fec: bool,
         packet_loss_perc: u32,
+        /// Target Opus bitrate in BITS PER SECOND for the live ctl 4002
+        /// (OPUS_SET_BITRATE). `None` (the multi-layer / FEC-only case) OMITS the
+        /// `bitRate` wire key so the reconfig is byte-identical to pre-#1398;
+        /// `Some(bps)` (the single-layer congestion downshift, #1398) re-applies
+        /// the bitrate to the running encoder.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bit_rate: Option<u32>,
     },
 }
 
@@ -364,12 +395,20 @@ mod tests {
         let json = serde_json::to_value(EncoderMessages::ReconfigOpus {
             fec: true,
             packet_loss_perc: 15,
+            bit_rate: None,
         })
         .expect("ReconfigOpus must serialize");
 
         assert_eq!(json["command"], serde_json::json!("reconfigOpus"));
         assert_eq!(json["fec"], serde_json::json!(true));
         assert_eq!(json["packetLossPerc"], serde_json::json!(15));
+        // FEC-only reconfig (bit_rate=None) MUST omit the bitRate key so it is
+        // byte-identical to the pre-#1398 wire shape and the worklet's
+        // `if(data.bitRate)` guard makes no ctl 4002 call.
+        assert!(
+            json.get("bitRate").is_none(),
+            "bitRate must be omitted when bit_rate is None"
+        );
     }
 
     #[test]
@@ -381,11 +420,53 @@ mod tests {
         let json = serde_json::to_value(EncoderMessages::ReconfigOpus {
             fec: false,
             packet_loss_perc: 0,
+            bit_rate: None,
         })
         .expect("ReconfigOpus must serialize");
 
         assert_eq!(json["fec"], serde_json::json!(false));
         assert_eq!(json["packetLossPerc"], serde_json::json!(0));
+        assert!(
+            json.get("bitRate").is_none(),
+            "bitRate must be omitted when bit_rate is None"
+        );
+    }
+
+    #[test]
+    fn reconfig_opus_bitrate_omitted_when_none_emitted_when_some() {
+        // Single-layer congestion downshift (issue #1398). The worklet reads
+        // `data.bitRate` (guarded by `if(data.bitRate)`) and calls
+        // `setOpusControl(4002, data.bitRate)` (OPUS_SET_BITRATE). Pin the EXACT
+        // `bitRate` key + value AND the omit-when-None contract: if the key drifts
+        // (e.g. to `bit_rate`) the worklet reads `undefined` → falsy → never
+        // lowers the bitrate, so a single-layer publisher can't downshift audio
+        // at all. This test FAILS if the field's `rename_all`/key drifts or if
+        // `skip_serializing_if` is dropped.
+        let omitted = serde_json::to_value(EncoderMessages::ReconfigOpus {
+            fec: true,
+            packet_loss_perc: 10,
+            bit_rate: None,
+        })
+        .expect("ReconfigOpus must serialize");
+        assert!(
+            omitted.get("bitRate").is_none(),
+            "bit_rate=None must OMIT the bitRate key (byte-identical to pre-#1398)"
+        );
+
+        let present = serde_json::to_value(EncoderMessages::ReconfigOpus {
+            fec: true,
+            packet_loss_perc: 10,
+            bit_rate: Some(32000),
+        })
+        .expect("ReconfigOpus must serialize");
+        assert_eq!(
+            present["bitRate"],
+            serde_json::json!(32000),
+            "bit_rate=Some(bps) must emit the EXACT camelCase `bitRate` key with the bps value"
+        );
+        // The FEC/loss part is unchanged regardless of the bitrate field.
+        assert_eq!(present["fec"], serde_json::json!(true));
+        assert_eq!(present["packetLossPerc"], serde_json::json!(10));
     }
 
     #[test]

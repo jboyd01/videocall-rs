@@ -502,6 +502,165 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
 }
 
 /**
+ * Drive a fresh page from the HOME FORM into the meeting grid as an AUDIO-ONLY
+ * publisher: microphone ON, camera OFF. This is the join shape the #1398 mic-side
+ * uplink-distress detector requires — its DOWN-step is gated to camera OFF
+ * (`detector_camera` reads false; the camera's enabled flag is shared into the
+ * mic encoder via `host.rs::set_camera_active_signal`) AND single-layer audio
+ * (`pinSimulcastMaxLayers(ctx, 1)` ⇒ `n_audio_layers == 1`). The standard
+ * {@link joinMeeting} above FORCES the camera ON for the receive-side video
+ * assertions, so it cannot be reused here; this is the deliberate camera-OFF
+ * counterpart.
+ *
+ * Mechanism for camera-OFF / mic-ON:
+ *   - Seed `vc_prejoin_camera_on=false` + `vc_prejoin_mic_on=true` BEFORE boot
+ *     (the keys `context.rs::DEVICE_PREF_CAMERA_ON_KEY` / `_MIC_ON_KEY` that
+ *     `load_preferred_camera_on` / `load_preferred_mic_on` read).
+ *   - Grant media permission (so the device list enumerates and `want_mic` in
+ *     `attendants.rs::resolve_initial_enabled(prejoin_mic_on, audio_ok, has_mic)`
+ *     evaluates true). Camera permission is granted too, but the camera toggle is
+ *     left OFF so `want_cam` is false and no video track is published.
+ *   - DO NOT click the camera toggle (the only thing that would turn it on).
+ *   - Readiness signal is the populated MIC SELECT (`#prejoin-mic-select`,
+ *     `pre_join_settings_card.rs::PREVIEW_MIC_SELECT_ID`) — it renders only once
+ *     the mic device list is enumerated, which is what makes `want_mic` true.
+ *
+ * Single publisher page; no receiver is needed (the detector is publisher-side).
+ */
+async function joinMeetingAudioOnly(
+  page: Page,
+  meetingId: string,
+  displayName: string,
+): Promise<void> {
+  // Camera OFF, mic ON — the exact inverse of joinMeeting's seed. addInitScript
+  // runs on every navigation before the app's own scripts read these keys.
+  await page.addInitScript(() => {
+    try {
+      window.localStorage.setItem("vc_prejoin_camera_on", "false");
+      window.localStorage.setItem("vc_prejoin_mic_on", "true");
+    } catch {
+      /* storage may be unavailable pre-navigation; the app origin sets it */
+    }
+  });
+
+  await page.goto("/");
+  await page.waitForTimeout(1500);
+
+  await page.locator("#meeting-id").click();
+  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+
+  await page.locator("#username").click();
+  await page.locator("#username").fill("");
+  await page.locator("#username").pressSequentially(displayName, { delay: 50 });
+  await page.waitForTimeout(500);
+  await page.locator("#username").press("Enter");
+
+  await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+  await page.waitForTimeout(1500);
+
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+  const grid = page.locator("#grid-container");
+
+  const result = await Promise.race([
+    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
+    grid.waitFor({ timeout: 30_000 }).then(() => "auto" as const),
+  ]);
+
+  if (result === "join") {
+    // Grant media permission so the device list enumerates (needed for the mic to
+    // actually start). Camera permission is granted too, but we never enable the
+    // camera toggle, so no video track is published.
+    const allow = page.locator('[data-testid="prejoin-permission-allow"]');
+    if (await allow.isVisible().catch(() => false)) {
+      await allow.click();
+      await page
+        .locator('[data-testid="prejoin-permission-prompt"]')
+        .waitFor({ state: "hidden", timeout: 15_000 })
+        .catch(() => {
+          /* already granted / prompt absent */
+        });
+    }
+
+    // This is the FIRST joiner ⇒ host. Disable the Waiting Room (same rationale as
+    // joinMeeting — left ON it would park later joiners; harmless no-op for a
+    // single-publisher test, but keep the flow identical so a future receiver add
+    // does not regress).
+    const waitingRoomRow = page.locator(".settings-option-row", {
+      has: page.getByText("Waiting Room", { exact: true }),
+    });
+    const waitingRoomToggle = waitingRoomRow.getByRole("switch");
+    if (await waitingRoomToggle.isVisible().catch(() => false)) {
+      let settled: string | null = null;
+      await expect
+        .poll(
+          async () => {
+            const first = await waitingRoomToggle.getAttribute("aria-checked").catch(() => null);
+            await page.waitForTimeout(250);
+            const second = await waitingRoomToggle.getAttribute("aria-checked").catch(() => null);
+            if (first !== null && first === second) {
+              settled = second;
+              return true;
+            }
+            return false;
+          },
+          { timeout: 10_000, intervals: [250, 500] },
+        )
+        .toBe(true)
+        .catch(() => {
+          /* never settled within budget — fall through without toggling */
+        });
+      if (settled === "true") {
+        await waitingRoomToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+        await expect(waitingRoomToggle).toHaveAttribute("aria-checked", "false", {
+          timeout: 10_000,
+        });
+      }
+    }
+
+    // Ensure the camera stays OFF: aria-pressed must NOT be "true". We do NOT
+    // click it on (the inverse of joinMeeting). If a stale default rendered it
+    // ON, click it OFF so `want_cam` is false and the detector's camera-OFF gate
+    // holds.
+    const cameraToggle = page.locator('[data-testid="prejoin-camera-toggle"]');
+    if (await cameraToggle.isVisible().catch(() => false)) {
+      if ((await cameraToggle.getAttribute("aria-pressed")) === "true") {
+        await cameraToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+      }
+      await expect(cameraToggle).toHaveAttribute("aria-pressed", "false", { timeout: 5_000 });
+    }
+
+    // Ensure the MIC is ON so the publisher actually captures + encodes audio
+    // (the detector lives in the mic encoder's recovery Interval, which only runs
+    // while the mic is capturing).
+    const micToggle = page.locator('[data-testid="prejoin-mic-toggle"]');
+    if (await micToggle.isVisible().catch(() => false)) {
+      if ((await micToggle.getAttribute("aria-pressed")) !== "true") {
+        await micToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+      }
+    }
+
+    // Readiness: the mic SELECT renders only once the device list is enumerated,
+    // which is the same condition that makes `want_mic` true at join. Waiting on
+    // it (rather than the camera preview track, which never appears here) proves
+    // the mic will actually start.
+    await expect(page.locator("#prejoin-mic-select")).toBeVisible({ timeout: 15_000 });
+
+    await page.waitForTimeout(500);
+    await joinButton.click().catch(() => {
+      /* auto-join already unmounted the pre-join button */
+    });
+  }
+
+  await expect(grid).toBeVisible({ timeout: 15_000 });
+}
+
+/**
  * Open the in-meeting Diagnostics drawer (the new home of the Performance
  * controls, #1131) and return the drawer locator that scopes the perf controls.
  *
@@ -2173,6 +2332,204 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // #1398 — SINGLE-LAYER, AUDIO-ONLY uplink-distress bitrate downshift.
+  //
+  // WHAT IS UNDER TEST: an audio-only publisher (camera OFF) with single-layer
+  // audio has NO upper Opus layer to shed, so the layer-ceiling lever (#621) is
+  // a no-op for it. #1398 adds a mic-side uplink-distress detector (the recovery
+  // `Interval` in microphone_encoder.rs) that, on SUSTAINED publisher-uplink
+  // distress while the camera is OFF and audio is single-layer, steps the audio
+  // bitrate FLOOR down one tier (50000 → 32000 → 24000 → 16000 bps) and re-applies
+  // it LIVE to the running Opus encoder via the worklet `reconfigOpus` (ctl 4002 =
+  // OPUS_SET_BITRATE). The first cut from the `u32::MAX` fail-open sentinel lands
+  // on tier index 1 (32000 bps), because the TOP tier (50000) IS the healthy
+  // bitrate and would be a no-op cut (audio_congestion_bitrate_step_down).
+  //
+  // HOW THE TEST DRIVES IT (deterministic, no real network impairment):
+  // the netsim build (TRUNK_BUILD_FEATURES=netsim, always-on in the e2e stack —
+  // docker/docker-compose.e2e.yaml) exposes `window.__vcNetsim.bumpUplinkStall(n)`
+  // and `bumpWsDrop(n)`, which add `n` to the process-global transport counters
+  // the detector reads (`unistream_ready_stall_count` / `websocket_drop_count`).
+  // We bump BOTH axes so the test is transport-agnostic: the decision is an OR
+  // across the WT-saturation and WS-drop axes (`audio_uplink_step_down_decision`),
+  // and the bump functions increment the shared statics regardless of the elected
+  // transport. Audio thresholds (videocall-aq/src/constants.rs): per-axis delta
+  // ≥ 5 over a tumbling 4000 ms window, evaluated at the 1 Hz recovery tick. The
+  // window must CLOSE with delta ≥ threshold to fire, and the detector seeds its
+  // window snapshot from the CURRENT counter at start — so we bump generously
+  // (+10 per tick) across several seconds and poll for up to ~20 s, guaranteeing a
+  // window closes with a large delta. Recovery climbs the floor back up only one
+  // tier per minutes-long cooldown, so the downshift will not be undone mid-test.
+  //
+  // WHAT WE ASSERT ON — and WHY (the FIX-2 worklet ACK).
+  //
+  // The worklet line that ACTUALLY applies the downshift
+  //   `[encoderWorker] Opus live reconfig … bitRate=(32000|24000|16000)`
+  // is emitted from dioxus-ui/scripts/encoderWorker.min.js, which runs as a
+  // DEDICATED WEB WORKER (`ENVIRONMENT_IS_WORKER = typeof importScripts ===
+  // "function"`). Playwright's `page.on("console")` does NOT capture dedicated-
+  // worker console output, and a repo-wide grep found NO worker-console forwarding
+  // in the e2e harness (`page.on("worker")` / `worker.on("console")` appear
+  // nowhere in e2e/tests or e2e/helpers; `collectConsole` only wires
+  // `page.on("console")`). So the worklet line itself is NOT observable here —
+  // which is WHY FIX 2 surfaces an ACK on the MAIN thread instead.
+  //
+  // FIX-2 DESIGN (worklet ACK): the worklet now posts a message back to the main
+  // thread — `{ message: "opusReconfigured", bitRate: data.bitRate }` — ONLY when
+  // it has actually applied `setOpusControl(4002, data.bitRate)` (OPUS_SET_BITRATE),
+  // i.e. only from INSIDE the `reconfigOpus` case's `if (data.bitRate) { … }` block,
+  // alongside the ctl-4002 call. The main-thread mic encoder receives that ack and
+  // re-logs it as a `log::info!`, which DOES surface via `page.on("console")`
+  // (wasm `log::info!` → `console_log`):
+  //   `MicrophoneEncoder: worklet ACK opusReconfigured bitRate=<bps>`
+  // where `<bps>` is the bare applied bitrate integer (32000/24000/16000 for the
+  // downshift tiers — NO parens; it is a Rust format-string value, not the
+  // `bit_rate=Some(<n>)` Debug shape the send-path log uses). This ack is the
+  // load-bearing signal because it fires ONLY when the worklet truly applied the
+  // bitrate to the live Opus encoder.
+  //
+  // MUTATION GUARD: removing the worklet's `setOpusControl(4002, data.bitRate)`
+  // call (in encoderWorker.min.js's `reconfigOpus` case) ALSO removes the ack
+  // `postMessage` — it lives inside the SAME `if (data.bitRate)` block — so this
+  // assertion FAILS (no ctl 4002 → no ack postMessage → no main-thread `worklet
+  // ACK` log → the poll times out → expect fails). The pre-#1398 send-path-only
+  // assertion (DOWNSHIFT_RE on `live Opus reconfig applied`) stayed GREEN under
+  // that mutation because the main thread logs it after it SENDS the `reconfigOpus`
+  // worklet message, regardless of whether the worklet applied it; that is the gap
+  // this ack closes.
+  //
+  // We keep the send-path `DOWNSHIFT_RE` assertion too (a secondary sanity check
+  // that the main thread did dispatch the reconfig), but the FINAL gating
+  // `expect(...).toBe(true)` is the ACK. We accept 32000/24000/16000 (any
+  // sub-50000 tier) so the assertion is robust to an extra tick stepping past
+  // 32000 before the poll catches it. (50000 — a healthy reconfig — is excluded so
+  // the assertion proves a genuine DOWN-step, not a no-op top-tier re-apply.)
+  // -------------------------------------------------------------------------
+  test("single-layer audio-only publisher downshifts Opus bitrate on uplink distress (#1398)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_audio_uplink_downshift_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "audio-uplink-pub@videocall.rs",
+        "AudioUplinkPublisher",
+        uiURL,
+      );
+      // Pin SINGLE-LAYER audio (n_audio_layers == 1) so the detector's
+      // single-layer gate (`detector_single_layer`) holds. Must run before the
+      // first navigation (route is context-scoped).
+      await pinSimulcastMaxLayers(pubCtx, 1);
+
+      const pubPage = await pubCtx.newPage();
+      // Capture the console BEFORE navigation so the mic-encoder reconfig log
+      // (main-thread `log::info!`) is collected once it fires.
+      const pubConsole = collectConsole(pubPage);
+
+      // Join AUDIO-ONLY: mic ON, camera OFF — the detector's camera-OFF gate.
+      await joinMeetingAudioOnly(pubPage, meetingId, "AudioUplinkPublisher");
+
+      // Guard: the netsim hook (incl. bumpUplinkStall/bumpWsDrop) must exist —
+      // otherwise the UI image was built WITHOUT the `netsim` feature and the
+      // test would silently never fire. Fail loud with a rebuild instruction.
+      const netsimReady = await pubPage.evaluate(
+        () =>
+          typeof window.__vcNetsim?.install === "function" &&
+          typeof (window.__vcNetsim as unknown as { bumpUplinkStall?: unknown }).bumpUplinkStall ===
+            "function" &&
+          typeof (window.__vcNetsim as unknown as { bumpWsDrop?: unknown }).bumpWsDrop ===
+            "function",
+      );
+      expect(
+        netsimReady,
+        "window.__vcNetsim.bumpUplinkStall/bumpWsDrop are missing — the dioxus UI image was built " +
+          "WITHOUT the `netsim` cargo feature. Rebuild with `make e2e-build` (the e2e stack sets " +
+          "TRUNK_BUILD_FEATURES=netsim; see docker/docker-compose.e2e.yaml).",
+      ).toBe(true);
+
+      // Let the call stabilize so the mic encoder + its recovery Interval are
+      // running before we drive distress.
+      await pubPage.waitForTimeout(3000);
+
+      // Drive SUSTAINED uplink distress on BOTH axes. The audio per-axis threshold
+      // is delta ≥ 5 over a tumbling 4000 ms window; bump +10 per second so a
+      // window always closes with a delta well above threshold. Poll for the
+      // main-thread WORKLET ACK log (the FIX-2 mutation-sensitive signal — it fires
+      // ONLY when the worklet actually applied ctl 4002), reporting a sub-50000 tier.
+      //
+      // ACK_RE is the load-bearing assertion: the worklet posts
+      // `{ message:"opusReconfigured", bitRate }` back ONLY from inside the same
+      // `if (data.bitRate)` block that calls `setOpusControl(4002, …)`, and the
+      // main thread re-logs it as `MicrophoneEncoder: worklet ACK opusReconfigured
+      // bitRate=<n>`. NOTE the value is a BARE integer (Rust format string), NOT
+      // `Some(<n>)` — so match `bitRate=(?:32000|24000|16000)` with no parens.
+      const ACK_RE =
+        /MicrophoneEncoder: worklet ACK opusReconfigured bitRate=(?:32000|24000|16000)/;
+      // DOWNSHIFT_RE is the SEND-path log (kept as a secondary sanity check that the
+      // main thread did dispatch the reconfig). It is NOT mutation-sensitive on its
+      // own — it logs after SEND regardless of worklet application — so it must NOT
+      // be the gating assertion. See the MUTATION GUARD comment above.
+      const DOWNSHIFT_RE =
+        /MicrophoneEncoder: live Opus reconfig applied.*bit_rate=Some\((?:32000|24000|16000)\)/;
+
+      let bumped = 0;
+      await expect
+        .poll(
+          async () => {
+            // Keep distress sustained across windows: one bump per poll iteration.
+            await pubPage.evaluate(() => {
+              const ns = window.__vcNetsim as unknown as {
+                bumpUplinkStall?: (n: number) => unknown;
+                bumpWsDrop?: (n: number) => unknown;
+              };
+              ns.bumpUplinkStall?.(10);
+              ns.bumpWsDrop?.(10);
+            });
+            bumped += 1;
+            // The WORKLET ACK is the success predicate: it proves the worklet
+            // applied OPUS_SET_BITRATE (ctl 4002), not merely that the main thread
+            // sent the reconfig message.
+            return pubConsole.some((line) => ACK_RE.test(line));
+          },
+          {
+            // ~20 s of sustained bumping at ~1 Hz (intervals reach 1000 ms): several
+            // 4000 ms windows close, each with delta ≥ 10 ≥ threshold(5).
+            timeout: 20_000,
+            intervals: [500, 1000],
+            message:
+              "expected the audio-only single-layer publisher to log the WORKLET ACK " +
+              "(MicrophoneEncoder: worklet ACK opusReconfigured bitRate=32000|24000|16000) " +
+              "proving the worklet applied OPUS_SET_BITRATE (ctl 4002) after sustained uplink " +
+              "distress (#1398). Its absence means the worklet never applied the live bitrate " +
+              "downshift — check the worklet's reconfigOpus ctl-4002 + ack, the mic-side detector " +
+              "gate, or the netsim bump.",
+          },
+        )
+        .toBe(true);
+
+      // SECONDARY sanity (NOT the gate): the main thread also logged the SEND-path
+      // reconfig. This pins that both halves fired — the detector dispatched the
+      // reconfig AND the worklet acked applying it — but the load-bearing assertion
+      // above is the ACK (DOWNSHIFT_RE alone stays green under the ctl-4002 removal
+      // mutation; see the MUTATION GUARD comment).
+      expect(
+        pubConsole.some((line) => DOWNSHIFT_RE.test(line)),
+        "expected the main thread to ALSO log the send-path reconfig " +
+          "(MicrophoneEncoder: live Opus reconfig applied … bit_rate=Some(32000|24000|16000))",
+      ).toBe(true);
+
+      // Sanity: we actually drove distress (the poll did bump), not a fluke.
+      expect(bumped, "test must have bumped the uplink counters at least once").toBeGreaterThan(0);
+    } finally {
+      await pubBrowser.close();
     }
   });
 });

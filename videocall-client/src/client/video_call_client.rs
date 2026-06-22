@@ -487,6 +487,54 @@ struct Inner {
     /// `Connected` handler) so a stale cut from the old session does not suppress
     /// audio on a fresh one.
     audio_congestion_layer_ceiling: Arc<AtomicU32>,
+    /// SINGLE-LAYER audio BITRATE floor in bps (issue #1398). The bitrate
+    /// analogue of `audio_congestion_layer_ceiling` above, and the lever that
+    /// closes the single-layer gap that ceiling cannot: a publisher gated to one
+    /// audio layer (or with audio simulcast disabled) has no upper layer to shed,
+    /// so the only downshift is lowering the single running Opus stream's bitrate
+    /// live (worklet ctl 4002 = OPUS_SET_BITRATE). `u32::MAX` = fail-open / no cut.
+    ///
+    /// WRITER (issue #1398): the MIC encoder's own uplink-distress detector — its
+    /// recovery `Interval` reads the live transport stall/drop counters and steps
+    /// this floor DOWN one tier (via the mic's `audio_congestion_bitrate_step_down`)
+    /// when the publisher is audio-only. This atom is NOT driven by the inbound
+    /// `PacketType::CONGESTION` arm anymore: b127ee80 stepped it from
+    /// `apply_self_congestion_cut`, but #1219 Half 1 removed the relay's
+    /// self-targeted CONGESTION emission, so that trigger never fired — #1398
+    /// retargeted it onto the live uplink signal.
+    ///
+    /// The client OWNS this atom (and shares it into the mic via
+    /// `set_congestion_bitrate_floor`) for ONE purpose: to RESET it to `u32::MAX`
+    /// on reconnect (see the `Connected` handler) so a stale cut does not pin audio
+    /// bitrate low on a fresh session. The mic recovery timer also climbs it back
+    /// after a cooldown; resetting here just makes a fresh session start at full
+    /// bitrate immediately.
+    ///
+    /// FIX D / #1398: the `VideoCallClient` struct ALSO holds a clone of this same
+    /// `Arc` directly (NOT behind `Inner`) so the reconnect reset runs even when the
+    /// `Inner` borrow is contended — the reset store was moved OUT of the `Inner`
+    /// `try_borrow_mut` block in `handle_connected_reconnect_resets`. Both clones
+    /// are the SAME atom, so a store through either is visible through the other.
+    audio_congestion_bitrate_floor: Arc<AtomicU32>,
+    /// Connection RECONNECT-reseed flag for the single-layer audio distress
+    /// detector (issue #1398 reconnect P1). Set `true` on every (re)connect (in the
+    /// `Connected` handler, next to the bitrate-floor reset); the mic-side detector
+    /// tick CONSUMES it and forces its tumbling windows to re-anchor to "now".
+    ///
+    /// Without it, a plain network reconnect does NOT restart the mic (the mic
+    /// stays enabled and `EncoderState::switching` stays false), so the detector
+    /// keeps running with the gate open (camera off, single-layer) and
+    /// `det_was_active == true` — its existing `!was_active` re-seed never fires.
+    /// The transport teardown/rebuild BUMPS the monotonic `unistream_*` /
+    /// `websocket_drop` counters, so the first window that closes on the fresh
+    /// session would cash a spurious cross-reconnect cut. Resetting the floor (the
+    /// atom above) is not enough — that clears an OLD cut but does not stop a NEW
+    /// spurious one. This flag closes that hole.
+    ///
+    /// Like the floor atom, the `VideoCallClient` struct ALSO holds a direct clone
+    /// (NOT behind `Inner`) so the reconnect set runs even when `Inner` is
+    /// contended. Both clones are the SAME atom.
+    audio_detector_reconnect_reseed: Arc<AtomicBool>,
     /// Signal set by `ConnectionManager` when a re-election completes. The
     /// camera encoder reads and clears this to suppress crash ceiling arming.
     reelection_completed_signal: Rc<AtomicBool>,
@@ -556,6 +604,27 @@ pub struct VideoCallClient {
     /// slot: a reconnect must be able to arm the encoder-owned atom even if the
     /// `Inner` mutable borrow used for layer-preference / union-cap reset is busy.
     screen_keyframe_cooldown_reset: Rc<RefCell<Option<Rc<AtomicBool>>>>,
+    /// Single-layer audio BITRATE floor (issue #1398), held DIRECTLY here (NOT
+    /// behind `Inner`) so the reconnect reset always runs even when the `Inner`
+    /// mutable borrow is contended — the same borrow-safety slot pattern as the
+    /// #1311 keyframe-cooldown-reset fields above (FIX D). `Inner` ALSO keeps its
+    /// own clone of this SAME `Arc` (for the `audio_congestion_bitrate_floor()`
+    /// accessor that wires the atom into the mic encoder); this is just a second
+    /// clone reachable WITHOUT taking the `Inner` borrow, so the `Connected`
+    /// reconnect handler can `store(u32::MAX)` here unconditionally. A stale low
+    /// bitrate cut from the OLD session must not pin a fresh one (see the
+    /// `handle_connected_reconnect_resets` store, moved OUT of the `Inner` borrow).
+    audio_congestion_bitrate_floor: Arc<AtomicU32>,
+    /// Connection RECONNECT-reseed flag for the single-layer audio distress
+    /// detector (issue #1398 reconnect P1), held DIRECTLY here (NOT behind `Inner`)
+    /// for the same borrow-safety reason as the bitrate-floor atom above: the
+    /// `Connected` reconnect handler must be able to `store(true)` even when the
+    /// `Inner` mutable borrow is contended. `Inner` ALSO keeps a clone of this SAME
+    /// `Arc` (for the `audio_detector_reconnect_reseed()` accessor that wires it
+    /// into the mic encoder). The mic detector tick consumes it (swap-to-false) and
+    /// forces a window re-seed, so a reconnect's counter bump is never read as a
+    /// fresh-session distress delta.
+    audio_detector_reconnect_reseed: Arc<AtomicBool>,
 }
 
 // `Timeout` (gloo) is not `Debug`; derive a manual impl that elides the
@@ -913,6 +982,8 @@ fn handle_connected_reconnect_resets(
     early_seed_timer: &Rc<RefCell<Option<Interval>>>,
     camera_keyframe_cooldown_reset: &Rc<RefCell<Option<Rc<AtomicBool>>>>,
     screen_keyframe_cooldown_reset: &Rc<RefCell<Option<Rc<AtomicBool>>>>,
+    audio_congestion_bitrate_floor: &Arc<AtomicU32>,
+    audio_detector_reconnect_reseed: &Arc<AtomicBool>,
 ) {
     // On (re)connect the relay also allocated a fresh empty layer-preference map
     // for the new session_id (fail-open -> every layer forwarded). Clear the
@@ -957,6 +1028,10 @@ fn handle_connected_reconnect_resets(
             inner
                 .audio_congestion_layer_ceiling
                 .store(u32::MAX, Ordering::Relaxed);
+            // NOTE (#621): the audio layer-CEILING reset stays inside this borrow.
+            // It is pre-existing/out-of-scope for #1398 FIX D; the single-layer
+            // BITRATE-floor reset that used to sit here was moved OUTSIDE the borrow
+            // below (see the FIX-D store after the #1311 arms).
         } else {
             warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
         }
@@ -974,6 +1049,35 @@ fn handle_connected_reconnect_resets(
     // arm are both harmless.
     arm_camera_keyframe_cooldown_reset(camera_keyframe_cooldown_reset);
     let _ = arm_keyframe_cooldown_reset_slot(screen_keyframe_cooldown_reset);
+
+    // Single-layer audio BITRATE floor reset (issue #1398, FIX D). Run OUTSIDE the
+    // `Inner` `try_borrow_mut()` block above for the SAME reason as the #1311
+    // keyframe-cooldown arms: a full reconnect must reset the floor even when
+    // `Inner` is contended at that instant. Previously this store sat inside the
+    // borrow and was silently dropped on conflict (logging only "inner busy,
+    // skipping"), leaving a stale low-bitrate cut from the OLD session pinning the
+    // single running Opus stream on the FRESH session until the mic recovery timer
+    // climbed it back over a carried-over cooldown. The atom is held directly on
+    // the client (the same `Arc` Inner also holds), so this store never depends on
+    // the `Inner` borrow. The mic-side uplink-distress detector re-steps the floor
+    // from scratch if the new session is also distressed.
+    audio_congestion_bitrate_floor.store(u32::MAX, Ordering::Relaxed);
+
+    // Single-layer audio distress-detector RECONNECT-RESEED (issue #1398 reconnect
+    // P1). Resetting the floor above clears an OLD cut, but does NOT stop a NEW
+    // spurious one: on a plain reconnect the mic is not restarted, so its
+    // uplink-distress detector keeps running with its tumbling windows anchored to
+    // the OLD session and `det_was_active == true` (the gate stayed open: camera
+    // off, single-layer). The transport teardown/rebuild BUMPS the monotonic
+    // `unistream_*` / `websocket_drop` counters, so the first window that closes on
+    // the fresh session would compute a cross-reconnect delta and cash a spurious
+    // cut — re-pinning audio low even though the new session's uplink is healthy.
+    // Set this flag so the detector's next tick CONSUMES it and re-anchors its
+    // windows to "now" (the detector's existing `!was_active` re-seed never fires
+    // here because the detector never went inactive). Stored OUTSIDE the `Inner`
+    // borrow for the same reason as the floor reset above — the atom is held
+    // directly on the client. `Release` so the detector's `AcqRel` swap observes it.
+    audio_detector_reconnect_reseed.store(true, Ordering::Release);
 }
 
 /// Arm the issue-#1179 early-seed sampler if it is not already armed.
@@ -1197,6 +1301,14 @@ impl VideoCallClient {
         // CONGESTION-driven audio layer-ceiling (issue #621). Fail-open
         // (u32::MAX = no congestion cap) until a self-targeted CONGESTION cuts it.
         let audio_congestion_layer_ceiling = Arc::new(AtomicU32::new(u32::MAX));
+        // Single-layer audio BITRATE floor (issue #1398). Fail-open (u32::MAX =
+        // no cut) until the mic-side uplink-distress detector steps it down one
+        // tier. The client owns it only to reset it on reconnect.
+        let audio_congestion_bitrate_floor = Arc::new(AtomicU32::new(u32::MAX));
+        // Reconnect-reseed flag for the single-layer audio distress detector (issue
+        // #1398 reconnect P1). False (no reconnect pending) until the `Connected`
+        // handler sets it on every (re)connect; the mic detector tick consumes it.
+        let audio_detector_reconnect_reseed = Arc::new(AtomicBool::new(false));
         let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
         // Phase 8a / TELEM-1: register a Long Tasks API observer once per
@@ -1277,6 +1389,8 @@ impl VideoCallClient {
                 congestion_warn_count_in_window: 0,
                 client_congestion_signals_received_total: 0,
                 audio_congestion_layer_ceiling: audio_congestion_layer_ceiling.clone(),
+                audio_congestion_bitrate_floor: audio_congestion_bitrate_floor.clone(),
+                audio_detector_reconnect_reseed: audio_detector_reconnect_reseed.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
                 // Relay layer-union hint atoms (issue #1108, Stage 3). None until
                 // the host wires in the camera/screen encoder accessors; the
@@ -1298,6 +1412,14 @@ impl VideoCallClient {
             // arm it independently of the `Inner` borrow (see field doc).
             camera_keyframe_cooldown_reset: Rc::new(RefCell::new(None)),
             screen_keyframe_cooldown_reset: Rc::new(RefCell::new(None)),
+            // FIX D / #1398: a second clone of the SAME floor atom Inner holds, kept
+            // here so the reconnect reset can store the fail-open sentinel without
+            // taking the (possibly contended) Inner borrow.
+            audio_congestion_bitrate_floor: audio_congestion_bitrate_floor.clone(),
+            // Issue #1398 reconnect P1: a second clone of the SAME reconnect-reseed
+            // atom Inner holds, kept here so the `Connected` handler can set it
+            // without taking the (possibly contended) Inner borrow.
+            audio_detector_reconnect_reseed: audio_detector_reconnect_reseed.clone(),
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -1457,6 +1579,15 @@ impl VideoCallClient {
                 // `store(true)` must not depend on `inner.try_borrow_mut()`.
                 let camera_keyframe_cooldown_reset = self.camera_keyframe_cooldown_reset.clone();
                 let screen_keyframe_cooldown_reset = self.screen_keyframe_cooldown_reset.clone();
+                // FIX D / #1398: capture the bitrate-floor atom DIRECTLY (NOT via
+                // `Inner`) so the `Connected` reconnect handler can reset it to the
+                // fail-open sentinel even when the `Inner` borrow below is contended
+                // — same rationale as the keyframe-cooldown slots above.
+                let audio_congestion_bitrate_floor = self.audio_congestion_bitrate_floor.clone();
+                // Issue #1398 reconnect P1: capture the detector reconnect-reseed
+                // atom DIRECTLY (NOT via `Inner`), same rationale, so the handler can
+                // set it on every (re)connect even under a contended `Inner` borrow.
+                let audio_detector_reconnect_reseed = self.audio_detector_reconnect_reseed.clone();
                 Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
@@ -1481,6 +1612,8 @@ impl VideoCallClient {
                                 &early_seed_timer,
                                 &camera_keyframe_cooldown_reset,
                                 &screen_keyframe_cooldown_reset,
+                                &audio_congestion_bitrate_floor,
+                                &audio_detector_reconnect_reseed,
                             );
 
                             // On (re)connect the session_id changed and the
@@ -2279,6 +2412,36 @@ impl VideoCallClient {
         self.inner.borrow().audio_congestion_layer_ceiling.clone()
     }
 
+    /// Returns a shared reference to the SINGLE-LAYER audio BITRATE floor atom
+    /// (issue #1398).
+    ///
+    /// Pass this to `MicrophoneEncoder::set_congestion_bitrate_floor`. The mic
+    /// encoder's uplink-distress detector WRITES it (steps it down one tier on
+    /// sustained uplink distress while audio-only) and its recovery timer climbs
+    /// it back; the mic reconfig timer does NOT min-compose it with the tier —
+    /// it runs a CAMERA-STATE-AWARE select (see `effective_audio_bitrate`):
+    /// camera-on uses the tier bitrate, camera-off uses THIS floor when cut else
+    /// the healthy top-tier default — and re-applies via ctl 4002. The CLIENT
+    /// shares it only so its reconnect handler can RESET it to the fail-open
+    /// sentinel. A bitrate-in-BPS atom (`u32::MAX` = fail-open / no cut), NOT a
+    /// consume-once flag.
+    pub fn audio_congestion_bitrate_floor(&self) -> Arc<AtomicU32> {
+        self.inner.borrow().audio_congestion_bitrate_floor.clone()
+    }
+
+    /// Returns the single-layer audio distress-detector RECONNECT-reseed flag
+    /// (issue #1398 reconnect P1).
+    ///
+    /// Pass this to `MicrophoneEncoder::set_reconnect_reseed_signal`. The CLIENT
+    /// sets it `true` on every (re)connect (in the `Connected` handler); the mic
+    /// detector tick CONSUMES it (swap-to-false) and forces its tumbling windows to
+    /// re-anchor to "now", so the transport counters bumped by a reconnect's
+    /// teardown/rebuild are never read as a fresh-session distress delta. A
+    /// consume-once flag (`true` = reconnect pending, cleared by the detector).
+    pub fn audio_detector_reconnect_reseed(&self) -> Arc<AtomicBool> {
+        self.inner.borrow().audio_detector_reconnect_reseed.clone()
+    }
+
     /// Returns the lifetime total of self-targeted DOWNLINK_CONGESTION signals
     /// received by this client (warned OR muted — see issue #628). Observability
     /// counterpart to the per-second `warn!` rate cap: muted signals still bump
@@ -3071,14 +3234,31 @@ impl Inner {
     ///     Separate flags (not one shared atom) so each encoder's AQ loop consumes
     ///     its own with `swap(false)` and they never race; the AQ loop turns the
     ///     edge into an aggressive multi-tier `force_congestion_cut`.
-    ///   * AUDIO (issue #621): drive the audio congestion layer-ceiling DIRECTLY
-    ///     to base-only (count `1`). Unlike video/screen this is NOT a consume-once
-    ///     flag, because the mic encoder has no AQ loop of its own (audio tier
-    ///     decisions are normally driven by the CAMERA's AQ loop, which is not
-    ///     running when the publisher is audio-only). A direct store makes the
-    ///     audio cut take effect on the next frame regardless of camera state; the
-    ///     mic encoder's self-contained recovery timer climbs the ceiling back up
-    ///     after a cooldown.
+    ///   * AUDIO multi-layer (issue #621): drive the audio congestion
+    ///     layer-ceiling DIRECTLY to base-only (count `1`). Unlike video/screen
+    ///     this is NOT a consume-once flag, because the mic encoder has no AQ loop
+    ///     of its own (audio tier decisions are normally driven by the CAMERA's AQ
+    ///     loop, which is not running when the publisher is audio-only). A direct
+    ///     store makes the audio cut take effect on the next frame regardless of
+    ///     camera state; the mic encoder's self-contained recovery timer climbs
+    ///     the ceiling back up after a cooldown.
+    ///   * AUDIO single-layer (issue #1398): NOT handled here anymore. The
+    ///     single-layer audio bitrate floor was retargeted off this (dead) packet
+    ///     arm onto the LIVE publisher-uplink-distress signal: the mic encoder's
+    ///     own recovery `Interval` now reads the transport stall/drop counters and
+    ///     steps the floor down when audio-only, so the mic encoder drives the
+    ///     single-layer downshift directly. See
+    ///     `MicrophoneEncoder::start`'s uplink-distress detector. (b127ee80
+    ///     originally stepped the floor here too; that write was removed in #1398.)
+    ///
+    /// NOTE (#1219 Half 1 + #1398): the inbound `PacketType::CONGESTION` packet
+    /// that calls this helper is no longer emitted by the relay to the publisher,
+    /// so in production this helper does not run. The audio bitrate floor was
+    /// retargeted onto the live uplink signal precisely for that reason. The
+    /// video/screen step-down flags and the #621 audio layer-ceiling cut below are
+    /// left intact: they have no other live feeder either, but removing them would
+    /// change video/screen + multi-layer-audio behavior, which is out of scope for
+    /// the #1398 audio bitrate path (tracked for a separate dead-code follow-up).
     ///
     /// Extracted as a `&self` helper so the dispatch arm and the host-side unit
     /// test exercise the EXACT same coordinated side-effects.
@@ -4869,6 +5049,8 @@ mod cooldown_reset_hardening_tests {
             &client.early_seed_timer,
             &client.camera_keyframe_cooldown_reset,
             &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
         );
 
         assert!(
@@ -4880,6 +5062,61 @@ mod cooldown_reset_hardening_tests {
             screen.load(Ordering::Acquire),
             "the real Connected reset helper must arm the screen cooldown atom even \
              while the real Inner is mutably borrowed"
+        );
+        drop(inner_guard);
+    }
+
+    /// FIX D / #1398: the single-layer audio BITRATE-floor reset must fire on a
+    /// reconnect even when `Inner` is mutably borrowed at that instant — the actual
+    /// bug this fix closes. We model the contended reconnect by holding a
+    /// `client.inner.borrow_mut()` across the reset call. The reset path upgrades
+    /// the `Weak<Inner>` and `try_borrow_mut`s it; with a `borrow_mut` already held
+    /// that `try_borrow_mut` FAILS (logging "inner busy, skipping"), so any reset
+    /// nested inside that borrow is silently dropped. Because the floor reset now
+    /// lives OUTSIDE the borrow (storing through the client-held clone of the SAME
+    /// `Arc`), it must still run. Revert it catches: moving the
+    /// `audio_congestion_bitrate_floor.store(u32::MAX, …)` back INSIDE the
+    /// `try_borrow_mut` block — under the held borrow it would be skipped, leaving
+    /// the floor at the stale 32000 and FAILING this `u32::MAX` assertion.
+    #[test]
+    fn reconnect_resets_audio_bitrate_floor_while_inner_is_borrowed() {
+        let client = build_test_client();
+        // Stale low-bitrate cut left over from the previous session, stored through
+        // the client-held field clone (the SAME Arc the accessor and Inner share).
+        // We read it back through the field clone too — NOT the public accessor,
+        // which takes `self.inner.borrow()` and would panic under the held
+        // `borrow_mut` below; the field clone is reachable without any Inner borrow,
+        // which is the whole point of FIX D.
+        client
+            .audio_congestion_bitrate_floor
+            .store(32_000, Ordering::Relaxed);
+        assert_eq!(
+            client
+                .audio_congestion_bitrate_floor
+                .load(Ordering::Relaxed),
+            32_000,
+            "precondition: a stale bitrate-floor cut is active"
+        );
+
+        // Simulate the contended reconnect: hold the Inner borrow across the reset.
+        let inner_guard = client.inner.borrow_mut();
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
+        );
+
+        // The floor must be fail-open DESPITE the held borrow.
+        assert_eq!(
+            client
+                .audio_congestion_bitrate_floor
+                .load(Ordering::Relaxed),
+            u32::MAX,
+            "FIX D: the audio bitrate-floor reset must fire on reconnect even while \
+             Inner is mutably borrowed — the store must not depend on the Inner borrow"
         );
         drop(inner_guard);
     }
@@ -5006,6 +5243,11 @@ mod cooldown_reset_hardening_tests {
             u32::MAX,
             "precondition: audio congestion ceiling starts fail-open"
         );
+        assert_eq!(
+            inner.audio_congestion_bitrate_floor.load(Ordering::Relaxed),
+            u32::MAX,
+            "precondition: audio congestion bitrate floor starts fail-open (#1398)"
+        );
 
         inner.apply_self_congestion_cut();
 
@@ -5025,6 +5267,18 @@ mod cooldown_reset_hardening_tests {
             inner.audio_congestion_layer_ceiling.load(Ordering::Relaxed),
             1,
             "self-targeted CONGESTION must cut the AUDIO ceiling to base-only (#621)"
+        );
+        // Single-layer audio bitrate floor (#1398): this dead packet arm must NOT
+        // touch the floor anymore — the floor is driven by the mic-side
+        // uplink-distress detector, not the (removed) CONGESTION trigger. The floor
+        // stays at the fail-open sentinel. Revert it catches: if the bitrate-floor
+        // step-down were re-added to `apply_self_congestion_cut`, this reads 32000
+        // and fails — pinning that the trigger moved off this arm.
+        assert_eq!(
+            inner.audio_congestion_bitrate_floor.load(Ordering::Relaxed),
+            u32::MAX,
+            "apply_self_congestion_cut must NOT step the bitrate floor (#1398: the \
+             floor is now driven by the mic uplink-distress detector)"
         );
     }
 
@@ -5048,20 +5302,43 @@ mod cooldown_reset_hardening_tests {
         );
     }
 
-    /// Issue #621: a reconnect must reset the audio congestion ceiling back to
-    /// fail-open so a stale cut from the OLD session does not pin the audio ladder
-    /// to base-only against a FRESH session.
+    /// Issue #621/#1398: a reconnect must reset BOTH the audio congestion ceiling
+    /// AND the single-layer bitrate floor back to fail-open so a stale cut from the
+    /// OLD session does not pin the audio ladder to base-only / the Opus stream to
+    /// a low bitrate against a FRESH session.
     #[test]
     fn reconnect_resets_audio_congestion_ceiling() {
         let client = build_test_client();
-        // Simulate an active cut left over from the previous session.
+        // Simulate active cuts left over from the previous session: the ceiling
+        // via the dispatch helper, and the bitrate floor by directly storing a
+        // stepped-down value (the floor is now driven by the mic uplink-distress
+        // detector out-of-band, NOT by `apply_self_congestion_cut`, so we model
+        // its effect directly to test the reconnect RESET in isolation).
         client.inner.borrow().apply_self_congestion_cut();
+        client
+            .audio_congestion_bitrate_floor()
+            .store(32_000, Ordering::Relaxed);
         assert_eq!(
             client
                 .audio_congestion_layer_ceiling()
                 .load(Ordering::Relaxed),
             1,
-            "precondition: a cut is active"
+            "precondition: a ceiling cut is active"
+        );
+        assert_eq!(
+            client
+                .audio_congestion_bitrate_floor()
+                .load(Ordering::Relaxed),
+            32_000,
+            "precondition: a stale bitrate-floor cut is active (#1398)"
+        );
+        // Precondition for the reconnect-reseed P1: the detector reseed flag starts
+        // clear (no reconnect pending yet).
+        assert!(
+            !client
+                .audio_detector_reconnect_reseed()
+                .load(Ordering::Acquire),
+            "precondition: the detector reconnect-reseed flag is clear before reconnect"
         );
 
         // The real Connected/reconnect reset path.
@@ -5070,6 +5347,8 @@ mod cooldown_reset_hardening_tests {
             &client.early_seed_timer,
             &client.camera_keyframe_cooldown_reset,
             &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
         );
 
         assert_eq!(
@@ -5078,6 +5357,27 @@ mod cooldown_reset_hardening_tests {
                 .load(Ordering::Relaxed),
             u32::MAX,
             "reconnect must reset the audio congestion ceiling to fail-open"
+        );
+        // Revert it catches: if `handle_connected_reconnect_resets` did not reset
+        // the bitrate floor, this reads 32000 (the stale cut) and fails.
+        assert_eq!(
+            client
+                .audio_congestion_bitrate_floor()
+                .load(Ordering::Relaxed),
+            u32::MAX,
+            "reconnect must reset the audio congestion bitrate floor to fail-open (#1398)"
+        );
+        // Reconnect-reseed P1 (#1398): the handler must SET the detector
+        // reconnect-reseed flag so the mic detector re-anchors its windows on the
+        // fresh session. Revert it catches: dropping the
+        // `audio_detector_reconnect_reseed.store(true, …)` from the handler → this
+        // reads false and FAILS, proving the reconnect signal is raised.
+        assert!(
+            client
+                .audio_detector_reconnect_reseed()
+                .load(Ordering::Acquire),
+            "reconnect must set the detector reconnect-reseed flag so the mic \
+             detector re-seeds its windows on the fresh session (#1398 reconnect P1)"
         );
     }
 }
