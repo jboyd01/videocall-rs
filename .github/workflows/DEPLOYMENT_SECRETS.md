@@ -34,6 +34,20 @@ ssh k3s.labsworkspace.fnxlabs.com "cat /etc/rancher/k3s/k3s.yaml" \
 
 The kubeconfig should point to the cluster API endpoint at `https://k3s.labsworkspace.fnxlabs.com:6443`.
 
+### `ASCEND_KUBECONFIG`
+
+**Used by:** `daily-deploy-ascend.yaml`  
+**Description:** Base64-encoded kubeconfig for the Ascend cluster at `conceptcar7.com`
+
+**How to generate:**
+
+```bash
+# From the location where the Ascend kubeconfig is stored
+cat /home/jboyd/ascend/ascend-cluster-config | base64 -w0
+```
+
+The kubeconfig should point to the cluster API endpoint at `https://10.244.8.238:6443`.
+
 ### `HARBOR_USERNAME`
 
 **Used by:** Both deployment workflows  
