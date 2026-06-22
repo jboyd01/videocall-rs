@@ -3,6 +3,7 @@
 //! Dedicated meeting settings page — the full management hub for a meeting.
 
 use crate::auth::{check_session, redirect_to_login};
+use crate::components::meeting_format::format_datetime_zoned;
 use crate::components::toggle_switch::ToggleSwitch;
 use crate::constants::oauth_enabled;
 use crate::meeting_api::{
@@ -240,8 +241,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let duration_str = info
         .ended_at
         .map(|ended| format_duration(ended - info.started_at));
-    let started_str = format_time(info.started_at);
-    let ended_str = info.ended_at.map(format_time);
+    let started_str = format_datetime_zoned(info.started_at);
+    let ended_str = info.ended_at.map(format_datetime_zoned);
     let participant_count = info.participant_count;
     let waiting_count = info.waiting_count;
 
@@ -768,19 +769,4 @@ fn format_duration(duration_ms: i64) -> String {
     } else {
         format!("{seconds}s")
     }
-}
-
-fn format_time(timestamp_ms: i64) -> String {
-    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(timestamp_ms as f64));
-    let hours = date.get_hours();
-    let minutes = date.get_minutes();
-    let am_pm = if hours >= 12 { "PM" } else { "AM" };
-    let hours_12 = if hours == 0 {
-        12
-    } else if hours > 12 {
-        hours - 12
-    } else {
-        hours
-    };
-    format!("{hours_12}:{minutes:02} {am_pm}")
 }
