@@ -529,8 +529,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     line { x1: "3", y1: "10", x2: "21", y2: "10" }
                 }
                 span { class: "settings-stat-label", if is_ended { "Time" } else { "Started" } }
-                span { class: "settings-stat-value",
-                    "{started_str}"
+                span { class: "settings-stat-value settings-stat-value--range",
+                    span { class: "settings-stat-time-part", "{started_str}" }
                     if let Some(ref ended) = ended_str {
                         span { class: "settings-stat-separator", " – {ended}" }
                     }

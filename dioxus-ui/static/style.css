@@ -4271,6 +4271,19 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   white-space: nowrap;
 }
 
+/* Time row may render a "from – to" range; allow it to wrap between the two
+   timestamps (right-aligned) while each timestamp stays an atomic unit.
+   A no-range value has no internal break point, so it stays on one line. */
+.settings-stat-value--range {
+  white-space: normal;
+  text-align: right;
+}
+
+.settings-stat-time-part,
+.settings-stat-separator {
+  white-space: nowrap;
+}
+
 .settings-stat-separator {
   color: var(--text-tertiary);
   font-weight: 400;
