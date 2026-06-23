@@ -6,6 +6,7 @@ import {
   joinMeeting,
   endMeeting,
   deleteAllOwnedMeetings,
+  fetchMeetingState,
 } from "../helpers/meeting-api";
 
 // Selectors for the inline label-row error pattern. The error <span> lives
@@ -750,6 +751,71 @@ test.describe("Meetings list (merged feed)", () => {
     // code path is identical for all three states (single span with the
     // matching class) so the active/ended coverage gives reasonable
     // confidence.
+  });
+
+  test("list state pill updates live after a server-side transition without reload", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // SSE is the primary live path: the homepage subscribes to the meetings
+    // stream and re-renders the `.meeting-state` pill as server-side state
+    // transitions arrive. Issue #1628 adds a low-frequency `use_future`
+    // fallback poll (FALLBACK_POLL_INTERVAL_MS = 25_000) in
+    // `dioxus-ui/src/components/meetings_list.rs` that silently re-fetches
+    // `GET /api/v1/meetings/feed` and calls `meetings.set(...)` WITHOUT
+    // flipping `loading`, so the list converges on the server's live
+    // per-meeting `state` even if SSE never delivers in the e2e env. That
+    // 25s fallback is what makes this test deterministic: we pick a 35s
+    // assertion timeout that comfortably exceeds the 25s poll interval.
+    //
+    // The load-bearing part is that the pill flips from "Active" to "Ended"
+    // with NO `page.reload()` / `page.goto()` between the initial and final
+    // assertions — the list updates itself. This would FAIL on the pre-fix
+    // code: without the poll (and with SSE silent in the e2e env), the row
+    // would stay stuck on "Active" until a manual refresh.
+    const email = `meetings-live-update-${Date.now()}@videocall.rs`;
+    const name = "MeetingsLiveUpdateUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    // Seed: one meeting, driven ACTIVE via the join-as-host path.
+    const id = `e2e_meetings_live_${Date.now()}`;
+    await createMeeting(email, name, { meetingId: id, waitingRoomEnabled: false });
+    await joinMeeting(email, name, id, name);
+
+    // Confirm the seed actually produced an ACTIVE row server-side before we
+    // load the page (the host-join activation is observable in the feed).
+    await expect.poll(() => fetchMeetingState(email, name, id)).toBe("active");
+
+    await page.goto("/");
+    await waitForMeetingsRowCount(page, 1);
+
+    // Initial UI state: the single row renders the "Active" pill.
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-active`)).toHaveText(
+      "Active",
+    );
+
+    // Drive the SERVER-SIDE transition WITHOUT touching the page. From here
+    // until the final assertion there is NO reload/goto — the list must
+    // converge on its own via the fallback poll (and SSE, when available).
+    await endMeeting(email, name, id);
+
+    // Confirm the server transitioned to `ended` before asserting the UI.
+    // The active→ended path settles through an async NATS round-trip, so we
+    // poll the feed rather than asserting immediately.
+    await expect.poll(() => fetchMeetingState(email, name, id)).toBe("ended");
+
+    // Load-bearing assertion: the pill flips to "Ended" with no reload/goto.
+    // The 35s timeout comfortably exceeds the 25s fallback-poll interval.
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-ended`)).toHaveText(
+      "Ended",
+      { timeout: 35_000 },
+    );
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-active`)).toHaveCount(0, {
+      timeout: 35_000,
+    });
+
+    await deleteAllOwnedMeetings(email, name);
   });
 
   test("Owner icon appears only on owned rows (and never on guest rows)", async ({

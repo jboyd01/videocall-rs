@@ -245,6 +245,20 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo test -p videocall-meeting-client
+      # videocall-ui (the Dioxus UI crate) has host-runnable libtest `#[test]`
+      # coverage — e.g. the meetings-list `feed_stream_url_*` URL-contract tests
+      # and the `should_refetch_on_tick` fallback-poll guard truth table
+      # (#1628). The clippy step above only COMPILES these (`--tests`); without
+      # this step they are never EXECUTED, so a broken guard or a drifted stream
+      # URL would compile-and-merge green. The crate's many `#[wasm_bindgen_test]`
+      # fns emit host-target stubs that never run under native libtest (verified:
+      # `cargo test -p videocall-ui --lib` runs 657 tests, 0 browser launches),
+      # so `--lib` is a fast, browserless gate for the pure host helpers.
+      - name: cargo test videocall-ui (native libtest)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test -p videocall-ui --lib
       # NOTE: vcprobe, videocall-cli, and videocall-sdk are also `paths:`-gated
       # by #1174 but carry NO test files (confirmed in #1176), so they
       # intentionally get no test step here — adding one would be a no-op.
