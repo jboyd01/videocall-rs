@@ -34,9 +34,12 @@
 //! node. A new
 //! node would NOT be the element the screen decoder cached a reference to (see
 //! the module docs on `screen_share_zoom`), so paint would freeze. By keeping
-//! the state imperative, Dioxus never touches the subtree after first mount, so
-//! the same `<canvas>` element survives the move to the PiP window and back —
-//! which is exactly what keeps it painting live.
+//! the state imperative, Dioxus never *re-creates* the `<canvas>` node — a
+//! props-driven re-render of this subtree diffs by retained node identity and
+//! reuses the unchanged element rather than tearing it down — so the cached
+//! decoder canvas reference survives re-renders and the same `<canvas>` element
+//! survives the move to the PiP window and back, which is exactly what keeps it
+//! painting live.
 
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};

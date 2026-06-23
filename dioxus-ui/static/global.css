@@ -3114,8 +3114,13 @@ html[data-theme="light"] #invite-overlay p {
    Picture-in-Picture window (`.ss-pip-host`), where it keeps the
    SAME <canvas> element so the decoder keeps painting it live.
 
-   Zoom is a CSS `transform: scale(z)` on the canvas only — never a
-   re-decode / re-raster — so it stays cheap per frame.
+   Zoom grows the canvas via CSS width/height percentage (with
+   `object-fit: fill`) on the canvas only — never a re-decode /
+   re-raster: the canvas backing store stays untouched, so the GPU
+   just upscales the already-rendered frame and it stays cheap per
+   frame. (Width/height is used, not `transform: scale()`, because a
+   transform creates no scrollable overflow for drag-to-pan; see
+   `apply_zoom` in `screen_share_zoom_dom.rs`.)
    ============================================================ */
 
 /* Permanent grid home for the shared content. The movable host is
