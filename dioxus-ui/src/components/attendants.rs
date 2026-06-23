@@ -6844,7 +6844,7 @@ pub fn AttendantsComponent(
                                 }
                             }
                             p {
-                                style: "color:#AEAEB2; margin-top:0; margin-bottom:0.75rem; font-size:0.85rem;",
+                                style: "color: var(--text-secondary); margin-top:0; margin-bottom:0.75rem; font-size:0.85rem;",
                                 "Changes apply to everyone immediately."
                             }
 
