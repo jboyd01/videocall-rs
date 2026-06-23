@@ -220,9 +220,12 @@ const PARTICIPANT_LEFT_SUBJECT: &str = "internal.participant_left";
 /// reconnection too — that is precisely the stuck-idle case it heals.
 ///
 /// Idempotent and race-safe on the consumer side: `mark_present_by_connect`
-/// only flips rows that are not already present, and the re-activation
-/// `activate()` guards `state IN ('idle','ended')`/`<>'ended'` so it never
-/// resurrects an `ended` meeting — `ended` is terminal and wins the
+/// only flips rows that are not already present, and the re-activation calls
+/// `reactivate_from_idle` (an atomic `UPDATE … SET state='active' WHERE
+/// state='idle'`), NOT `activate()`. `activate()` would re-open an `ended`
+/// meeting; `reactivate_from_idle`'s `WHERE state='idle'` predicate matches
+/// zero rows when the row is `ended`, so a late present event racing a host
+/// `end_meeting` can never resurrect it — `ended` is terminal and wins the
 /// end-vs-present race in either ordering. Like [`PARTICIPANT_LEFT_SUBJECT`]
 /// it is per-user and NOT coalesced; a join wave is an O(N) fan-out, matching
 /// the per-peer `PARTICIPANT_JOINED` volume the relay already sustains.

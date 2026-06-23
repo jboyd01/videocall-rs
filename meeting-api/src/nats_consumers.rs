@@ -301,9 +301,9 @@ pub fn spawn_participant_left_consumer_inner(
 /// `(meeting_id, user_id)` as `status='admitted', left_at=NULL` via
 /// [`db_participants::mark_present_by_connect`] (so the participant is counted as
 /// present again — issue #1628), and RE-ACTIVATE the meeting via
-/// [`db_meetings::activate`] (`idle -> active`). This is the symmetric
-/// counterpart to the empty→`set_idle` path and closes the asymmetry where
-/// re-activation previously only happened on a REST `/join`.
+/// [`db_meetings::reactivate_from_idle`] (`idle -> active`). This is the
+/// symmetric counterpart to the empty→`set_idle` path and closes the asymmetry
+/// where re-activation previously only happened on a REST `/join`.
 ///
 /// Ordering / nudge: the nudge is fired AFTER both DB writes succeed. A nudge is
 /// emitted when EITHER the participant row flipped to present (`rows > 0`) OR the
@@ -311,17 +311,19 @@ pub fn spawn_participant_left_consumer_inner(
 /// duplicate event (the user is already present and the meeting already active)
 /// is a zero-effect no-op and emits no nudge, keeping nudge cardinality tight.
 ///
-/// `ended`-safety: `activate()` re-activates a meeting whose state is
-/// `idle` or `ended`. We must NEVER resurrect a meeting the host deliberately
+/// `ended`-safety: we must NEVER resurrect a meeting the host deliberately
 /// ended (`end_on_host_leave=true`). The relay only publishes
 /// `PARTICIPANT_PRESENT` for a session that reached Active in `room_members`; a
 /// host-ended meeting tears those sessions down (MEETING_ENDED), so in practice
-/// no present event races an end. As a belt-and-suspenders guard the consumer
-/// re-activates ONLY when the row is currently `idle` — it reads the meeting
-/// state and skips the `activate()` call (and the implied resurrection) when the
-/// meeting is `ended`. The mark-present write is still applied (harmless: it only
-/// heals a `left` row and never changes meeting state), but the terminal `ended`
-/// state is preserved.
+/// no present event races an end. The consumer does NOT read the meeting state
+/// and does NOT call `activate()` (which would UNCONDITIONALLY re-open an
+/// `ended` meeting). It unconditionally calls
+/// [`db_meetings::reactivate_from_idle`], an atomic `UPDATE … SET state='active'
+/// WHERE state='idle'`: when the host ended the meeting, the `state='idle'`
+/// predicate matches zero rows, so the re-activation is a no-op and the terminal
+/// `ended` state is preserved — even against a read-then-write race. The
+/// mark-present write is still applied (harmless: it only heals a `left` row and
+/// never changes meeting state).
 ///
 /// Idempotent and reconnect-safe: `mark_present_by_connect` only flips a `left`,
 /// previously-admitted row, so it is a no-op on an already-present participant,
