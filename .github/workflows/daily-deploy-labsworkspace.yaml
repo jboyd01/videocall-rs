@@ -1,4 +1,4 @@
-name: Daily Deploy to HCL Daily-Dev
+name: Daily Deploy to labsworkspace
 
 # NOTE: workflow_run trigger is currently non-functional due to GitHub Actions API limitation.
 # The REST API /repos/.../actions/runs/{id}/jobs endpoint does not expose job outputs,
@@ -31,7 +31,7 @@ env:
 
 jobs:
   deploy:
-    name: Deploy to HCL daily-dev
+    name: Deploy to labsworkspace
     runs-on: [self-hosted, linux, docker]
     # Only deploy if build was successful (for workflow_run trigger)
     if: |
@@ -44,9 +44,9 @@ jobs:
       - name: Setup kubeconfig
         run: |
           mkdir -p ~/.kube
-          echo "${{ secrets.HCL_DAILY_KUBECONFIG }}" | base64 -d > ~/.kube/hcl-daily.yaml
-          chmod 600 ~/.kube/hcl-daily.yaml
-          echo "KUBECONFIG=$HOME/.kube/hcl-daily.yaml" >> $GITHUB_ENV
+          echo "${{ secrets.LABSWORKSPACE_KUBECONFIG }}" | base64 -d > ~/.kube/labsworkspace.yaml
+          chmod 600 ~/.kube/labsworkspace.yaml
+          echo "KUBECONFIG=$HOME/.kube/labsworkspace.yaml" >> $GITHUB_ENV
 
       - name: Validate kubectl and kubeconfig access
         run: |
@@ -56,7 +56,7 @@ jobs:
           CLUSTER_INFO=$(kubectl cluster-info)
           echo "${CLUSTER_INFO}"
           # Strip ANSI color codes before grep
-          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
+          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://k3s.labsworkspace.fnxlabs.com:6443"
 
       - name: Determine image tag
         id: determine-tag
@@ -166,7 +166,7 @@ jobs:
         run: |
           echo "Ensuring videocall namespace exists..."
           kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
-          kubectl label namespace ${NAMESPACE} app=videocall env=daily-dev --overwrite
+          kubectl label namespace ${NAMESPACE} app=videocall env=labsworkspace --overwrite
           echo "✅ Namespace ready: ${NAMESPACE}"
 
       - name: Verify required secrets exist
@@ -175,12 +175,8 @@ jobs:
 
           REQUIRED_SECRETS=(
             "postgres-credentials"
-            "google-oauth-credentials"
             "jwt-secret"
             "harbor-pull-secret"
-            "api-tls"
-            "websocket-tls"
-            "webtransport-tls"
           )
 
           MISSING_SECRETS=()
@@ -223,7 +219,7 @@ jobs:
           # Build helm dependencies for the NATS chart
           helm dependency update helm/global/us-east/nats/
 
-          # Deploy using the NATS chart
+          # Deploy using the production NATS chart
           helm upgrade --install nats helm/global/us-east/nats/ \
             --namespace ${NAMESPACE} \
             --set nats.natsbox.enabled=true \
@@ -246,6 +242,11 @@ jobs:
 
           echo "Deploying WebTransport server to ${NAMESPACE}..."
 
+          # NOTE: The helm/rustlemania-webtransport chart does not render an Ingress or Certificate resource,
+          # so the cert-manager annotation below has no effect. The webtransport-tls secret must be pre-created
+          # via a Certificate CR or manual provisioning. Both labsworkspace and Ascend clusters have this
+          # secret already provisioned.
+
           helm upgrade --install videocall-webtransport helm/rustlemania-webtransport/ \
             --namespace ${NAMESPACE} \
             --set image.repository=${REGISTRY}/videocall-media-server \
@@ -257,12 +258,12 @@ jobs:
             --set service.healthPort=444 \
             --set "command[0]=webtransport_server" \
             --set tlsSecret=webtransport-tls \
-            --set certificateDomain=webtransport.videocall.fnxlabs.com \
+            --set certificateDomain=webtransport.videocall.labsworkspace.fnxlabs.com \
             --set "env[0].name=JWT_SECRET" \
             --set "env[0].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[0].valueFrom.secretKeyRef.key=secret" \
             --set "env[1].name=RUST_LOG" \
-            --set "env[1].value=warn,quinn=warn,web-transport-quinn=warn,async_nats=warn" \
+            --set "env[1].value=warn" \
             --set "env[2].name=NATS_URL" \
             --set "env[2].value=nats:4222" \
             --set "env[3].name=LISTEN_URL" \
@@ -312,17 +313,16 @@ jobs:
             --set "env[6].name=SERVER_STATS_INTERVAL_SECS" \
             --set-string "env[6].value=5" \
             --set ingress.enabled=true \
-            --set "ingress.hosts[0].host=websocket.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].host=websocket.videocall.labsworkspace.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-websocket" \
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
             --set "ingress.tls[0].secretName=websocket-tls" \
-            --set "ingress.tls[0].hosts[0]=websocket.videocall.fnxlabs.com" \
+            --set "ingress.tls[0].hosts[0]=websocket.videocall.labsworkspace.fnxlabs.com" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
-            --set "ingress.annotations.cert-manager\.io/issuer=null" \
-            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --set "ingress.annotations.cert-manager\.io/cluster-issuer=letsencrypt-prod" \
             --wait --timeout 5m
 
           echo "✅ WebSocket server deployed"
@@ -356,11 +356,8 @@ jobs:
           # Get postgres password
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n ${NAMESPACE} -o jsonpath='{.data.password}' | base64 -d)
 
-          # Get OAuth credentials
-          OAUTH_CLIENT_ID=$(kubectl get secret google-oauth-credentials -n ${NAMESPACE} -o jsonpath='{.data.client-id}' | base64 -d)
-          OAUTH_CLIENT_SECRET=$(kubectl get secret google-oauth-credentials -n ${NAMESPACE} -o jsonpath='{.data.client-secret}' | base64 -d)
-
-          echo "Deploying Meeting API to ${NAMESPACE} with OAuth enabled..."
+          echo "Deploying Meeting API to ${NAMESPACE} with PKCE OAuth enabled..."
+          # NOTE: OAUTH_SECRET env var is intentionally empty for PKCE flow (public client, no static secret)
 
           helm upgrade --install videocall-api helm/meeting-api/ \
             --namespace ${NAMESPACE} \
@@ -374,23 +371,23 @@ jobs:
             --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
-            --set "env[2].value=https://app.videocall.fnxlabs.com" \
+            --set "env[2].value=https://app.videocall.labsworkspace.fnxlabs.com" \
             --set "env[3].name=COOKIE_DOMAIN" \
-            --set "env[3].value=.videocall.fnxlabs.com" \
+            --set "env[3].value=.videocall.labsworkspace.fnxlabs.com" \
             --set "env[4].name=OAUTH_ISSUER" \
-            --set "env[4].value=https://accounts.google.com" \
+            --set "env[4].value=https://id.labsworkspace.fnxlabs.com" \
             --set "env[5].name=OAUTH_CLIENT_ID" \
-            --set "env[5].value=${OAUTH_CLIENT_ID}" \
+            --set "env[5].value=client_01KVR3TZ42FAAM76MMKZ81A0TA" \
             --set "env[6].name=OAUTH_SECRET" \
-            --set "env[6].value=${OAUTH_CLIENT_SECRET}" \
+            --set "env[6].value=" \
             --set "env[7].name=OAUTH_REDIRECT_URL" \
-            --set "env[7].value=https://api.videocall.fnxlabs.com/login/callback" \
+            --set "env[7].value=https://app.videocall.labsworkspace.fnxlabs.com/auth/callback" \
             --set "env[8].name=AFTER_LOGIN_URL" \
-            --set "env[8].value=https://app.videocall.fnxlabs.com" \
+            --set "env[8].value=https://app.videocall.labsworkspace.fnxlabs.com" \
             --set "env[9].name=OAUTH_SCOPES" \
             --set "env[9].value=openid email profile" \
             --set "env[10].name=ALLOWED_REDIRECT_URLS" \
-            --set "env[10].value=https://app.videocall.fnxlabs.com" \
+            --set "env[10].value=https://app.videocall.labsworkspace.fnxlabs.com" \
             --set "env[11].name=LISTEN_ADDR" \
             --set "env[11].value=0.0.0.0:8081" \
             --set "env[12].name=RUST_LOG" \
@@ -405,22 +402,25 @@ jobs:
             --set-string "env[16].value=86400" \
             --set "env[17].name=NATS_URL" \
             --set "env[17].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
+            --set "env[18].name=OAUTH_BROWSER_PKCE" \
+            --set-string "env[18].value=true" \
+            --set "env[19].name=AFTER_LOGOUT_URL" \
+            --set "env[19].value=https://app.videocall.labsworkspace.fnxlabs.com/" \
             --set ingress.enabled=true \
-            --set "ingress.hosts[0].host=api.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].host=api.videocall.labsworkspace.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-api" \
             --set "ingress.hosts[0].paths[0].service.port.number=8081" \
             --set "ingress.tls[0].secretName=api-tls" \
-            --set "ingress.tls[0].hosts[0]=api.videocall.fnxlabs.com" \
-            --set "ingress.annotations.cert-manager\.io/issuer=null" \
-            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --set "ingress.tls[0].hosts[0]=api.videocall.labsworkspace.fnxlabs.com" \
+            --set "ingress.annotations.cert-manager\.io/cluster-issuer=letsencrypt-prod" \
             --set consoleLogs.enabled=true \
             --set consoleLogs.storageSize=5Gi \
             --set-string consoleLogs.retentionDays=14 \
             --wait --timeout 5m
 
-          echo "✅ Meeting API deployed with OAuth and console log collection"
+          echo "✅ Meeting API deployed with PKCE OAuth and console log collection"
 
       - name: Deploy Dioxus UI
         run: |
@@ -436,15 +436,17 @@ jobs:
             --set image.tag=${TAG} \
             --set "imagePullSecrets[0].name=harbor-pull-secret" \
             --set fullnameOverride=videocall-dioxus-ui \
-            --set "runtimeConfig.apiBaseUrl=https://api.videocall.fnxlabs.com" \
-            --set "runtimeConfig.meetingApiBaseUrl=https://api.videocall.fnxlabs.com" \
-            --set "runtimeConfig.wsUrl=wss://websocket.videocall.fnxlabs.com" \
-            --set "runtimeConfig.webTransportHost=https://webtransport.videocall.fnxlabs.com:4433" \
+            --set "runtimeConfig.apiBaseUrl=https://api.videocall.labsworkspace.fnxlabs.com" \
+            --set "runtimeConfig.meetingApiBaseUrl=https://api.videocall.labsworkspace.fnxlabs.com" \
+            --set "runtimeConfig.wsUrl=wss://websocket.videocall.labsworkspace.fnxlabs.com" \
+            --set "runtimeConfig.webTransportHost=https://webtransport.videocall.labsworkspace.fnxlabs.com:4433" \
             --set-string "runtimeConfig.webTransportEnabled=true" \
             --set-string "runtimeConfig.transportBadgeEnabled=true" \
             --set-string "runtimeConfig.showBuildGitInfo=false" \
             --set-string "runtimeConfig.oauthEnabled=true" \
-            --set-string "runtimeConfig.oauthProvider=google" \
+            --set "runtimeConfig.oauthIssuer=https://id.labsworkspace.fnxlabs.com" \
+            --set "runtimeConfig.oauthFlow=pkce" \
+            --set "runtimeConfig.oauthClientId=client_01KVR3TZ42FAAM76MMKZ81A0TA" \
             --set-string "runtimeConfig.e2eeEnabled=false" \
             --set-string "runtimeConfig.firefoxEnabled=false" \
             --set-string "runtimeConfig.hardwareMetricsEnabled=true" \
@@ -455,14 +457,12 @@ jobs:
             --set "runtimeConfig.screenBitrateKbps=1000" \
             --set-string "runtimeConfig.consoleLogUploadEnabled=true" \
             --set ingress.enabled=true \
-            --set "ingress.hosts[0].host=app.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].host=app.videocall.labsworkspace.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.tls[0].secretName=dioxus-ui-tls" \
-            --set "ingress.tls[0].hosts[0]=app.videocall.fnxlabs.com" \
-            --set "ingress.annotations.cert-manager\.io/issuer=letsencrypt-prod" \
-            --set "ingress.annotations.cert-manager\.io/issuer-kind=Issuer" \
-            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --set "ingress.tls[0].hosts[0]=app.videocall.labsworkspace.fnxlabs.com" \
+            --set "ingress.annotations.cert-manager\.io/cluster-issuer=letsencrypt-prod" \
             --wait --timeout 5m
 
           echo "✅ Dioxus UI deployed"
@@ -485,16 +485,16 @@ jobs:
           TAG=${{ steps.determine-tag.outputs.tag }}
 
           echo "=================================================="
-          echo "✅ HCL daily-dev deployment completed successfully!"
+          echo "✅ labsworkspace deployment completed successfully!"
           echo "=================================================="
           echo ""
           echo "Deployed image tag: ${TAG}"
           echo ""
-          echo "HCL Daily-Dev URLs:"
-          echo "  - Dioxus UI:     https://app.videocall.fnxlabs.com"
-          echo "  - API:           https://api.videocall.fnxlabs.com"
-          echo "  - WebSocket:     wss://websocket.videocall.fnxlabs.com"
-          echo "  - WebTransport:  https://webtransport.videocall.fnxlabs.com"
+          echo "labsworkspace URLs:"
+          echo "  - Dioxus UI:     https://app.videocall.labsworkspace.fnxlabs.com"
+          echo "  - API:           https://api.videocall.labsworkspace.fnxlabs.com"
+          echo "  - WebSocket:     wss://websocket.videocall.labsworkspace.fnxlabs.com"
+          echo "  - WebTransport:  https://webtransport.videocall.labsworkspace.fnxlabs.com"
           echo ""
           echo "Namespace: ${NAMESPACE}"
           echo ""
@@ -529,9 +529,9 @@ jobs:
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           if [ "${{ job.status }}" = "success" ]; then
-            MESSAGE="✅ *HCL Daily-Dev Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app.videocall.fnxlabs.com\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n\n_Deployed to videocall namespace_"
+            MESSAGE="✅ *labsworkspace Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app.videocall.labsworkspace.fnxlabs.com\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n\n_Deployed to videocall namespace_"
           else
-            MESSAGE="❌ *HCL Daily-Dev Deployment Failed*\n\n📦 Tag: \`${TAG}\`\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n🔗 Logs: ${WORKFLOW_URL}\n\n_Check workflow logs for details_"
+            MESSAGE="❌ *labsworkspace Deployment Failed*\n\n📦 Tag: \`${TAG}\`\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n🔗 Logs: ${WORKFLOW_URL}\n\n_Check workflow logs for details_"
           fi
 
           curl -X POST "${GCHAT_WEBHOOK_URL}" \
@@ -544,11 +544,11 @@ jobs:
           TAG=${{ steps.determine-tag.outputs.tag }}
 
           if [ "${{ job.status }}" = "success" ]; then
-            echo "::notice::HCL daily-dev deployment successful - tag: ${TAG}"
+            echo "::notice::labsworkspace deployment successful - tag: ${TAG}"
           else
-            echo "::error::HCL daily-dev deployment failed - tag: ${TAG}"
+            echo "::error::labsworkspace deployment failed - tag: ${TAG}"
           fi
 
       - name: Cleanup kubeconfig
         if: always()
-        run: rm -f ~/.kube/hcl-daily.yaml
+        run: rm -f ~/.kube/labsworkspace.yaml
