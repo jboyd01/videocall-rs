@@ -3105,6 +3105,165 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 /* ============================================================
+   Issue 1175: received shared-content zoom / pan / detach.
+
+   The shared-content (received screen share) subtree on the
+   receiving side is wrapped so the viewer can zoom in/out, pan
+   when zoomed, and detach the content into its own window. The
+   layout below is movable as ONE node into a Document
+   Picture-in-Picture window (`.ss-pip-host`), where it keeps the
+   SAME <canvas> element so the decoder keeps painting it live.
+
+   Zoom is a CSS `transform: scale(z)` on the canvas only — never a
+   re-decode / re-raster — so it stays cheap per frame.
+   ============================================================ */
+
+/* Permanent grid home for the shared content. The movable host is
+   appended here at mount and re-appended here on reattach. */
+.ss-pip-slot {
+  width: 100%;
+  height: 100%;
+}
+
+/* Movable subtree: viewport + canvas + controls + name. Positioned
+   so the floating name and corner controls overlay the viewport. */
+.ss-pip-host {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+/* Pannable viewport around the screen-share canvas. At fit (zoom == 1)
+   it clips with the existing `.canvas-container` overflow:hidden. When
+   zoomed past fit the `--pannable` modifier turns on scrolling so the
+   user can reach the off-screen content. */
+.ss-zoom-viewport {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.ss-zoom-viewport.ss-zoom-viewport--pannable {
+  overflow: auto;
+  /* Switch OFF the inherited `.canvas-container` flex-centering while
+     pannable: flex centering an oversized child clips the overflow on the
+     centered axis so it can't be scrolled to. Block layout + align-start
+     lets the full zoomed canvas live inside the scrollable area. */
+  display: block;
+  /* Grab cursor signals drag-to-pan; switches to grabbing mid-drag. */
+  cursor: grab;
+}
+
+.ss-zoom-viewport.ss-zoom-viewport--pannable[data-panning="true"] {
+  cursor: grabbing;
+}
+
+/* Zoom / detach control cluster. Mirrors the `.tile-top-icons`
+   placement language (corner overlay) but sits at the BOTTOM so it does
+   not collide with the top signal / pin / crop icons, and travels with
+   the content into the detached window. */
+.ss-zoom-controls {
+  position: absolute;
+  bottom: min(8px, calc(var(--tile-h, 240px) * 0.04));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: min(8px, calc(var(--tile-w, 320px) * 0.025));
+  padding: 4px 8px;
+  background-color: var(--overlay-heavy);
+  border-radius: var(--radius-lg);
+  z-index: 4;
+  /* Hidden until the tile is hovered, matching the pin/crop affordance.
+     Always visible inside the detached PiP window (rule below). */
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.split-screen-tile:hover .ss-zoom-controls,
+.ss-zoom-controls:hover,
+.ss-zoom-controls:focus-within {
+  opacity: 1;
+}
+
+.ss-zoom-btn {
+  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: transparent;
+  color: var(--text-on-glass-strong);
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  font: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.ss-zoom-btn svg {
+  width: min(20px, calc(var(--tile-h, 240px) * 0.1));
+  height: min(20px, calc(var(--tile-h, 240px) * 0.1));
+  flex-shrink: 0;
+}
+
+.ss-zoom-btn:hover {
+  background-color: var(--overlay-opaque);
+}
+
+.ss-zoom-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.ss-zoom-label {
+  min-width: 3.2em;
+  text-align: center;
+  color: var(--text-on-glass-strong);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+/* ── Document PiP window body ─────────────────────────────────────────
+   The PiP document starts blank; we copy the app stylesheets in and tag
+   its <body> with `.ss-pip-body` so the moved subtree fills the window
+   on a dark backdrop, and the controls stay always-visible (no tile to
+   hover in the popped-out window). */
+.ss-pip-body {
+  margin: 0;
+  width: 100vw;
+  height: 100vh;
+  background: var(--bg, #000000); /* @token-exempt: PiP fallback when tokens absent */
+  overflow: hidden;
+}
+
+.ss-pip-body .ss-pip-host {
+  width: 100vw;
+  height: 100vh;
+}
+
+.ss-pip-body .ss-zoom-controls {
+  opacity: 1;
+}
+
+/* Hide pin/crop/zoom controls on mobile narrow grid tiles -- the split
+   layout is the primary surface for these (matches the existing
+   pin/crop mobile hide). The detached window is desktop-only (Document
+   PiP is unsupported on mobile browsers), so the controls there are
+   unaffected. */
+@media (max-width: 767px) {
+  .grid-item .ss-zoom-controls {
+    display: none;
+  }
+}
+
+/* ============================================================
    Clip peer-tile video feed to the tile's rounded corners.
 
    `.grid-item` carries the tile's `border-radius` (var(--radius-lg)

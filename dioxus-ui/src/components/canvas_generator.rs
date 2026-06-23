@@ -22,6 +22,8 @@ use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
+use crate::components::icons::zoom::{DetachIcon, ZoomInIcon, ZoomOutIcon, ZoomResetIcon};
+use crate::components::screen_share_zoom::zoom_percent_label;
 use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 // SignalMeterMode is referenced via SignalInfo internally — no direct import
 // needed in this file (yet); attendants/peer_tile own the call-site values.
@@ -698,26 +700,55 @@ pub fn generate_for_peer(
         // so the legacy `signal-popup-open` overflow-visible toggle is dead and
         // its class is no longer emitted.
         let ss_split_class = "split-screen-tile";
+        // Issue 1175: ids for the zoom/pan/detach machinery. The grid SLOT
+        // stays in the grid permanently (so reattach always has a home); the
+        // PIP-HOST is the movable subtree (viewport + canvas + controls + name)
+        // that detaches into a Document PiP window and back.
+        let ss_slot_id = format!("screen-share-{}-slot", &key);
+        let ss_pip_host_id = format!("screen-share-{}-pip-host", &key);
+        let ss_viewport_id = format!("screen-share-{}-viewport", &key);
         return rsx! {
             div {
                 id: "{ss_div_id}",
                 class: "{ss_split_class}",
                 "data-tile-root": "true",
-                div {
-                    class: "canvas-container video-on",
-                    ScreenCanvas { peer_id: key.clone() }
-                    h4 {
-                        id: "{ss_name_id}",
-                        class: "floating-name",
-                        title: "{ss_name_title}",
-                        dir: "auto",
-                        "{ss_name}"
-                        if is_guest {
-                            span { class: "guest-badge", "Guest" }
-                        }
-                    }
+                // Permanent grid home for the shared content. Stays mounted even
+                // while detached (the PIP host is moved OUT of it imperatively),
+                // so `reattach_from_pip` can always move the subtree back here.
+                div { id: "{ss_slot_id}", class: "ss-pip-slot",
+                    // Movable subtree: zoom viewport + canvas + controls + name.
+                    // Moved as ONE node into the PiP window so the SAME canvas
+                    // element keeps painting (see screen_share_zoom docs).
                     div {
-                        class: "tile-top-icons",
+                        id: "{ss_pip_host_id}",
+                        class: "ss-pip-host",
+                        "data-zoom": "1",
+                        // Pannable viewport: scrolls only when zoomed past fit
+                        // (class toggled imperatively in screen_share_zoom_dom).
+                        // Keeps `.canvas-container video-on` so the existing
+                        // screen-share canvas sizing / gradient rules still apply.
+                        div {
+                            id: "{ss_viewport_id}",
+                            class: "ss-zoom-viewport canvas-container video-on",
+                            ScreenCanvas { peer_id: key.clone() }
+                        }
+                        h4 {
+                            id: "{ss_name_id}",
+                            class: "floating-name",
+                            title: "{ss_name_title}",
+                            dir: "auto",
+                            "{ss_name}"
+                            if is_guest {
+                                span { class: "guest-badge", "Guest" }
+                            }
+                        }
+                        // Content controls: zoom in/out, reset, detach/reattach.
+                        // These travel WITH the content into the PiP window so
+                        // the user can still zoom/reattach from the popped-out
+                        // window.
+                        ScreenShareZoomControls { peer_id: key.clone() }
+                        div {
+                            class: "tile-top-icons",
                         // HCL bug #2: signal-meter icon button on the
                         // shared-content tile. Visually identical to peer
                         // tiles (same `.signal-indicator` class + bars
@@ -752,8 +783,9 @@ pub fn generate_for_peer(
                                 }
                             }
                         }
-                    }
-                }
+                        } // .tile-top-icons
+                    } // .ss-pip-host
+                } // .ss-pip-slot
                 if show_signal_popup {
                     {
                         let h = signal_history.clone();
@@ -1455,6 +1487,151 @@ pub fn generate_for_peer(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Issue 1175: zoom / pan / detach controls for a RECEIVED shared-content tile.
+///
+/// All click handlers and the pan wiring are imperative (`screen_share_zoom_dom`)
+/// rather than Dioxus-reactive: zoom level + detach state must NOT trigger a
+/// Dioxus re-render of the screen-share subtree, because a re-render could
+/// recreate the `<canvas>` node and break the decoder's cached reference (which
+/// is what keeps the content live-updating while detached). See the module docs.
+///
+/// The detach control is only rendered when the Document Picture-in-Picture API
+/// is available (Chromium). On Firefox / Safari it is omitted, so the feature
+/// degrades to zoom + pan only with no broken/crashing button.
+#[component]
+fn ScreenShareZoomControls(peer_id: String) -> Element {
+    // Feature-detect Document PiP once at mount. wasm-only call; on the host
+    // (unit-test build) this whole component is never instantiated, but the
+    // cfg-guard keeps it compiling.
+    #[cfg(target_arch = "wasm32")]
+    let pip_supported = crate::components::screen_share_zoom_dom::document_pip_supported();
+    #[cfg(not(target_arch = "wasm32"))]
+    let pip_supported = false;
+
+    // Initial label always renders 100% (fit) — zoom state is imperative, so
+    // the label is updated by the DOM helpers on every zoom change.
+    let initial_label = zoom_percent_label(1.0);
+
+    // Keep drag-to-pan listeners alive for this tile's lifetime. Dropping the
+    // returned handlers on unmount detaches the listeners.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let peer_for_pan = peer_id.clone();
+        let pan_slot: std::rc::Rc<std::cell::RefCell<Option<_>>> =
+            use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None)));
+        use_effect(move || {
+            // (Re)install pan once the viewport is in the DOM. Replacing the
+            // slot drops the previous handlers (idempotent across re-mounts).
+            *pan_slot.borrow_mut() =
+                crate::components::screen_share_zoom_dom::install_pan(&peer_for_pan);
+        });
+
+        // Lifecycle cleanup: if this shared-content tile unmounts while
+        // detached — presenter stops sharing, the receiver leaves/reconnects,
+        // or the meeting ends — close the lingering PiP window so it can't sit
+        // there showing frozen content. Closing fires the window's `pagehide`
+        // handler, which is a no-op reattach into the (now-gone) grid slot,
+        // then the window tears down. Guarded on `is_pip_open` so a normal
+        // (never-detached) unmount does nothing.
+        let peer_for_drop = peer_id.clone();
+        use_drop(move || {
+            use crate::components::screen_share_zoom_dom as ssz;
+            // Only close the PiP if it hosts THIS peer's content (one PiP per
+            // page; a different peer's detached window must not be closed by
+            // this tile's unmount).
+            if ssz::is_pip_open_for(&peer_for_drop) {
+                ssz::close_pip_if_open();
+            }
+        });
+    }
+
+    let zoom_label_id = format!("screen-share-{peer_id}-zoom-label");
+
+    let peer_in = peer_id.clone();
+    let peer_out = peer_id.clone();
+    let peer_reset = peer_id.clone();
+    let peer_detach = peer_id.clone();
+
+    rsx! {
+        div { class: "ss-zoom-controls",
+            button {
+                r#type: "button",
+                class: "ss-zoom-btn",
+                title: "Zoom out",
+                "aria-label": "Zoom out shared content",
+                "data-testid": "ss-zoom-out",
+                onclick: move |_| {
+                    #[cfg(target_arch = "wasm32")]
+                    crate::components::screen_share_zoom_dom::handle_zoom_out(&peer_out);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = &peer_out;
+                },
+                ZoomOutIcon {}
+            }
+            span {
+                id: "{zoom_label_id}",
+                class: "ss-zoom-label",
+                "data-testid": "ss-zoom-label",
+                "{initial_label}"
+            }
+            button {
+                r#type: "button",
+                class: "ss-zoom-btn",
+                title: "Zoom in",
+                "aria-label": "Zoom in shared content",
+                "data-testid": "ss-zoom-in",
+                onclick: move |_| {
+                    #[cfg(target_arch = "wasm32")]
+                    crate::components::screen_share_zoom_dom::handle_zoom_in(&peer_in);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = &peer_in;
+                },
+                ZoomInIcon {}
+            }
+            button {
+                r#type: "button",
+                class: "ss-zoom-btn",
+                title: "Reset to actual size (100%)",
+                "aria-label": "Reset shared content zoom to 100%",
+                "data-testid": "ss-zoom-reset",
+                onclick: move |_| {
+                    #[cfg(target_arch = "wasm32")]
+                    crate::components::screen_share_zoom_dom::handle_reset(&peer_reset);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = &peer_reset;
+                },
+                ZoomResetIcon {}
+            }
+            if pip_supported {
+                button {
+                    r#type: "button",
+                    class: "ss-zoom-btn ss-detach-btn",
+                    title: "Open shared content in a separate window",
+                    "aria-label": "Open shared content in a separate window",
+                    "data-testid": "ss-detach",
+                    onclick: move |_| {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            use crate::components::screen_share_zoom_dom as ssz;
+                            // Toggle: if THIS peer's content is already in a PiP
+                            // window, closing it reattaches (the pagehide handler
+                            // runs); otherwise detach into a fresh PiP window.
+                            if ssz::is_pip_open_for(&peer_detach) {
+                                ssz::close_pip_if_open();
+                            } else {
+                                ssz::detach_to_pip(&peer_detach, || {});
+                            }
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let _ = &peer_detach;
+                    },
+                    DetachIcon {}
                 }
             }
         }
