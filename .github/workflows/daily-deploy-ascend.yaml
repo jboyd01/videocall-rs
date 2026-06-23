@@ -548,3 +548,7 @@ jobs:
           else
             echo "::error::Ascend deployment failed - tag: ${TAG}"
           fi
+
+      - name: Cleanup kubeconfig
+        if: always()
+        run: rm -f ~/.kube/ascend.yaml

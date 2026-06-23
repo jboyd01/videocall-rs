@@ -51,17 +51,17 @@ The kubeconfig should point to the cluster API endpoint at `https://10.244.8.238
 
 ### `HARBOR_USERNAME`
 
-**Used by:** Both deployment workflows  
+**Used by:** All three deployment workflows  
 **Description:** Username for Harbor container registry authentication at `hclcr.io`
 
 ### `HARBOR_PASSWORD`
 
-**Used by:** Both deployment workflows  
+**Used by:** All three deployment workflows  
 **Description:** Password for Harbor container registry authentication at `hclcr.io`
 
 ### `GCHAT_WEBHOOK_URL`
 
-**Used by:** Both deployment workflows (optional)  
+**Used by:** HCL and labsworkspace workflows (optional)  
 **Description:** Google Chat webhook URL for deployment notifications
 
 If not set, deployment notifications will be skipped (non-fatal).
@@ -79,7 +79,7 @@ Secrets can be set in the GitHub repository settings:
 
 - All kubeconfigs contain cluster authentication credentials and should be treated as highly sensitive
 - Kubeconfigs are decoded at workflow runtime and stored temporarily in `~/.kube/` with `600` permissions
-- The kubeconfig files are automatically cleaned up when the workflow job completes (ephemeral runner environment)
+- The kubeconfig files are cleaned up when the workflow job completes via an `if: always()` cleanup step in each workflow
 - Harbor credentials are used for both authentication to the API and docker login
 
 ## Validation
@@ -88,5 +88,6 @@ After setting the secrets, you can validate them by running the deployment workf
 
 - **HCL Daily:** Manually trigger `daily-deploy-hcl.yaml` with a known image tag
 - **labsworkspace:** Manually trigger `daily-deploy-labsworkspace.yaml` with a known image tag
+- **Ascend:** Manually trigger `daily-deploy-ascend.yaml` with a known image tag
 
-Both workflows will validate kubeconfig access in the "Validate kubectl and kubeconfig access" step before attempting deployment.
+All three workflows will validate kubeconfig access in the "Validate kubectl and kubeconfig access" step before attempting deployment.
