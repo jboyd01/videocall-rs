@@ -10052,6 +10052,29 @@ details.perf-peers[open] .perf-peers__chev {
   display: block;
 }
 
+/* issue 1656: per-peer VIDEO worker readout (painted fps + capture-lag chip).
+   The lag chip reuses the `.peer-stat` quality classes; tints the value only
+   while the `title` attribute carries the text reason, so meaning never depends
+   on color alone (WCAG 1.4.1). The aria-live alarm element announces the poor
+   state to assistive tech and is visually muted (it is a redundant announcement
+   of the already-visible chip). */
+.simulcast-recv-peer-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: var(--fs-2);
+  color: var(--text-tertiary);
+}
+
+.simulcast-recv-peer-stats .peer-stat.is-good { color: var(--diag-q-good); }
+.simulcast-recv-peer-stats .peer-stat.is-warn { color: var(--diag-q-warn); }
+.simulcast-recv-peer-stats .peer-stat.is-poor { color: var(--diag-q-poor); }
+
+.simulcast-recv-peer-lag-alarm {
+  color: var(--diag-q-poor);
+  font-weight: 600;
+}
+
 .simulcast-rung-res,
 .simulcast-rung-kbps {
   color: var(--text-tertiary);
