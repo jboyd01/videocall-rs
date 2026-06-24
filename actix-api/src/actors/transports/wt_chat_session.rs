@@ -92,7 +92,7 @@ enum WtSendResult {
     /// dropped — a TAIL drop. A drop-oldest is not implementable on tokio mpsc
     /// from the sender side (see the `Full` arm in `send_auto`, #1638 PART 2);
     /// the congestion signal is instead delivered by the priority pre-drop and
-    /// the bridge writer deadline.
+    /// the bridge writer's backpressure-gated shed.
     /// The transport-agnostic drop counters and the legacy media-kind
     /// labels (`audio`/`video`/`screen`/`media`/`control`/`unknown`,
     /// or `overflow_critical` for Critical packets) are bumped at the
@@ -471,14 +471,21 @@ impl WtChatSession {
                 //       `try_send` ran (priority_drop.rs), so by the time we
                 //       reach `Full` the policy has already had its say and the
                 //       packets still arriving are the protected/critical ones;
-                //  (ii) the #1638 PART 1 writer deadline
+                //  (ii) the #1638 backpressure-gated writer shed
                 //       (`bridge.rs::spawn_unistream_writer`) prevents the queue
-                //       from STAYING full: a stalled receiver's wedged stream is
-                //       reset within `WT_UNISTREAM_WRITE_DEADLINE`, so the writer
-                //       resumes draining instead of pinning the channel full
-                //       indefinitely (the #1631 M1 cascade). The deep-stale-frame
-                //       hazard #979 warns about is bounded by the shallow 512 cap
-                //       plus that writer deadline, not by evicting the oldest.
+                //       from STAYING full: the shed arms precisely when the
+                //       channel is backed up (it gates on channel depth crossing
+                //       `WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`), and a `Full`
+                //       channel — the state at THIS arm — is unambiguously past
+                //       that gate, so a stalled receiver's wedged stream is reset
+                //       within `WT_UNISTREAM_WRITE_DEADLINE` of continuous
+                //       backpressure and the writer resumes draining instead of
+                //       pinning the channel full indefinitely (the #1631 M1
+                //       cascade). The shed deliberately does NOT fire on a healthy
+                //       (non-backed-up) stream merely slow to be polled, so it
+                //       cannot spuriously reset a low-traffic receiver. The
+                //       deep-stale-frame hazard #979 warns about is bounded by the
+                //       shallow 512 cap plus that shed, not by evicting the oldest.
                 //
                 // Phase 8b TELEM-8: this drop site previously lacked any
                 // counter increment, so a flood of media drops only surfaced

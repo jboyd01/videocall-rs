@@ -69,7 +69,10 @@
 //! the full root-cause analysis.
 
 use crate::actors::transports::wt_chat_session::{WtInbound, WtInboundSource};
-use crate::constants::{MAX_FRAME_SIZE, WT_UNISTREAM_WRITE_DEADLINE};
+use crate::constants::{
+    MAX_FRAME_SIZE, WT_UNISTREAM_BACKPRESSURE_POLL, WT_UNISTREAM_BACKPRESSURE_SHED_RATIO,
+    WT_UNISTREAM_WRITE_DEADLINE,
+};
 use crate::metrics::{RELAY_INBOUND_BRIDGE_DROPS_TOTAL, RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL};
 use actix::Addr;
 use bytes::Bytes;
@@ -250,23 +253,44 @@ impl WebTransportBridge {
     /// parked. This is the central architectural fix for the 5-minute
     /// WT freeze described in discussion #756.
     ///
-    /// **Bounded writer** (#1638 — "#979 part 2"): the per-frame write is
-    /// bounded by [`WT_UNISTREAM_WRITE_DEADLINE`]. Two failure modes are
-    /// handled distinctly, but BOTH end the same way — RESET the wedged/broken
-    /// stream, RE-OPEN a fresh persistent stream, DROP the current frame, and
-    /// continue draining the NEXT frame from the channel onto the fresh stream:
+    /// **Backpressure-gated shed** (#1638 — "#979 part 2"): a parked write is
+    /// shed (RESET the wedged stream, RE-OPEN a fresh persistent stream, DROP the
+    /// current frame, continue draining the NEXT frame onto the fresh stream)
+    /// ONLY when the outbound channel is genuinely backing up — never merely
+    /// because a single write took a long wall-clock time. Two paths end in a
+    /// reset:
     ///
-    /// * **Timeout (stream alive but flow-control-wedged).** A slow receiver
-    ///   stops granting QUIC credits, so `write_all` parks. Without a bound the
-    ///   writer (the channel's only consumer) stays parked, the 512-deep
-    ///   `unistream_tx` fills, and `try_send` returns `Full` for EVERY publisher
-    ///   targeting that one receiver — the #1631 M1 cascade. Resetting the
-    ///   wedged stream sheds the head-of-line frame and lets the writer resume
-    ///   draining within one deadline, so a stalled receiver can no longer hold
-    ///   the channel full indefinitely. Counted as `reason="write_timeout"`.
+    /// * **Stalled-while-backed-up (stream alive but flow-control-wedged).** A
+    ///   slow receiver stops granting QUIC credits, so `write_all` parks. While
+    ///   it is parked the writer polls the channel depth every
+    ///   [`WT_UNISTREAM_BACKPRESSURE_POLL`]; a tick spent at or above
+    ///   [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] full advances a
+    ///   stalled-while-backed-up accumulator, and the stream is reset once that
+    ///   accumulator reaches [`WT_UNISTREAM_WRITE_DEADLINE`]. A tick spent BELOW
+    ///   the ratio (healthy / draining) RESETS the accumulator. So the shed fires
+    ///   iff the 512-deep `unistream_tx` is actually filling because this writer
+    ///   (its only consumer) is parked and `try_send` is starting to return
+    ///   `Full` for publishers targeting that receiver — the #1631 M1 cascade.
+    ///   Counted as `reason="write_timeout"`.
     /// * **Write error (stream already torn down).** The stream returned an I/O
     ///   error — it is genuinely broken (not merely slow). The pre-existing
-    ///   single-retry recovery. Counted as `reason="write_error"`.
+    ///   single-retry recovery, independent of backpressure. Counted as
+    ///   `reason="write_error"`.
+    ///
+    /// **Why the gate, and why it cannot spuriously reset a healthy stream:** the
+    /// relay's WT actor runs on a SINGLE-THREADED runtime. Under CPU/scheduling
+    /// starvation the one thread may not POLL a write future for a long
+    /// wall-clock interval even when QUIC credits are available — the executor
+    /// was busy, NOT the receiver's downlink. The v1 cut used a bare per-frame
+    /// `tokio::time::timeout` on wall-clock and therefore reset HEALTHY streams
+    /// under that starvation (it failed `test_lobby_isolation`). A healthy
+    /// low-traffic stream's channel never reaches
+    /// [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] (the writer drains every frame
+    /// promptly, so depth hovers near 0), so its accumulator never advances and
+    /// it is NEVER reset — a slow poll just delays it. The accumulator advances
+    /// only when the channel is sustainedly backed up, which only happens when
+    /// the receiver isn't draining. That is exactly the invariant: reset iff the
+    /// channel is actually wedging, never merely because the executor was slow.
     ///
     /// Why the CURRENT frame is dropped on BOTH paths rather than re-sent on the
     /// fresh stream: re-sending the wedged frame first would immediately
@@ -310,49 +334,21 @@ impl WebTransportBridge {
                     .expect("packet exceeds u32::MAX bytes; video frames should be well under 4GB");
                 let len_header = len.to_be_bytes();
 
-                // Write the WHOLE framed message (header + payload) under a SINGLE
-                // deadline so a stall on either half triggers the same shed. The
-                // header and payload are written back-to-back inside one
-                // `tokio::time::timeout` future; the deadline covers their sum, not
-                // each half separately.
+                // Write the WHOLE framed message (header + payload) as one future
+                // so a stall on either half is treated identically. The future
+                // parks NORMALLY on QUIC flow control — it is NOT wrapped in a
+                // wall-clock timeout. Instead we run it under a backpressure-gated
+                // shed: a periodic tick samples the outbound channel depth, and the
+                // write is only shed once the channel has been sustainedly backed
+                // up (see `write_framed_with_backpressure_shed`). A slow poll under
+                // executor starvation on a NON-backed-up channel therefore only
+                // delays the write; it never sheds it. `unistream_rx` is read
+                // immutably for the depth probe — disjoint from the `&mut stream`
+                // borrowed by the write future.
                 let stream = persistent_stream.as_mut().expect("stream was just opened");
-                let framed_write = async {
-                    stream.write_all(&len_header).await?;
-                    stream.write_all(&data).await
-                };
-                let write_outcome =
-                    tokio::time::timeout(WT_UNISTREAM_WRITE_DEADLINE, framed_write).await;
-
-                // `reason` distinguishes the two shed paths for the operator-facing
-                // metric + log. `None` => the write completed within the deadline.
-                let shed_reason: Option<&'static str> = match write_outcome {
-                    // Completed within the deadline with no I/O error: fast path.
-                    Ok(Ok(())) => None,
-                    // Completed within the deadline but the stream returned an
-                    // error: the stream is genuinely broken (already torn down),
-                    // NOT merely flow-control-wedged. Pre-existing recovery path.
-                    Ok(Err(e)) => {
-                        warn!(
-                            "Error writing to persistent UniStream ({}); resetting and \
-                             reopening (frame dropped)",
-                            e
-                        );
-                        Some("write_error")
-                    }
-                    // Deadline elapsed: the stream is alive but its QUIC
-                    // flow-control credits are exhausted (the receiver's downlink
-                    // stalled). Shed by resetting so the writer stops being parked
-                    // and the channel can drain. This is the #1638 fix.
-                    Err(_elapsed) => {
-                        warn!(
-                            "Persistent UniStream write stalled past {}ms deadline \
-                             (receiver downlink wedged); resetting and reopening \
-                             (frame dropped)",
-                            WT_UNISTREAM_WRITE_DEADLINE.as_millis()
-                        );
-                        Some("write_timeout")
-                    }
-                };
+                let shed_reason =
+                    write_framed_with_backpressure_shed(stream, &len_header, &data, &unistream_rx)
+                        .await;
 
                 if let Some(reason) = shed_reason {
                     RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL
@@ -424,6 +420,137 @@ impl WebTransportBridge {
             }
             info!("WebTransport Datagram writer ended");
         });
+    }
+}
+
+/// Pure backpressure predicate for the #1638 writer shed.
+///
+/// Returns `true` iff the outbound `unistream_tx` channel is at or above
+/// [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] full — i.e. REAL backpressure is
+/// present: the writer (the channel's only consumer) is parked and publishers
+/// have filled at least that fraction of the buffer. `depth` is the number of
+/// frames currently queued (`max_capacity - capacity`), `max_capacity` the
+/// channel's fixed bound.
+///
+/// This is the gate that prevents the v1 spurious-reset regression: the shed
+/// accumulator advances ONLY on ticks where this returns `true`. A healthy
+/// low-traffic stream drains every frame promptly, so its depth hovers near 0
+/// and this returns `false` — its shed never arms no matter how starved the
+/// executor is. Extracted as a free function so the threshold arithmetic
+/// (`ceil`-equivalent: `depth as f64 >= max_capacity as f64 * ratio`) is
+/// unit-testable without standing up a real QUIC session.
+fn channel_is_backed_up(depth: usize, max_capacity: usize) -> bool {
+    if max_capacity == 0 {
+        // Degenerate (cannot happen — the channel is always built with a
+        // non-zero cap, see `resolve_wt_outbound_channel_capacity`'s zero
+        // rejection), but treat "no capacity" as never-backed-up so we never
+        // shed on a nonsense bound.
+        return false;
+    }
+    (depth as f64) >= (max_capacity as f64) * WT_UNISTREAM_BACKPRESSURE_SHED_RATIO
+}
+
+/// Write one length-prefixed frame onto the persistent uni stream, shedding ONLY
+/// under sustained real backpressure (#1638).
+///
+/// Returns the shed reason for the operator-facing metric/log:
+/// * `None` — the write completed; no shed.
+/// * `Some("write_error")` — the stream returned an I/O error (genuinely broken,
+///   not merely slow); reset+reopen regardless of backpressure.
+/// * `Some("write_timeout")` — the write stayed parked while the channel was
+///   sustainedly backed up for [`WT_UNISTREAM_WRITE_DEADLINE`]; shed the wedged
+///   stream so the writer resumes draining.
+///
+/// ## Why this cannot spuriously reset a healthy stream under executor starvation
+///
+/// The write future parks normally on QUIC flow control. We do NOT bound it by
+/// wall-clock. We instead `select!` it against a periodic
+/// [`WT_UNISTREAM_BACKPRESSURE_POLL`] tick and accumulate elapsed time toward the
+/// shed grace ONLY across ticks where [`channel_is_backed_up`] holds. The
+/// accumulator is reset on any tick where the channel is below the ratio. So:
+///
+/// * On a HEALTHY (non-backed-up) stream the channel depth stays near 0, every
+///   tick resets the accumulator, and the write is left to park — executor
+///   starvation that delays the poll only delays the write, it can never make
+///   the accumulator reach the grace. No reset.
+/// * On a genuinely WEDGED receiver the writer is parked AND publishers keep
+///   filling the channel past the ratio, so successive ticks advance the
+///   accumulator until it reaches the grace and the stream is shed — bounding
+///   how long one wedged receiver can hold the channel full.
+///
+/// `unistream_rx` is borrowed immutably here purely to read `capacity()` /
+/// `max_capacity()`; the write future borrows the `stream` mutably. The two
+/// borrows are disjoint.
+async fn write_framed_with_backpressure_shed(
+    stream: &mut web_transport_quinn::SendStream,
+    len_header: &[u8; 4],
+    data: &Bytes,
+    unistream_rx: &mpsc::Receiver<Bytes>,
+) -> Option<&'static str> {
+    let max_capacity = unistream_rx.max_capacity();
+
+    // The framed write parks normally on flow control. `tokio::pin!` lets us poll
+    // it repeatedly across `select!` iterations without it being moved/dropped
+    // between ticks (so partial progress is preserved while we wait).
+    let framed_write = async {
+        stream.write_all(len_header).await?;
+        stream.write_all(data).await
+    };
+    tokio::pin!(framed_write);
+
+    let mut ticker = tokio::time::interval(WT_UNISTREAM_BACKPRESSURE_POLL);
+    // The first tick of `interval` fires immediately; skip it so a write that
+    // completes promptly never samples backpressure at all (pure fast path), and
+    // so the accumulator only advances after a real poll interval has elapsed.
+    ticker.tick().await;
+
+    // Total time the write has stayed parked WHILE the channel was backed up.
+    // Advances only on backed-up ticks; reset to zero on any healthy tick.
+    let mut stalled_while_backed_up = std::time::Duration::ZERO;
+
+    loop {
+        tokio::select! {
+            // Bias the write arm so a ready write always wins over a coincident
+            // tick — we never shed a write that has actually completed.
+            biased;
+
+            write_result = &mut framed_write => {
+                return match write_result {
+                    Ok(()) => None,
+                    Err(e) => {
+                        warn!(
+                            "Error writing to persistent UniStream ({}); resetting and \
+                             reopening (frame dropped)",
+                            e
+                        );
+                        Some("write_error")
+                    }
+                };
+            }
+
+            _ = ticker.tick() => {
+                let depth = max_capacity.saturating_sub(unistream_rx.capacity());
+                if channel_is_backed_up(depth, max_capacity) {
+                    stalled_while_backed_up += WT_UNISTREAM_BACKPRESSURE_POLL;
+                    if stalled_while_backed_up >= WT_UNISTREAM_WRITE_DEADLINE {
+                        warn!(
+                            "Persistent UniStream write parked while the outbound \
+                             channel stayed backed up ({}/{} queued) past {}ms; \
+                             resetting and reopening (frame dropped)",
+                            depth,
+                            max_capacity,
+                            WT_UNISTREAM_WRITE_DEADLINE.as_millis()
+                        );
+                        return Some("write_timeout");
+                    }
+                } else {
+                    // Channel is draining / healthy: the write being slow here is
+                    // NOT congestion (e.g. the executor was just slow to poll us).
+                    // Reset the accumulator so only SUSTAINED backpressure sheds.
+                    stalled_while_backed_up = std::time::Duration::ZERO;
+                }
+            }
+        }
     }
 }
 
@@ -976,22 +1103,35 @@ mod writer_shed_tests {
         tx.try_send(Bytes::from(vec![0xCD; n]))
     }
 
-    /// REGRESSION TEST (#1638): a stalled-downlink receiver must NOT wedge the
-    /// outbound unistream channel full indefinitely — the writer sheds within
-    /// the deadline and resumes draining.
+    /// REGRESSION TEST (#1638): a stalled-downlink receiver whose outbound
+    /// channel is ACTUALLY BACKED UP must NOT wedge that channel full
+    /// indefinitely — the backpressure-gated writer sheds within the grace and
+    /// resumes draining.
     ///
     /// Setup: a real server→client uni stream where the client accepts the
     /// stream but never reads it, so QUIC flow-control credits drain to zero and
-    /// the server's `write_all` parks. We push enough frames to fill the writer's
-    /// channel, then assert the channel does NOT stay full past the deadline (the
-    /// writer reset+reopened the wedged stream and drained more frames).
+    /// the server's `write_all` parks. We push enough frames to FILL the writer's
+    /// channel (depth 16/16, far above the [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`]
+    /// = 0.5 gate of depth ≥ 8), so the genuine-backpressure condition the shed
+    /// keys on is unambiguously present. We then assert the channel does NOT stay
+    /// full past the grace (the writer reset+reopened the wedged stream and
+    /// drained more frames).
     ///
-    /// PROOF THE TEST BITES: on the UN-bounded writer (revert the
-    /// `tokio::time::timeout` + reset/reopen), `write_all` parks forever, the
-    /// writer never drains again, and the channel stays full until the outer
-    /// `tokio::time::timeout` fires → the test FAILS (panics on timeout). With
-    /// the fix, the writer sheds within `WT_UNISTREAM_WRITE_DEADLINE` and the
-    /// channel regains capacity → the test PASSES.
+    /// This still exercises the REAL production shed: because the channel is
+    /// genuinely backed up here, `write_framed_with_backpressure_shed`'s
+    /// stalled-while-backed-up accumulator advances on every poll tick and reaches
+    /// [`WT_UNISTREAM_WRITE_DEADLINE`] → `write_timeout` shed. (The sibling
+    /// `healthy_low_traffic_write_is_not_shed_under_executor_starvation` proves the
+    /// COMPLEMENT — a NON-backed-up channel never sheds even when the poll is
+    /// starved — which is the spurious-reset regression this redesign fixes.)
+    ///
+    /// PROOF THE TEST BITES: on a writer that NEVER sheds (replace the
+    /// `write_framed_with_backpressure_shed` call with a bare
+    /// `framed_write.await`), `write_all` parks forever, the writer never drains
+    /// again, and the channel stays full until the outer `tokio::time::timeout`
+    /// fires → the test FAILS (panics on timeout). With the fix, the writer sheds
+    /// once the channel has been backed up for `WT_UNISTREAM_WRITE_DEADLINE` and
+    /// the channel regains capacity → the test PASSES.
     #[actix_rt::test]
     async fn stalled_receiver_does_not_wedge_channel_forever() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1103,5 +1243,159 @@ mod writer_shed_tests {
              test window — the channel stayed wedged (un-bounded writer parks \
              forever on QUIC flow control)",
         );
+    }
+
+    /// REGRESSION TEST (#1638 follow-up): a HEALTHY, non-backed-up stream must
+    /// NOT be shed even when its write parks for far longer than
+    /// [`WT_UNISTREAM_WRITE_DEADLINE`] — the exact spurious-reset the v1
+    /// wall-clock `tokio::time::timeout(write_all)` caused (it failed
+    /// `test_lobby_isolation`). The genuine congestion signal is the outbound
+    /// channel BACKING UP, not wall-clock on one write.
+    ///
+    /// Setup: a real server→client uni stream where the client accepts but never
+    /// reads, so `write_all` parks on QUIC flow control — BUT the outbound channel
+    /// passed to the production `write_framed_with_backpressure_shed` is EMPTY
+    /// (depth 0, far below the 0.5 shed ratio). A parked write here stands in for
+    /// "the executor was slow to drive a healthy write": the receiver isn't the
+    /// bottleneck (no other frames are queued behind it). The shed must therefore
+    /// NEVER fire.
+    ///
+    /// We drive the REAL production helper directly and assert it does NOT return
+    /// a shed within a window that is MANY times the deadline. Because a
+    /// non-backed-up parked write parks FOREVER (correct behaviour), the only way
+    /// to make this terminate is an outer timeout — and the outer timeout firing
+    /// (the helper still parked) is exactly the PASS condition.
+    ///
+    /// PROOF THE TEST BITES: on the v1 wall-clock writer, the equivalent
+    /// `tokio::time::timeout(WT_UNISTREAM_WRITE_DEADLINE, framed_write)` elapses
+    /// after 1s regardless of channel depth and returns a shed, so the helper
+    /// WOULD return `Some("write_timeout")` well within this window → the
+    /// `select!` below would take the `shed` branch and the test would FAIL
+    /// ("spuriously shed a healthy non-backed-up stream"). With the fix the helper
+    /// stays parked on the empty channel, the outer sleep wins, and the test
+    /// PASSES.
+    #[actix_rt::test]
+    async fn healthy_low_traffic_write_is_not_shed_under_executor_starvation() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (addr, mut server) = build_test_server();
+
+        let server_session_fut = tokio::spawn(async move {
+            let request = server.accept().await.expect("accept request");
+            request.ok().await.expect("respond ok")
+        });
+
+        // Client connects but never accepts/reads the server's uni stream, so
+        // once the server writes a flow-control window's worth the write parks.
+        let client_session = connect_test_client(addr).await;
+        let server_session = server_session_fut.await.expect("join server session");
+
+        // Open the persistent uni stream the same way the production writer does.
+        let mut stream = server_session
+            .open_uni()
+            .await
+            .expect("open server->client uni stream");
+
+        // CRITICAL: the channel is EMPTY — depth 0, well below the 0.5 shed ratio.
+        // This is the "healthy / non-backed-up" condition. We never push to it, so
+        // `channel_is_backed_up` is false on every poll tick and the shed
+        // accumulator can never advance.
+        const CAP: usize = 16;
+        let (_uni_tx, uni_rx) = mpsc::channel::<Bytes>(CAP);
+        assert_eq!(
+            uni_rx.max_capacity().saturating_sub(uni_rx.capacity()),
+            0,
+            "precondition: the channel under test must be empty (non-backed-up)"
+        );
+
+        // A payload large enough to exhaust the fresh stream's AND the
+        // connection's flow-control window so a SINGLE `write_all` genuinely
+        // parks mid-frame (the receiver never reads). quinn's default stream
+        // receive window is ~1 MiB and the connection window ~1.5 MiB; a 4 MiB
+        // frame (= MAX_FRAME_SIZE, a real 1080p keyframe ceiling) blows past both,
+        // so the write parks rather than completing into the buffer. We assert
+        // below that it actually parked (the helper must NOT return promptly).
+        let len: u32 = (4 * 1024 * 1024) as u32;
+        let header = len.to_be_bytes();
+        let data = Bytes::from(vec![0xEE; len as usize]);
+
+        // Wait MANY deadlines. If the helper sheds within this window on a
+        // non-backed-up channel, that is the spurious-reset bug.
+        let watchdog = WT_UNISTREAM_WRITE_DEADLINE * 4 + Duration::from_secs(2);
+
+        tokio::select! {
+            shed = write_framed_with_backpressure_shed(&mut stream, &header, &data, &uni_rx) => {
+                panic!(
+                    "REGRESSION (#1638): the writer SHED a healthy, non-backed-up \
+                     stream (channel depth 0) just because the write parked past \
+                     the wall-clock deadline (shed={shed:?}). The shed must key on \
+                     the outbound channel backing up, NOT on a per-write deadline. \
+                     This is the spurious reset that broke test_lobby_isolation."
+                );
+            }
+            _ = tokio::time::sleep(watchdog) => {
+                // Helper is still parked after 4× the deadline + 2s on an empty
+                // channel — correct: a non-backed-up write is never shed.
+            }
+        }
+
+        drop(client_session);
+    }
+}
+
+// =============================================================================
+// #1638 backpressure-predicate unit tests
+// =============================================================================
+//
+// Pure, fast tests for `channel_is_backed_up` — the gate that decides whether a
+// parked write's stall counts toward the shed. These drive the REAL production
+// predicate (no re-implementation) over its full decision boundary so the 0.5
+// ratio and the never-shed-when-empty invariant are pinned.
+#[cfg(test)]
+mod backpressure_predicate_tests {
+    use super::*;
+
+    #[test]
+    fn empty_channel_is_never_backed_up() {
+        // The healthy steady state: a draining writer keeps depth at 0. This is
+        // the case the v1 wall-clock shed got wrong — it MUST be "not backed up".
+        assert!(!channel_is_backed_up(0, 512));
+        assert!(!channel_is_backed_up(0, 16));
+    }
+
+    #[test]
+    fn below_half_is_not_backed_up() {
+        // Just under the 0.5 ratio at the production 512 cap: 255 < 256.
+        assert!(!channel_is_backed_up(255, 512));
+        // And at the small test cap: 7 < 8.
+        assert!(!channel_is_backed_up(7, 16));
+    }
+
+    #[test]
+    fn at_or_above_half_is_backed_up() {
+        // Exactly at the ratio boundary (depth == 50% of cap) counts as backed
+        // up — the gate is `>=`, so the boundary arms the shed.
+        assert!(channel_is_backed_up(256, 512));
+        assert!(channel_is_backed_up(8, 16));
+        // Above the ratio, and at full.
+        assert!(channel_is_backed_up(400, 512));
+        assert!(channel_is_backed_up(512, 512));
+        assert!(channel_is_backed_up(16, 16));
+    }
+
+    #[test]
+    fn zero_capacity_is_never_backed_up() {
+        // Degenerate guard: a 0-cap channel (which the production resolver never
+        // builds) must not divide-by-zero into a false shed.
+        assert!(!channel_is_backed_up(0, 0));
+        assert!(!channel_is_backed_up(5, 0));
+    }
+
+    #[test]
+    fn ratio_matches_the_documented_half_threshold() {
+        // Pin the production ratio used by the predicate. If someone retunes
+        // WT_UNISTREAM_BACKPRESSURE_SHED_RATIO they must revisit this boundary
+        // (and the shed-grace math in the doc comments).
+        assert_eq!(WT_UNISTREAM_BACKPRESSURE_SHED_RATIO, 0.5);
     }
 }
