@@ -79,15 +79,17 @@ message VideoMetadata {
   // string so new causes can be added without a wire-format break.
   string cause_hint = 7;
   // Sender-side capture wall-clock time (ms since UNIX epoch, Date.now()) of the
-  // frame, used by the receiver's jitter buffer to detect intrinsically-stale
-  // frames that arrive on-time but are minutes old at source (#1656). Distinct
+  // frame, used by the receiver to compute the `realtime_lag_ms` OBSERVABILITY
+  // metric surfaced in the diagnostics drawer (#1656). It does NOT affect
+  // playout — the receiver's freshness deadline is arrival-age only. Distinct
   // from `MediaPacket.timestamp` (WebCodecs media-time microseconds on a
   // per-track origin), which does NOT carry wall-clock. Optional: proto3
   // default-zero (0) means "unknown / not sent" — older publishers omit it and
-  // receivers MUST treat 0 as absent (no capture-age signal). Peer-controlled
-  // value (inside the E2EE packet): the relay cannot forge it, but the sending
-  // peer can lie; the receiver clamps/sanity-ranges it and bounds blast radius
-  // to that peer's own tile (see jitter_buffer capture-age logic).
+  // receivers MUST treat 0 as absent (no real-time-lag signal; the metric
+  // reports 0). Peer-controlled value (inside the E2EE packet): the relay
+  // cannot forge it, but the sending peer can lie; because the value is purely
+  // observational the worst a lie does is report a misleading realtime_lag_ms
+  // for that peer's OWN diagnostic tile — no cross-peer or playout impact.
   uint64 capture_unix_ms = 8;
 }
 

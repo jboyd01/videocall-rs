@@ -1658,7 +1658,8 @@ mod tests {
     }
 
     /// Like [`create_test_frame`] but stamps a sender-side capture wall-clock
-    /// (#1656) so a test can drive the skew-resilient capture-age freshness trip.
+    /// (#1656) so a test can exercise the `realtime_lag_ms` diagnostic (and the
+    /// arrival-only deadline's indifference to capture age).
     fn create_test_frame_with_capture(
         seq: u64,
         frame_type: FrameType,

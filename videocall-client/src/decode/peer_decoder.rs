@@ -767,8 +767,10 @@ impl PeerDecode for VideoPeerDecoder {
                 data: packet.data.clone(),
                 // #1656: carry the sender-side capture wall-clock from the
                 // protobuf VideoMetadata into the codecs VideoFrame so the
-                // jitter buffer's skew-resilient capture-age freshness trip can
-                // read it. 0 when the publisher did not stamp it (older clients).
+                // jitter buffer can compute the `realtime_lag_ms` diagnostic
+                // (observability only — it does not trip the freshness deadline
+                // or affect playout). 0 when the publisher did not stamp it
+                // (older clients).
                 capture_unix_ms: video_metadata.capture_unix_ms,
             };
 

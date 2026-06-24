@@ -103,10 +103,10 @@ pub fn transform_video_chunk(
             get_video_codec().into(),
             source_width,
             source_height,
-            // #1656: stamp the sender-side capture wall-clock so the receiver's
-            // jitter buffer can detect intrinsically-stale frames that arrive
-            // on-time but are minutes old at source. `Date::now()` is ms since
-            // UNIX epoch as f64; cast to u64.
+            // #1656: stamp the sender-side capture wall-clock so the receiver can
+            // compute the `realtime_lag_ms` diagnostic (observability only — it
+            // does not affect playout). `Date::now()` is ms since UNIX epoch as
+            // f64; cast to u64.
             js_sys::Date::now() as u64,
         ))
         .into(),
@@ -183,8 +183,8 @@ pub fn transform_screen_chunk(
             adaptive_tier,
             cause_hint,
             // #1656: stamp the sender-side capture wall-clock (ms since UNIX
-            // epoch) so the receiver's jitter buffer can detect intrinsically-
-            // stale screen frames that arrive on-time but are old at source.
+            // epoch) so the receiver can compute the `realtime_lag_ms` diagnostic
+            // (observability only — it does not affect playout).
             capture_unix_ms: js_sys::Date::now() as u64,
             ..Default::default()
         })

@@ -108,8 +108,9 @@ impl FrameBuffer {
 
     /// Sender-side capture wall-clock (ms since UNIX epoch) of the wrapped frame,
     /// or 0 when the publisher did not stamp it (#1656). Reads through to
-    /// `self.frame.capture_unix_ms`; the jitter buffer uses it for the
-    /// skew-resilient capture-age freshness trip.
+    /// `self.frame.capture_unix_ms`; the jitter buffer uses it to compute the
+    /// `realtime_lag_ms` diagnostic (observability only — it does not trip the
+    /// freshness deadline or affect playout).
     pub fn capture_unix_ms(&self) -> u64 {
         self.frame.capture_unix_ms
     }
