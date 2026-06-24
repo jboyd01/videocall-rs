@@ -2088,9 +2088,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   position: absolute;
   top: calc(100% + 0.5rem);
   right: 0;
-  background: rgba(30, 30, 30, 0.98)
-    /* @token-exempt: dark near-opaque, no matching token */
-  ;
+  background: var(--fixed-dark-opaque);
   backdrop-filter: blur(var(--effect-blur-lg));
   -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid var(--glass-border);
@@ -2121,7 +2119,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.75rem 1rem;
   background: transparent;
   border: none;
-  color: var(--text-primary);
+  color: var(--on-dark-text);
   font-size: var(--fs-5);
   text-align: left;
   cursor: pointer;
@@ -3337,9 +3335,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   left: 50%;
   transform: translateX(-50%);
   z-index: 9000;
-  background: rgba(30, 30, 30, 0.95)
-    /* @token-exempt: dark near-opaque, no matching token */
-  ;
+  background: var(--fixed-dark-strong);
   border-radius: var(--radius-lg);
   box-shadow: 0 4px 20px var(--shadow-error);
   min-width: 300px;
@@ -3356,7 +3352,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.875rem 1rem;
   background: transparent;
   border: none;
-  color: var(--text-primary);
+  color: var(--on-dark-text);
   font-size: var(--fs-6);
   cursor: pointer;
   transition: background-color 0.2s ease;
@@ -4540,16 +4536,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   right: calc(100% + 8px);
   top: 50%;
   transform: translateY(-50%);
-  background: rgba(30, 30, 30, 0.95)
-    /* @token-exempt: dark near-opaque, no matching token */
-  ;
+  background: var(--fixed-dark-strong);
   backdrop-filter: blur(var(--effect-blur-surface));
   border: 1px solid var(--settings-tooltip-border);
   border-radius: var(--radius-md);
   padding: 0.5rem 0.75rem;
   font-size: var(--fs-3);
   line-height: 1.4;
-  color: var(--text-secondary);
+  color: var(--on-dark-text-secondary);
   white-space: normal;
   width: max-content;
   max-width: 200px;
@@ -4785,15 +4779,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    ~10% bleed-through and was barely perceptible; bumping the fill to near-opaque
    removes the GPU cost with negligible visual change.
 
-   The banner surface is ALWAYS dark (a flat near-opaque dark fill in both
-   themes), so its foreground colours MUST be literal light-on-dark — NOT the
-   `--text-on-glass-strong` token, which flips to near-black under
-   html[data-theme="light"] and would render the text + ✕ invisible on the dark
-   surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
-   dismiss glyph, matching how the amber accent is already a literal. Contrast on
-   the near-opaque dark surface: white text ≈ 15–16:1, amber accent ≈ 7–8:1
-   (the more-opaque fill only RAISES contrast vs the prior ~0.9 surface, since
-   less page background bleeds through) — both well past 4.5:1, in BOTH themes. */
+   The banner surface is ALWAYS dark (--fixed-dark-heavy in both themes), so its
+   foreground colours use --on-dark-text-high — NOT theme-flipping tokens like
+   --text-on-glass-strong, which go near-black under html[data-theme="light"]
+   and would render text invisible on the dark surface. Contrast on the
+   near-opaque dark surface: white text ≈ 15–16:1, amber accent ≈ 7–8:1 — both
+   well past 4.5:1, in BOTH themes. */
 .decode-budget-banner {
   position: absolute;
   top: 12px;
@@ -4805,20 +4796,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 10px;
   max-width: min(560px, calc(100% - 24px));
   padding: 8px 10px 8px 14px;
-  background: rgba(30, 30, 30, 0.97)
-    /* @token-exempt: flat near-opaque dark banner surface. No backdrop-filter
-       blur (#1197): the banner only renders under decode-budget pressure, when
-       the GPU is already the bottleneck, so a compositing blur would add cost
-       exactly when it hurts most. The fill is near-opaque (was 0.9 + blur), so
-       dropping the blur is visually ~indistinguishable. */;
+  background: var(--fixed-dark-heavy);
   border: 1px solid var(--btn-warning-border);
   border-radius: var(--radius-lg);
   box-shadow: 0 8px 32px var(--shadow-card-deep);
-  /* @token-exempt: literal light-on-dark; the surface is hardcoded dark in both
-     themes, so the theme-flipping --text-on-glass-strong token must NOT be used
-     here (it would go near-black in light mode -> invisible). ≈14.5:1 on the
-     dark surface. */
-  color: rgba(255, 255, 255, 0.95);
+  color: var(--on-dark-text-high);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
@@ -4878,9 +4860,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .decode-budget-banner-dismiss {
   min-width: 44px;
   padding: 0;
-  /* @token-exempt: literal light-on-dark to stay visible on the hardcoded dark
-     banner surface in light mode (see the banner's color note above). */
-  color: rgba(255, 255, 255, 0.95);
+  color: var(--on-dark-text-high);
   background: transparent;
   border: 1px solid transparent;
 }
@@ -5145,22 +5125,13 @@ html[data-theme="light"] .decode-paused-pill-action {
   display: flex;
   align-items: center;
   gap: 10px;
-  background: rgba(30, 30, 30, 0.88)
-    /* @token-exempt: dark near-opaque, no matching token */
-  ;
+  background: var(--fixed-dark);
   backdrop-filter: blur(var(--effect-blur-lg));
   -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-lg);
   padding: 10px 16px;
-  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-     both themes (rgba(30,30,30,0.88) above), so the theme-flipping --text-primary
-     token must NOT be used here — it goes near-black under
-     html[data-theme="light"] and would render the toast text invisible on the
-     dark surface. This literal equals --text-primary's dark value (opaque white)
-     so dark mode is byte-identical; white on rgb(30,30,30) ≈ 16:1, well past
-     4.5:1. */
-  color: #ffffff;
+  color: var(--on-dark-text);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
@@ -5198,13 +5169,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 }
 
 .peer-toast.toast-left .toast-icon svg {
-  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-     both themes, so --toast-action-neutral must NOT be used — it flips near-black
-     (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this icon glyph
-     invisible on the dark chip. Literal equals the token's dark value so dark mode
-     is unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
-     ≈ 6-7:1, past 4.5:1. */
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--on-dark-text-muted);
 }
 
 .peer-toast .toast-text {
@@ -5214,13 +5179,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .peer-toast .toast-name {
   font-weight: 600;
-  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-     both themes, so --text-on-glass-strong must NOT be used — it flips near-black
-     (rgba(0,0,0,0.92)) under html[data-theme="light"], rendering the participant
-     name invisible on the dark surface (the reported issue 1189 bug). Literal
-     equals the token's dark value so dark mode is unchanged; white 0.95 on
-     rgb(30,30,30) ≈ 14.5:1, well past 4.5:1. */
-  color: rgba(255, 255, 255, 0.95);
+  color: var(--on-dark-text-high);
 }
 
 .peer-toast.toast-joined .toast-action {
@@ -5229,13 +5188,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 }
 
 .peer-toast.toast-left .toast-action {
-  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-     both themes, so --text-on-glass-faint must NOT be used — it flips near-black
-     (rgba(0,0,0,0.44)) under html[data-theme="light"], rendering this faint
-     secondary text invisible on the dark surface. Literal equals the token's dark
-     value so dark mode is unchanged; preserves the dimmer secondary weight. White
-     0.5 on rgb(30,30,30) ≈ 6-7:1, still past 4.5:1. */
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--on-dark-text-muted);
   font-weight: 400;
 }
 
@@ -5257,13 +5210,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 }
 
 .peer-toast.toast-loading .toast-icon svg {
-    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-       both themes, so --toast-action-neutral must NOT be used — it flips near-black
-       (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this loading
-       glyph invisible on the dark chip. Literal equals the token's dark value so
-       dark mode is unchanged; preserves the dim neutral weight. White 0.5 on
-       rgb(30,30,30) ≈ 6-7:1, past 4.5:1. */
-    color: rgba(255, 255, 255, 0.5);
+    color: var(--on-dark-text-muted);
     animation: screen-share-spin 1s linear infinite;
 }
 
@@ -5280,14 +5227,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 }
 
 .peer-toast.toast-error .toast-icon svg {
-    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-       both themes. --danger is UNDEFINED in this codebase, so this fell through to
-       --toast-action-neutral, which flips near-black (rgba(0,0,0,0.45)) under
-       html[data-theme="light"], rendering the error glyph invisible on the dark
-       chip. Literal equals the (fallen-through) token's dark value so dark mode is
-       unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
-       ≈ 6-7:1, past 4.5:1. */
-    color: rgba(255, 255, 255, 0.5);
+    color: var(--on-dark-text-muted);
 }
 
 @keyframes screen-share-spin {
@@ -7814,14 +7754,14 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   font-size: var(--fs-2);
 }
 .type-websocket {
-  background: #1c1c1e;
-  color: #0a84ff;
-  border: 1px solid #38383a;
+  background: var(--surface);
+  color: var(--accent-hover);
+  border: 1px solid var(--border);
 }
 .type-webtransport {
-  background: #1c1c1e;
-  color: #0a84ff;
-  border: 1px solid #38383a;
+  background: var(--surface);
+  color: var(--accent-hover);
+  border: 1px solid var(--border);
 }
 
 .signal-quality-popup .popup-close {
