@@ -2091,8 +2091,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: rgba(30, 30, 30, 0.98)
     /* @token-exempt: dark near-opaque, no matching token */
   ;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(var(--effect-blur-lg));
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   box-shadow:
@@ -3137,8 +3137,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-info-tooltip-portal {
   position: fixed;
   background: var(--tooltip-portal-bg);
-  -webkit-backdrop-filter: blur(20px) saturate(140%);
-  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg)) saturate(140%);
+  backdrop-filter: blur(var(--effect-blur-lg)) saturate(140%);
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-md);
   padding: 0.3125rem 0.5rem;
@@ -3551,8 +3551,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   -ms-user-select: none;
   -webkit-appearance: none;
   background: var(--glass-bg);
-  -webkit-backdrop-filter: blur(12px) saturate(150%);
-  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
+  backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button);
   box-sizing: border-box;
@@ -3669,8 +3669,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   -ms-user-select: none;
   -webkit-appearance: none;
   background: var(--glass-bg);
-  -webkit-backdrop-filter: blur(12px) saturate(150%);
-  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
+  backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button);
   box-sizing: border-box;
@@ -3747,8 +3747,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .generic-sign-in-button {
   -webkit-appearance: none;
   background: var(--oauth-blue-bg);
-  -webkit-backdrop-filter: blur(12px) saturate(150%);
-  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
+  backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
   border: 1px solid var(--oauth-blue-border);
   border-radius: var(--radius-button);
   box-sizing: border-box;
@@ -4543,7 +4543,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: rgba(30, 30, 30, 0.95)
     /* @token-exempt: dark near-opaque, no matching token */
   ;
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(var(--effect-blur-surface));
   border: 1px solid var(--settings-tooltip-border);
   border-radius: var(--radius-md);
   padding: 0.5rem 0.75rem;
@@ -5148,8 +5148,8 @@ html[data-theme="light"] .decode-paused-pill-action {
   background: rgba(30, 30, 30, 0.88)
     /* @token-exempt: dark near-opaque, no matching token */
   ;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(var(--effect-blur-lg));
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-lg);
   padding: 10px 16px;
@@ -5776,8 +5776,8 @@ html[data-theme="light"] .decode-paused-pill-action {
   border: 1px solid var(--settings-popover-border);
   border-top: none;
   border-radius: 0 0 10px 10px;
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow:
     inset 0 1px 0 var(--glass-select-menu-inset),
     0 8px 24px var(--glass-select-menu-shadow);
@@ -6474,8 +6474,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   ;
   border: 1px solid var(--add-color-popover-border);
   border-radius: 10px;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(var(--effect-blur-surface));
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface));
 }
 
 .custom-color-popover-row {
@@ -8341,8 +8341,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   padding: 14px 18px;
   z-index: 9100;
   min-width: 200px;
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);
 }
 
@@ -8418,8 +8418,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   display: flex;
   gap: 8px;
   z-index: 9100;
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);
 }
 
@@ -8763,8 +8763,8 @@ html[data-theme="dark"] .settings-modal {
     0 18px 48px rgba(0, 0, 0, 0.34);
   /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
-  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(130%) contrast(102%);
 }
 
 .settings-sidebar-title-icon {
@@ -8893,8 +8893,8 @@ html[data-theme="light"] .settings-modal {
     0 18px 48px rgba(90, 105, 130, 0.14);
   /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
-  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(130%) contrast(102%);
 }
 
 html[data-theme="light"] .settings-layout {
@@ -8919,8 +8919,8 @@ html[data-theme="light"] .settings-panel {
     rgba(232, 233, 240, 0.95) 100% /* @token-exempt: theme variant */
   );
 
-  backdrop-filter: blur(16px) saturate(120%);
-  -webkit-backdrop-filter: blur(16px) saturate(120%);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(120%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(120%);
 }
 
 html[data-theme="light"] .settings-panel::before,
