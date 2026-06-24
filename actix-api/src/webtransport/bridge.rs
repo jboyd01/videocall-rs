@@ -254,11 +254,11 @@ impl WebTransportBridge {
     /// WT freeze described in discussion #756.
     ///
     /// **Backpressure-gated shed** (#1638 — "#979 part 2"): a parked write is
-    /// shed (RESET the wedged stream, RE-OPEN a fresh persistent stream, DROP the
-    /// current frame, continue draining the NEXT frame onto the fresh stream)
-    /// ONLY when the outbound channel is genuinely backing up — never merely
-    /// because a single write took a long wall-clock time. Two paths end in a
-    /// reset:
+    /// shed (RESET the wedged stream, RE-OPEN a fresh persistent stream) ONLY when
+    /// the outbound channel is genuinely backing up — never merely because a
+    /// single write took a long wall-clock time. Two paths end in a reset, and
+    /// they recover OPPOSITELY (the current frame is DROPPED on the timeout path
+    /// but RE-SENT on the error path):
     ///
     /// * **Stalled-while-backed-up (stream alive but flow-control-wedged).** A
     ///   slow receiver stops granting QUIC credits, so `write_all` parks. While
@@ -271,11 +271,16 @@ impl WebTransportBridge {
     ///   iff the 512-deep `unistream_tx` is actually filling because this writer
     ///   (its only consumer) is parked and `try_send` is starting to return
     ///   `Full` for publishers targeting that receiver — the #1631 M1 cascade.
-    ///   Counted as `reason="write_timeout"`.
+    ///   Counted as `reason="write_timeout"`. The current frame is **DROPPED** (it
+    ///   would re-wedge the fresh stream against the same starved receiver — see
+    ///   below); the packet-sent callback does NOT fire for it.
     /// * **Write error (stream already torn down).** The stream returned an I/O
     ///   error — it is genuinely broken (not merely slow). The pre-existing
-    ///   single-retry recovery, independent of backpressure. Counted as
-    ///   `reason="write_error"`.
+    ///   single-retry recovery, independent of backpressure: the fresh stream
+    ///   starts clean, so the complete frame (`len_header` + `data`) is **RE-SENT**
+    ///   on it and, on success, DELIVERED — the packet-sent callback DOES fire (the
+    ///   frame is counted, not dropped). A second error terminates the writer.
+    ///   Counted as `reason="write_error"`.
     ///
     /// **Why the gate, and why it cannot spuriously reset a healthy stream:** the
     /// relay's WT actor runs on a SINGLE-THREADED runtime. Under CPU/scheduling
@@ -292,16 +297,25 @@ impl WebTransportBridge {
     /// the receiver isn't draining. That is exactly the invariant: reset iff the
     /// channel is actually wedging, never merely because the executor was slow.
     ///
-    /// Why the CURRENT frame is dropped on BOTH paths rather than re-sent on the
-    /// fresh stream: re-sending the wedged frame first would immediately
-    /// re-stall the new stream against the same flow-control-starved receiver,
-    /// re-wedging the channel. Dropping it keeps the new stream's first bytes a
-    /// COMPLETE `[len][payload]` frame (the next frame from the channel), so the
-    /// client's per-stream framing buffer — which is freshly allocated per
-    /// accepted stream and never carries a mid-frame continuation across a reset
-    /// (see `videocall-client`'s `handle_unidirectional_stream`) — resyncs
-    /// immediately at a frame boundary. A reset mid-frame therefore discards the
-    /// client's partial frame cleanly; it never desyncs the decoder.
+    /// Why the CURRENT frame is dropped on the **timeout** path but RE-SENT on the
+    /// **error** path: on the timeout path the receiver is flow-control-wedged, so
+    /// re-sending the parked frame first would immediately re-stall the new stream
+    /// against that same starved receiver and re-wedge the channel — so we drop it.
+    /// Dropping keeps the new stream's first bytes a COMPLETE `[len][payload]`
+    /// frame (the next frame from the channel), so the client's per-stream framing
+    /// buffer — which is freshly allocated per accepted stream and never carries a
+    /// mid-frame continuation across a reset (see `videocall-client`'s
+    /// `handle_unidirectional_stream`) — resyncs immediately at a frame boundary. A
+    /// reset mid-frame therefore discards the client's partial frame cleanly; it
+    /// never desyncs the decoder.
+    ///
+    /// On the error path the receiver is NOT flow-control-wedged (the stream is
+    /// just broken), so re-sending will not re-wedge: the fresh stream has its own
+    /// flow-control window and the client allocates a fresh per-stream buffer that
+    /// reads the re-sent frame whole from offset 0. Re-sending is therefore safe
+    /// AND necessary — dropping here would silently lose a frame (e.g. a peer's
+    /// reply during session churn, the exact `test_lobby_isolation` failure that
+    /// the #1638 over-broad drop introduced).
     fn spawn_unistream_writer(
         join_set: &mut JoinSet<()>,
         session: Session,
@@ -377,13 +391,9 @@ impl WebTransportBridge {
                     if let Some(mut wedged) = persistent_stream.take() {
                         let _ = wedged.reset(UNISTREAM_SHED_RESET_CODE);
                     }
-                    // Re-open a fresh persistent stream for the NEXT frame. We do
-                    // NOT re-send the dropped frame here (see the doc comment): the
-                    // next loop iteration drains the next frame from the channel and
-                    // writes it whole onto this fresh stream, so the client resyncs
-                    // at a clean frame boundary.
-                    match session.open_uni().await {
-                        Ok(s) => persistent_stream = Some(s),
+                    // Re-open a fresh persistent stream.
+                    let mut fresh = match session.open_uni().await {
+                        Ok(s) => s,
                         Err(e2) => {
                             error!(
                                 "Error opening fresh UniStream after shed ({}): {}",
@@ -391,10 +401,56 @@ impl WebTransportBridge {
                             );
                             break;
                         }
+                    };
+
+                    // The two shed reasons demand OPPOSITE recovery (see the doc
+                    // comment on this fn and #1638):
+                    //
+                    // * `write_timeout` (backpressure-gated stall): the receiver
+                    //   is flow-control-wedged. DROP the current frame — re-sending
+                    //   it onto the fresh stream would immediately re-stall against
+                    //   the same starved receiver and re-wedge the channel. The
+                    //   next loop iteration drains the NEXT frame onto `fresh`, so
+                    //   the client resyncs at a clean frame boundary. Do NOT fire
+                    //   the packet-sent callback for the dropped frame.
+                    //
+                    // * `write_error` (stream returned an I/O error — broken, NOT
+                    //   flow-control-wedged): restore the pre-existing single-retry.
+                    //   The fresh stream starts clean, so RE-SEND the complete frame
+                    //   (`len_header` + `data`) on it; the client's per-stream
+                    //   framing buffer reads the whole frame from offset 0. On
+                    //   success the frame IS delivered — fall through to fire the
+                    //   callback (deliver + count). If the retry write ALSO errors,
+                    //   terminate the writer exactly as the original did.
+                    if reason == "write_error" {
+                        if let Err(e2) = fresh.write_all(&len_header).await {
+                            error!(
+                                "Error writing length header to fresh UniStream after \
+                                 write-error retry: {}",
+                                e2
+                            );
+                            break;
+                        }
+                        if let Err(e2) = fresh.write_all(&data).await {
+                            error!(
+                                "Error writing payload to fresh UniStream after \
+                                 write-error retry: {}",
+                                e2
+                            );
+                            break;
+                        }
+                        // Retry delivered the frame on the fresh stream. Keep it as
+                        // the persistent stream and fall through to fire the
+                        // packet-sent callback below (the frame was delivered +
+                        // must be counted — this is the regression fix: do NOT drop
+                        // it).
+                        persistent_stream = Some(fresh);
+                    } else {
+                        // `write_timeout`: keep the fresh stream for the NEXT frame
+                        // and drop the current one (skip the callback, continue).
+                        persistent_stream = Some(fresh);
+                        continue;
                     }
-                    // The current frame was shed away; do not fire the
-                    // packet-sent callback for it. Continue to the next frame.
-                    continue;
                 }
 
                 // Call packet sent callback if provided (for test instrumentation)
@@ -468,13 +524,15 @@ fn channel_is_backed_up(depth: usize, max_capacity: usize) -> bool {
 /// Write one length-prefixed frame onto the persistent uni stream, shedding ONLY
 /// under sustained real backpressure (#1638).
 ///
-/// Returns the shed reason for the operator-facing metric/log:
-/// * `None` — the write completed; no shed.
+/// Returns the shed reason for the operator-facing metric/log. The CALLER
+/// ([`Self::spawn_unistream_writer`]) maps each reason to its recovery:
+/// * `None` — the write completed; no shed; the frame is delivered + counted.
 /// * `Some("write_error")` — the stream returned an I/O error (genuinely broken,
-///   not merely slow); reset+reopen regardless of backpressure.
+///   not merely slow); reset+reopen regardless of backpressure, then the caller
+///   RE-SENDS the frame on the fresh stream and counts it (single-retry recovery).
 /// * `Some("write_timeout")` — the write stayed parked while the channel was
-///   sustainedly backed up for [`WT_UNISTREAM_WRITE_DEADLINE`]; shed the wedged
-///   stream so the writer resumes draining.
+///   sustainedly backed up for [`WT_UNISTREAM_WRITE_DEADLINE`]; the caller resets
+///   the wedged stream and DROPS the frame so the writer resumes draining.
 ///
 /// ## Why this cannot spuriously reset a healthy stream under executor starvation
 ///
@@ -550,8 +608,8 @@ async fn write_framed_with_backpressure_shed(
                     Ok(()) => None,
                     Err(e) => {
                         warn!(
-                            "Error writing to persistent UniStream ({}); resetting and \
-                             reopening (frame dropped)",
+                            "Error writing to persistent UniStream ({}); resetting, \
+                             reopening and re-sending the frame on a fresh stream",
                             e
                         );
                         Some("write_error")
@@ -1274,6 +1332,148 @@ mod writer_shed_tests {
              test window — the channel stayed wedged (un-bounded writer parks \
              forever on QUIC flow control)",
         );
+    }
+
+    /// REGRESSION TEST (the #1638 over-broad-drop bug — the bug THIS change fixes):
+    /// a single transient **write error** must be recovered by RE-SENDING the frame
+    /// on a fresh stream and FIRING the packet-sent callback (deliver + count) — it
+    /// must NOT be dropped.
+    ///
+    /// This is the `test_lobby_isolation` failure mode in miniature: #1638
+    /// collapsed BOTH shed reasons into "reset + reopen + DROP the frame + skip the
+    /// callback". That is correct for `write_timeout` (the receiver is
+    /// flow-control-wedged) but WRONG for `write_error` (the stream is just broken):
+    /// a transient error — e.g. `invalid STOP_SENDING` during session churn — then
+    /// silently DROPS the frame instead of retrying it. In `test_lobby_isolation`
+    /// the dropped frame is a peer's reply, so the receiving peer's counter never
+    /// reaches its expected value. The pre-#1638 writer single-retried on a write
+    /// error and delivered the frame; this test pins that restored behaviour.
+    ///
+    /// Setup (drives the REAL production `spawn_unistream_writer` via
+    /// `WebTransportBridge::new_with_callback` over a REAL loopback session — NO
+    /// NATS, NO relay server): the client accepts the server's FIRST persistent uni
+    /// stream and immediately `stop()`s it (sends STOP_SENDING), which surfaces on
+    /// the server writer's `write_all` as a genuine I/O **write error** — the exact
+    /// `write_error` shed reason, induced the same real way the sibling tests induce
+    /// a real stall. The client then accepts EVERY subsequent server stream and
+    /// drains it (granting flow control), so the writer's re-send on the fresh
+    /// stream completes. We push exactly ONE (large) frame and assert the
+    /// `on_packet_sent` callback fires exactly once — i.e. the frame was RE-SENT
+    /// and counted. (The frame is large so the first `write_all` is guaranteed
+    /// still in-flight when STOP_SENDING lands and therefore reliably errors — see
+    /// the comment at the push site.)
+    ///
+    /// PROOF THE TEST BITES: on the current (drops-on-`write_error`) code the writer
+    /// resets+reopens but `continue`s WITHOUT re-sending and WITHOUT firing the
+    /// callback, so the count stays 0 and the final assert FAILS. With the fix the
+    /// writer re-sends the frame on the fresh stream and fires the callback → count
+    /// == 1 → the assert PASSES. (Reverting the production split — making
+    /// `write_error` `continue` like `write_timeout` — re-breaks this test.)
+    #[actix_rt::test]
+    async fn write_error_resends_frame_and_counts_it_not_dropped() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (addr, mut server) = build_test_server();
+
+        let server_session_fut = tokio::spawn(async move {
+            let request = server.accept().await.expect("accept request");
+            request.ok().await.expect("respond ok")
+        });
+
+        let client_session = connect_test_client(addr).await;
+        let server_session = server_session_fut.await.expect("join server session");
+
+        // Client side: accept the server's persistent uni streams. STOP_SENDING the
+        // FIRST one (this is what makes the server writer's `write_all` return an
+        // I/O error → the `write_error` shed). Then accept and DRAIN every later
+        // stream so the writer's re-send on the fresh stream actually completes
+        // (the receiver grants flow control by reading). Runs until the session
+        // closes.
+        let client_drainer = tokio::spawn(async move {
+            let mut stream_index = 0usize;
+            // `accept_uni` returns `Err` once the session closes (test teardown),
+            // which ends this `while let` cleanly.
+            while let Ok(mut recv) = client_session.accept_uni().await {
+                if stream_index == 0 {
+                    // Induce ONE real write error on the server's first persistent
+                    // stream by STOP_SENDING it.
+                    let _ = recv.stop(0u32);
+                } else {
+                    // Drain the re-sent frame on the fresh stream so the server's
+                    // retry `write_all` makes progress and returns Ok (which is what
+                    // fires the callback in the writer). Read until EOF / error; we
+                    // don't assert on the contents, only that draining lets the
+                    // server's write complete.
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(Some(_n)) = recv.read(&mut buf).await {}
+                }
+                stream_index += 1;
+            }
+        });
+
+        const CAP: usize = 16;
+        let (uni_tx, uni_rx) = mpsc::channel::<Bytes>(CAP);
+        let (_dgram_tx, dgram_rx) = mpsc::channel::<Bytes>(CAP);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_cb = sent.clone();
+        let on_sent: PacketSentCallback = Box::new(move || {
+            sent_cb.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let stub = StubActor.start();
+        let _bridge = WebTransportBridge::new_with_callback(
+            server_session,
+            stub,
+            uni_rx,
+            dgram_rx,
+            Some(on_sent),
+        );
+
+        // Push EXACTLY ONE frame. The writer opens stream #1 and writes — the
+        // client STOP_SENDINGs that stream → the server's `write_all` returns an
+        // I/O error → the writer resets, opens stream #2, and (with the fix)
+        // RE-SENDS this frame onto it, then fires the callback.
+        //
+        // The frame is LARGE (4 MiB, above quinn's default ~1.25 MiB stream window
+        // — the same size the sibling `healthy_low_traffic_*` test uses to force a
+        // genuine park). This removes the only timing race in the setup: a small
+        // write would complete into the local send buffer and return `Ok` BEFORE
+        // the STOP_SENDING frame is processed (no error → the normal path fires the
+        // callback and the test would pass for the wrong reason). A 4 MiB write
+        // CANNOT complete in one shot — it must await window grant, so it is
+        // guaranteed still in-flight when STOP_SENDING lands and reliably errors.
+        // The client drainer reads stream #2 to completion, granting the window the
+        // re-send needs, so the retry `write_all` returns `Ok` and the callback
+        // fires.
+        let frame_len = 4 * 1024 * 1024;
+        uni_tx
+            .send(Bytes::from(vec![0xAB; frame_len]))
+            .await
+            .expect("push one frame onto the outbound unistream channel");
+
+        // Poll for the callback to fire. On the FIXED code it reaches 1 once the
+        // re-send completes; on the BUGGY (drops-on-error) code it stays 0 forever,
+        // so this loop exhausts its deadline and the assert below FAILS.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if sent.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            1,
+            "REGRESSION (#1638 over-broad drop): a single write error must RE-SEND \
+             the frame on a fresh stream and FIRE the packet-sent callback (deliver \
+             + count) — it was DROPPED instead (callback never fired). This is the \
+             dropped-peer-reply that breaks test_lobby_isolation."
+        );
+
+        // Tear down: closing the session ends the client drainer loop cleanly.
+        drop(uni_tx);
+        client_drainer.abort();
     }
 
     /// REGRESSION TEST (#1638 follow-up): a HEALTHY, non-backed-up stream must
