@@ -251,7 +251,13 @@ pub async fn start(
 
     // Accept new WebTransport connections
     // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
-    // actor requires the actix LocalSet context for spawn_local.
+    // actor requires the actix LocalSet context for spawn_local. This is also why
+    // the binary is `#[actix_rt::main]` (single-threaded current-thread runtime):
+    // a multi-threaded runtime cannot host these `!Send`, spawn_local-bound tasks.
+    // Because the runtime is current-thread, `TOKIO_WORKER_THREADS` is INERT for
+    // this relay — tuning it does nothing and cannot relieve outbound back-pressure.
+    // Multi-core scaling (multi-Arbiter sharding / off-thread parse — issue #1639
+    // options a/b) is future work gated on the #1637 scheduler-lag instrumentation.
     while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
         let chat_server = chat_server.clone();

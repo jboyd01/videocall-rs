@@ -216,6 +216,11 @@ jobs:
           #    so no ingress is needed. The webtransport-tls secret is cert-manager managed
           #    via letsencrypt-aws ClusterIssuer (Route53 DNS-01).
           #  * Health port (444/TCP) exposed for internal probes.
+          #  * TOKIO_WORKER_THREADS is deliberately NOT set (issue #1639, option c):
+          #    webtransport_server is `#[actix_rt::main]` (single-threaded current-thread
+          #    runtime) and never reads it; the WtChatSession actor requires the
+          #    LocalSet/spawn_local, so tuning thread count cannot relieve back-pressure.
+          #    The env array below is contiguous (env[0..10]); do not reintroduce a gap.
 
           helm upgrade --install videocall-webtransport helm/rustlemania-webtransport/ \
             --namespace ${NAMESPACE} \
@@ -251,10 +256,8 @@ jobs:
             --set "env[8].value=webtransport" \
             --set "env[9].name=SERVER_STATS_INTERVAL_SECS" \
             --set-string "env[9].value=5" \
-            --set "env[10].name=TOKIO_WORKER_THREADS" \
-            --set-string "env[10].value=4" \
-            --set "env[11].name=TOKIO_BLOCKING_THREADS" \
-            --set-string "env[11].value=2" \
+            --set "env[10].name=TOKIO_BLOCKING_THREADS" \
+            --set-string "env[10].value=2" \
             --set resources.requests.cpu=200m \
             --set resources.requests.memory=256Mi \
             --set resources.limits.cpu=2000m \

@@ -246,6 +246,12 @@ jobs:
           # so the cert-manager annotation below has no effect. The webtransport-tls secret must be pre-created
           # via a Certificate CR or manual provisioning. Both labsworkspace and Ascend clusters have this
           # secret already provisioned.
+          #
+          # NOTE: TOKIO_WORKER_THREADS is deliberately NOT set here (issue #1639,
+          # option c). webtransport_server is `#[actix_rt::main]` (single-threaded
+          # current-thread runtime) and never reads it; the WtChatSession actor
+          # requires the LocalSet/spawn_local, so tuning thread count cannot
+          # relieve back-pressure. The env array below is contiguous (env[0..7]).
 
           helm upgrade --install videocall-webtransport helm/rustlemania-webtransport/ \
             --namespace ${NAMESPACE} \
@@ -274,10 +280,8 @@ jobs:
             --set "env[5].value=/certs/tls.crt" \
             --set "env[6].name=KEY_PATH" \
             --set "env[6].value=/certs/tls.key" \
-            --set "env[7].name=TOKIO_WORKER_THREADS" \
-            --set-string "env[7].value=4" \
-            --set "env[8].name=TOKIO_BLOCKING_THREADS" \
-            --set-string "env[8].value=2" \
+            --set "env[7].name=TOKIO_BLOCKING_THREADS" \
+            --set-string "env[7].value=2" \
             --set ingress.enabled=false \
             --wait --timeout 5m
 

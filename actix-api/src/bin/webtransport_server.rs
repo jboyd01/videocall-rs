@@ -33,6 +33,21 @@ async fn health_responder() -> impl Responder {
     HttpResponse::Ok().body("Ok")
 }
 
+// This relay runs on a SINGLE-THREADED runtime by necessity.
+//
+// `#[actix_rt::main]` builds a current-thread tokio runtime (actix-rt never
+// reads `worker_threads` / the `TOKIO_WORKER_THREADS` env var). It must be
+// single-threaded because the per-session `WtChatSession` actor and its
+// WebTransport stream/datagram I/O are driven on the actix `LocalSet` via
+// `spawn_local` (see `webtransport::mod` connection-accept loop), which a
+// multi-threaded runtime cannot host. Consequently `TOKIO_WORKER_THREADS` is
+// INERT for this binary — setting it in deploy config does nothing, and
+// thread count cannot relieve outbound back-pressure here.
+//
+// Scaling past one core (multi-Arbiter sharding / off-thread parse — issue
+// #1639 options a/b) is future work, gated on the #1637 scheduler-lag
+// instrumentation. Issue #1639 option (c) only removed the inert env and
+// documented this ceiling.
 #[actix_rt::main]
 async fn main() {
     tracing_subscriber::fmt()
