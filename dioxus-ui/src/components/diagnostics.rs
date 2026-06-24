@@ -62,14 +62,15 @@ struct ReceptionEntry {
     bitrate_kbps: Option<f64>,
     loss_per_sec: Option<f64>,
     kf_req_per_sec: Option<f64>,
-    // issue 1656: skew-resilient relative capture-lag (ms) and TRUE painted-frame
+    // issue 1656: content staleness (skew-cancelled ms the painted content is
+    // behind real-time — #1641's `content_staleness_ms`) and TRUE painted-frame
     // fps, emitted by the worker `"video"` event (which carries `to_peer` but NO
     // `media_type`). Folded under key `(to_peer, "VIDEO")`. `None` until a worker
     // event arrives; the backend sends a literal `0.0` when unknown, but `0.0` is
     // ALSO a legitimate "perfectly on time" reading — indistinguishable from the
     // value alone — so we rely on `None` (no entry yet) for "unknown" and let a
     // genuine `0.0` render once a real worker event has been folded.
-    realtime_lag_ms: Option<f64>,
+    content_staleness_ms: Option<f64>,
     fps_painted: Option<f64>,
     last_ts_ms: u64,
 }
@@ -99,8 +100,9 @@ fn update_reception(
             ("bitrate_kbps", MetricValue::F64(v)) => bitrate = Some(*v),
             ("video_seq_loss_per_sec", MetricValue::F64(v)) => loss = Some(*v),
             ("keyframe_requests_per_sec", MetricValue::F64(v)) => kf = Some(*v),
-            // issue 1656: worker `"video"` event metrics.
-            ("realtime_lag_ms", MetricValue::F64(v)) => lag = Some(*v),
+            // issue 1656: worker `"video"` event metrics (content staleness is
+            // #1641's `content_staleness_ms`).
+            ("content_staleness_ms", MetricValue::F64(v)) => lag = Some(*v),
             ("fps_painted", MetricValue::F64(v)) => painted = Some(*v),
             _ => {}
         }
@@ -133,11 +135,11 @@ fn update_reception(
         entry.kf_req_per_sec = Some(v);
     }
     // issue 1656: worker fields, latest-wins like the rest. Once a real worker
-    // event folds even a genuine `0.0` lag, the dump shows `0 ms` (not `-`),
-    // which is how we resolve the 0.0-vs-unknown ambiguity: `-`/`None` means "no
-    // worker event seen yet", any folded value (incl. 0.0) is a real reading.
+    // event folds even a genuine `0.0` staleness, the dump shows `0 ms` (not
+    // `-`), which is how we resolve the 0.0-vs-unknown ambiguity: `-`/`None`
+    // means "no worker event seen yet", any folded value (incl. 0.0) is real.
     if let Some(v) = lag {
-        entry.realtime_lag_ms = Some(v);
+        entry.content_staleness_ms = Some(v);
     }
     if let Some(v) = painted {
         entry.fps_painted = Some(v);
@@ -157,10 +159,11 @@ fn render_reception(map: &BTreeMap<(String, String), ReceptionEntry>) -> Option<
     fn fmt1(v: Option<f64>) -> String {
         v.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into())
     }
-    // issue 1656: lag is rounded to whole ms (`{:.0}`) — like the rest of the
-    // dump it must be stable sub-second so the subscribe-loop change-gate (which
-    // compares rendered strings) isn't defeated by jitter below the displayed
-    // precision. `-` for never-observed, matching the dump's hyphen idiom.
+    // issue 1656: content staleness is rounded to whole ms (`{:.0}`) — like the
+    // rest of the dump it must be stable sub-second so the subscribe-loop
+    // change-gate (which compares rendered strings) isn't defeated by jitter
+    // below the displayed precision. `-` for never-observed, matching the dump's
+    // hyphen idiom.
     fn fmt0(v: Option<f64>) -> String {
         v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into())
     }
@@ -175,16 +178,17 @@ fn render_reception(map: &BTreeMap<(String, String), ReceptionEntry>) -> Option<
         // timestamp changes on every 500ms heartbeat — which would make the
         // dump never byte-identical and defeat the gate entirely (each event
         // would re-render the drawer body for an invisible ms tick).
-        // issue 1656: `FPS(painted)` (TRUE painted-frame fps, `{:.1}`) and `lag`
-        // (skew-resilient relative capture-lag, whole ms) are NEW lines added to
-        // the fixed template — the existing `FPS:` line stays as fps_received.
+        // issue 1656: `FPS(painted)` (TRUE painted-frame fps, `{:.1}`) and
+        // `Stale` (content staleness — ms the painted content is behind
+        // real-time, #1641, whole ms) are NEW lines added to the fixed template
+        // — the existing `FPS:` line stays as fps_received.
         text.push_str(&format!(
-            "Peer: {peer} ({kind})\nFPS: {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nlag: {} ms\nTimestamp: {}s\n\n",
+            "Peer: {peer} ({kind})\nFPS: {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
             fmt1(e.fps_painted),
             fmt1(e.bitrate_kbps),
             fmt1(e.loss_per_sec),
             fmt1(e.kf_req_per_sec),
-            fmt0(e.realtime_lag_ms),
+            fmt0(e.content_staleness_ms),
             e.last_ts_ms / 1000,
         ));
     }
@@ -232,7 +236,8 @@ fn peer_jitter_class(jitter_ms: u64) -> (&'static str, &'static str) {
     }
 }
 
-/// Quality class + reason for a per-peer realtime capture-LAG value (issue 1656).
+/// Quality class + reason for a per-peer CONTENT-STALENESS value (ms the painted
+/// content is behind real-time — #1641's `content_staleness_ms`; issue 1656).
 /// `< 1000ms` → good; `[1000, 1800)ms` → warn "falling behind"; `>= 1800ms` →
 /// poor "severely behind real-time". Returns `(class, reason)` (`""` for good).
 ///
@@ -252,10 +257,10 @@ fn peer_lag_class(lag_ms: f64) -> (&'static str, &'static str) {
     }
 }
 
-/// issue 1656: poor capture-lag boundary (ms). The chip turns "severely behind
-/// real-time" at this value — a standalone UI display threshold meaning "≥1.8s
-/// behind real-time = severe". It is the UI's own severity cut, not derived from
-/// or coupled to any backend constant. The
+/// issue 1656: poor content-staleness boundary (ms). The chip turns "severely
+/// behind real-time" at this value — a standalone UI display threshold meaning
+/// "≥1.8s behind real-time = severe". It is the UI's own severity cut, not
+/// derived from or coupled to any backend constant. The
 /// `peer_lag_poor_threshold_is_severe_display_value` test pins this value on its
 /// own terms so a future edit to `PEER_LAG_POOR_MS` is visible/intentional
 /// rather than a silent drift.
@@ -267,10 +272,11 @@ const PEER_LAG_POOR_MS: f64 = 1800.0;
 /// renders the em-dash "unknown" idiom, while a folded `0.0` renders a real
 /// value. The three metrics arrive from TWO producers on the SAME subsystem
 /// `"video"` bus: the diagnostics-manager HEARTBEAT carries `fps_received`
-/// (+ `media_type`), the worker event carries `realtime_lag_ms` +
+/// (+ `media_type`), the worker event carries `content_staleness_ms` (#1641) +
 /// `fps_painted` (NO `media_type`). Both key by `to_peer`. Because a heartbeat
-/// updates only `recv_fps` and a worker updates only `lag_ms`/`painted_fps`,
-/// the fold is PER-FIELD latest-wins (see [`fold_video_readout`]).
+/// updates only `recv_fps` and a worker updates only `lag_ms` (= content
+/// staleness) / `painted_fps`, the fold is PER-FIELD latest-wins (see
+/// [`fold_video_readout`]).
 ///
 /// `recv_fps` is VIDEO-only. The heartbeat fires for BOTH VIDEO and SCREEN with
 /// the SAME `to_peer`, so [`fold_video_readout`] folds `fps_received` into
@@ -291,10 +297,11 @@ struct PeerVideoReadout {
 /// actually changed (so the caller can change-gate the signal `.set()` and not
 /// wake the drawer on every ~1 Hz tick). A field is overwritten ONLY when its
 /// metric is `Some` on THIS event — a heartbeat (recv only) must not clobber a
-/// prior worker's lag/painted, and vice-versa. Rounds to the displayed
-/// precision (recv/painted to 1 decimal, lag to whole ms) so jitter below the
-/// shown digits can't defeat the change-gate. Returns `false` (no change) for
-/// an event lacking `to_peer` or any of the three metrics. Pure / host-testable.
+/// prior worker's staleness/painted, and vice-versa. Rounds to the displayed
+/// precision (recv/painted to 1 decimal, staleness to whole ms) so jitter below
+/// the shown digits can't defeat the change-gate. Returns `false` (no change)
+/// for an event lacking `to_peer` or any of the three metrics. Pure /
+/// host-testable.
 ///
 /// `media_type` filter (issue 1656): `recv_fps` is the VIDEO (camera) pipeline
 /// ONLY. The heartbeat producer emits this `"video"` subsystem event for BOTH
@@ -322,7 +329,8 @@ fn fold_video_readout(
             ("to_peer", MetricValue::Text(t)) => peer = Some(t.to_string()),
             ("media_type", MetricValue::Text(t)) => media_type = Some(t.to_string()),
             ("fps_received", MetricValue::F64(v)) => recv = Some((*v * 10.0).round() / 10.0),
-            ("realtime_lag_ms", MetricValue::F64(v)) => lag = Some((*v).round()),
+            // issue 1656: content staleness is #1641's `content_staleness_ms`.
+            ("content_staleness_ms", MetricValue::F64(v)) => lag = Some((*v).round()),
             ("fps_painted", MetricValue::F64(v)) => painted = Some((*v * 10.0).round() / 10.0),
             _ => {}
         }
@@ -834,8 +842,8 @@ pub fn Diagnostics(
     let mut neteq_buffer_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut peer_transport_per_peer = use_signal(HashMap::<String, String>::new);
-    // issue 1656: per-peer VIDEO readout — recv fps + capture-lag + painted fps
-    // (see `PeerVideoReadout`), each `Option` so a peer absent from the map (or a
+    // issue 1656: per-peer VIDEO readout — recv fps + content staleness + painted
+    // fps (see `PeerVideoReadout`), each `Option` so a peer absent from the map (or a
     // `None` field) renders the em-dash "unknown" in the Receive breakdown /
     // triage chip, while a folded `0.0` renders a real value. Keyed by
     // `Peer::sid_str` (u64-as-String) == the worker/heartbeat event's `to_peer`.
@@ -945,8 +953,8 @@ pub fn Diagnostics(
                             }
                         }
                         // issue 1656: per-peer VIDEO readout. Fold `to_peer` +
-                        // `fps_received` (heartbeat) / `realtime_lag_ms` +
-                        // `fps_painted` (worker) per-field latest-wins via the
+                        // `fps_received` (heartbeat) / `content_staleness_ms` (#1641)
+                        // + `fps_painted` (worker) per-field latest-wins via the
                         // pure helper, which rounds to the displayed precision so
                         // sub-second jitter can't defeat the change-gate, and
                         // returns whether a value actually changed. Push to the
@@ -1645,7 +1653,7 @@ pub fn Diagnostics(
                                                     let title = if reason.is_empty() { "on time" } else { reason };
                                                     (format!("{v:.0} ms"), c, title)
                                                 }
-                                                None => ("\u{2014}".to_string(), "", "Capture lag unknown"),
+                                                None => ("\u{2014}".to_string(), "", "Content staleness unknown"),
                                             };
                                             let lag_has_dot = !lag_class.is_empty();
                                             rsx! {
@@ -1660,11 +1668,11 @@ pub fn Diagnostics(
                                                             ", Jitter: "
                                                             span { class: "peer-stat {jit_class}", title: "{jit_title}", "{latest_jitter}ms" }
                                                         }
-                                                        // Triage chip: fps gap + lag with dot accent.
+                                                        // Triage chip: fps gap + content staleness with dot accent.
                                                         span {
                                                             class: "peer-summary-item__lag",
                                                             "data-testid": "diag-peer-summary-lag-{peer_id}",
-                                                            "Lag: "
+                                                            "Stale: "
                                                             if lag_has_dot {
                                                                 span {
                                                                     class: "peer-stat__dot {lag_class}",
@@ -2379,8 +2387,9 @@ fn SimulcastReceiveBreakdown(
                                             .map(|l| format!("{}: {l}", p.label))
                                             .unwrap_or(p.label);
                                         // issue 1656: per-peer VIDEO readout. Only the video
-                                        // kind shows the recv/painted fps pair and capture-lag
-                                        // chip; audio/screen render nothing new. Look up by
+                                        // kind shows the recv/painted fps pair and the
+                                        // content-staleness chip; audio/screen render nothing
+                                        // new. Look up by
                                         // session_id-as-String == the event's `to_peer`. A peer
                                         // absent (or a `None` field) renders the em-dash unknown
                                         // idiom. `0.0` (a real "on time"/"no frames" reading once
@@ -2493,7 +2502,7 @@ fn SimulcastReceiveBreakdown(
                                                         }
                                                         span {
                                                             class: "simulcast-recv-peer-lag",
-                                                            "lag: "
+                                                            "stale: "
                                                             // BLOCKER 1: severity hue is a non-text
                                                             // dot; the VALUE text is neutral and
                                                             // high-contrast. The dot's class carries
@@ -2508,8 +2517,8 @@ fn SimulcastReceiveBreakdown(
                                                             if lag_txt == "\u{2014}" {
                                                                 span {
                                                                     class: "peer-stat__value",
-                                                                    title: "Capture lag unknown",
-                                                                    "aria-label": "Capture lag unknown",
+                                                                    title: "Content staleness unknown",
+                                                                    "aria-label": "Content staleness unknown",
                                                                     "{lag_txt}"
                                                                 }
                                                             } else {
@@ -2521,18 +2530,19 @@ fn SimulcastReceiveBreakdown(
                                                             }
                                                         }
                                                         if lag_alarm {
-                                                            // a11y: the poor lag is NOT color-only —
-                                                            // the visible chip already shows it via
-                                                            // the dot + neutral "N ms" text + title.
-                                                            // This element is a REDUNDANT, sr-only
-                                                            // announcement for assistive tech, so it
-                                                            // is visually-hidden (not merely a faint
+                                                            // a11y: the poor staleness is NOT
+                                                            // color-only — the visible chip already
+                                                            // shows it via the dot + neutral "N ms"
+                                                            // text + title. This element is a
+                                                            // REDUNDANT, sr-only announcement for
+                                                            // assistive tech, so it is
+                                                            // visually-hidden (not merely a faint
                                                             // color, which would itself fail AA).
                                                             span {
                                                                 class: "visually-hidden",
                                                                 role: "status",
                                                                 "aria-live": "polite",
-                                                                "Capture lag {lag_title}"
+                                                                "Content staleness: {lag_title}"
                                                             }
                                                         }
                                                     }
@@ -2811,11 +2821,11 @@ mod tests {
     }
 
     /// issue 1656: a worker-shaped `"video"` event (carries `to_peer` +
-    /// `realtime_lag_ms` + `fps_painted`, but NO `media_type`) must fold (return
-    /// true) under the synthetic `"VIDEO"` kind and render the new FPS(painted)
-    /// and lag lines. Removing the `kind = Some("VIDEO")` synthesis in
-    /// `update_reception` makes this event fail the `(peer, kind)` gate → the
-    /// fold returns false and the assertion below breaks.
+    /// `content_staleness_ms` + `fps_painted`, but NO `media_type`) must fold
+    /// (return true) under the synthetic `"VIDEO"` kind and render the new
+    /// FPS(painted) and staleness lines. Removing the `kind = Some("VIDEO")`
+    /// synthesis in `update_reception` makes this event fail the `(peer, kind)`
+    /// gate → the fold returns false and the assertion below breaks.
     #[test]
     fn reception_worker_event_folds_lag_and_painted() {
         let mut map = BTreeMap::new();
@@ -2826,7 +2836,7 @@ mod tests {
             metrics: vec![
                 m("from_peer", MetricValue::Text("self-id".into())),
                 m("to_peer", MetricValue::Text("42".into())),
-                m("realtime_lag_ms", MetricValue::F64(0.0)),
+                m("content_staleness_ms", MetricValue::F64(0.0)),
                 m("fps_painted", MetricValue::F64(29.97)),
             ],
         };
@@ -2840,11 +2850,11 @@ mod tests {
             text.contains("Peer: 42 (VIDEO)"),
             "VIDEO block present: {text}"
         );
-        // A genuine 0.0 lag renders as a real value (not the `-` unknown) once a
-        // worker event has folded — resolves the 0.0-vs-unknown ambiguity.
+        // A genuine 0.0 staleness renders as a real value (not the `-` unknown)
+        // once a worker event has folded — resolves the 0.0-vs-unknown ambiguity.
         assert!(
-            text.contains("lag: 0 ms"),
-            "lag line present (0.0 → 0): {text}"
+            text.contains("Stale: 0 ms"),
+            "staleness line present (0.0 → 0): {text}"
         );
         // TRUE painted fps, 1-decimal.
         assert!(
@@ -2877,7 +2887,7 @@ mod tests {
             ts_ms: 4_000_500,
             metrics: vec![
                 m("to_peer", MetricValue::Text("7".into())),
-                m("realtime_lag_ms", MetricValue::F64(1234.0)),
+                m("content_staleness_ms", MetricValue::F64(1234.0)),
                 m("fps_painted", MetricValue::F64(28.0)),
             ],
         };
@@ -2894,14 +2904,15 @@ mod tests {
             text.contains("FPS(painted): 28.0"),
             "painted folded: {text}"
         );
-        assert!(text.contains("lag: 1234 ms"), "lag folded: {text}");
+        assert!(text.contains("Stale: 1234 ms"), "staleness folded: {text}");
     }
 
     /// issue 1656 (item 3): `fold_video_readout` must merge the HEARTBEAT
-    /// (`fps_received` only) and the WORKER (`realtime_lag_ms` + `fps_painted`
-    /// only) events for the SAME peer PER-FIELD latest-wins — a heartbeat must
-    /// NOT clobber a prior worker's lag/painted, and a worker must NOT clobber a
-    /// prior heartbeat's recv. Reverting the fold to whole-struct overwrite
+    /// (`fps_received` only) and the WORKER (`content_staleness_ms` +
+    /// `fps_painted` only) events for the SAME peer PER-FIELD latest-wins — a
+    /// heartbeat must NOT clobber a prior worker's staleness/painted, and a
+    /// worker must NOT clobber a prior heartbeat's recv. Reverting the fold to
+    /// whole-struct overwrite
     /// (dropping the `is_some()` guards) makes the heartbeat null out lag/painted
     /// (or the worker null out recv) → one of the `Some(...)` asserts fails.
     #[test]
@@ -2937,7 +2948,7 @@ mod tests {
             ts_ms: 2,
             metrics: vec![
                 m("to_peer", MetricValue::Text("7".into())),
-                m("realtime_lag_ms", MetricValue::F64(1234.4)),
+                m("content_staleness_ms", MetricValue::F64(1234.4)),
                 m("fps_painted", MetricValue::F64(12.34)),
             ],
         };
@@ -2993,7 +3004,7 @@ mod tests {
             ts_ms: 1,
             metrics: vec![
                 m("to_peer", MetricValue::Text("9".into())),
-                m("realtime_lag_ms", MetricValue::F64(500.0)),
+                m("content_staleness_ms", MetricValue::F64(500.0)),
                 m("fps_painted", MetricValue::F64(24.0)),
             ],
         };
@@ -3006,7 +3017,7 @@ mod tests {
             ts_ms: 2,
             metrics: vec![
                 m("to_peer", MetricValue::Text("9".into())),
-                m("realtime_lag_ms", MetricValue::F64(500.4)),
+                m("content_staleness_ms", MetricValue::F64(500.4)),
                 m("fps_painted", MetricValue::F64(24.04)),
             ],
         };
@@ -3019,7 +3030,7 @@ mod tests {
             subsystem: "video",
             stream_id: None,
             ts_ms: 3,
-            metrics: vec![m("realtime_lag_ms", MetricValue::F64(900.0))],
+            metrics: vec![m("content_staleness_ms", MetricValue::F64(900.0))],
         };
         assert!(
             !fold_video_readout(&mut map, &no_peer),
@@ -3131,21 +3142,22 @@ mod tests {
             Some(30.0),
             "camera recv_fps unchanged by the SCREEN heartbeat"
         );
-        // Worker event (no media_type → video pipeline) still folds lag/painted
-        // for the same peer, regardless of the SCREEN/VIDEO filtering above.
+        // Worker event (no media_type → video pipeline) still folds
+        // staleness/painted for the same peer, regardless of the SCREEN/VIDEO
+        // filtering above.
         let worker = DiagEvent {
             subsystem: "video",
             stream_id: None,
             ts_ms: 4,
             metrics: vec![
                 m("to_peer", MetricValue::Text("7".into())),
-                m("realtime_lag_ms", MetricValue::F64(1234.0)),
+                m("content_staleness_ms", MetricValue::F64(1234.0)),
                 m("fps_painted", MetricValue::F64(28.0)),
             ],
         };
         assert!(
             fold_video_readout(&mut map, &worker),
-            "worker (no media_type) folds lag/painted"
+            "worker (no media_type) folds staleness/painted"
         );
         assert_eq!(
             map["7"],
@@ -3157,7 +3169,7 @@ mod tests {
         );
     }
 
-    /// issue 1656 (drift-guard): pins the UI's "poor" capture-lag display
+    /// issue 1656 (drift-guard): pins the UI's "poor" content-staleness display
     /// threshold (`PEER_LAG_POOR_MS`) on its own terms — it is the UI's own
     /// "severely behind real-time" severity cut, not coupled to any backend
     /// constant. This guard makes any future edit to `PEER_LAG_POOR_MS`

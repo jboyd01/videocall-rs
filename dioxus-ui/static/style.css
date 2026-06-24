@@ -10102,7 +10102,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: block;
 }
 
-/* issue 1656: per-peer VIDEO readout (recv/painted fps pair + capture-lag chip).
+/* issue 1656: per-peer VIDEO readout (recv/painted fps pair + content-staleness chip).
    WCAG AA (issue 1656): legibility is DECOUPLED from severity hue. At --fs-2
    (11px, "small" text) the AA floor is 4.5:1, which the saturated --diag-q-*
    severity tokens FAIL against --surface-elevated (e.g. dark poor 4.09:1, light
