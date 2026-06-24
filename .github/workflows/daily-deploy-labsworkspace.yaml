@@ -1,21 +1,19 @@
 name: Daily Deploy to labsworkspace
 
-# NOTE: workflow_run trigger is currently non-functional due to GitHub Actions API limitation.
-# The REST API /repos/.../actions/runs/{id}/jobs endpoint does not expose job outputs,
-# so the image tag cannot be retrieved from the build workflow. This workflow must be
-# manually triggered via workflow_dispatch with the image_tag input.
-# See: https://github.com/orgs/community/discussions/26639
-
+# Triggered as a workflow_dispatch by the "Daily Build Images (HCL)" workflow,
+# which passes the tag it just built. Can also be run manually: provide an
+# image_tag to deploy a specific build, or leave it blank to auto-deploy the
+# latest daily-* tag found in Harbor.
 on:
-  workflow_run:
-    workflows: ["Daily Build Images (HCL)"]
-    types: [completed]
-    branches: [hcl-main]
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag to deploy (e.g., daily-2026-03-10-0000)'
-        required: true
+        description: 'Image tag to deploy (e.g., daily-2026-03-10-0000). Leave blank to deploy the latest tag in Harbor.'
+        required: false
+        type: string
+      deploy_ref:
+        description: 'Commit SHA to check out for Helm charts. The build passes the SHA its images were built from so charts match the image. Leave blank to use the latest hcl-main.'
+        required: false
         type: string
 
 permissions:
@@ -33,10 +31,6 @@ jobs:
   deploy:
     name: Deploy to labsworkspace
     runs-on: [self-hosted, linux, docker]
-    # Only deploy if build was successful (for workflow_run trigger)
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     steps:
       - name: Setup PATH
         run: echo "/home/jenkins/bin" >> $GITHUB_PATH
@@ -55,40 +49,68 @@ jobs:
           kubectl config current-context
           CLUSTER_INFO=$(kubectl cluster-info)
           echo "${CLUSTER_INFO}"
-          # Strip ANSI color codes before grep
-          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://k3s.labsworkspace.fnxlabs.com:6443"
+          # Strip ANSI color codes before grep.
+          # The labsworkspace kubeconfig advertises the control plane by node IP
+          # (10.190.75.36), which is what k3s exposes; the DNS name
+          # k3s.labsworkspace.fnxlabs.com resolves to that same IP. Accept either
+          # form so the guard still confirms the right cluster regardless of how the
+          # kubeconfig server endpoint is written.
+          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "Kubernetes control plane is running at https://(k3s\.labsworkspace\.fnxlabs\.com|10\.190\.75\.36):6443"
 
       - name: Determine image tag
         id: determine-tag
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.image_tag }}"
-            echo "Using manually specified tag: $TAG"
+          TAG="${{ inputs.image_tag }}"
+          if [ -n "$TAG" ]; then
+            echo "Using specified tag: $TAG"
           else
-            # For workflow_run trigger, fetch tag from build workflow job outputs via API
-            WORKFLOW_RUN_ID="${{ github.event.workflow_run.id }}"
-            echo "Fetching image tag from build workflow run ID: ${WORKFLOW_RUN_ID}"
+            # No tag given: deploy the most recently pushed daily-* image in
+            # Harbor. Query the media-server repo's artifacts sorted by push
+            # time (newest first) and take the first daily-YYYY-MM-DD-HHMM tag.
+            # page_size is a window (not 1) because PR builds push pr-<N> tags
+            # to this same repo; scanning the newest 100 artifacts finds the
+            # latest daily tag even if PR images were pushed since — sufficient
+            # given the daily build cadence vs. PR push volume.
+            # Uses only curl + grep (no gh/jq) to match the existing
+            # "Verify Harbor images exist" step's proven toolset.
+            echo "No tag specified — resolving latest daily-* tag from Harbor..."
+            HARBOR_API="https://hclcr.io/api/v2.0"
+            PROJECT="hcllabs"
+            REPO="videocall-media-server"
+            API_URL="${HARBOR_API}/projects/${PROJECT}/repositories/${REPO}/artifacts?sort=-push_time&page_size=100&with_tag=true"
 
-            # Get the jobs for this workflow run
-            JOBS_JSON=$(gh api repos/${{ github.repository }}/actions/runs/${WORKFLOW_RUN_ID}/jobs)
+            ARTIFACTS=$(curl -s -u "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" "${API_URL}")
+            # `|| true`: grep exits 1 on no match, which under `set -euo pipefail`
+            # would abort the step before the empty-TAG guard below could report
+            # the failure (and the API response) usefully.
+            TAG=$(printf '%s' "$ARTIFACTS" | grep -oE 'daily-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}' | head -n1 || true)
 
-            # Extract the image_tag output from the build job
-            TAG=$(echo "$JOBS_JSON" | jq -r '.jobs[] | select(.name == "Build and push daily images") | .outputs.image_tag')
-
-            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-              echo "::error::Failed to get image tag from build workflow"
+            if [ -z "$TAG" ]; then
+              echo "::error::Could not determine latest tag from Harbor (repo ${REPO}). API response:"
+              echo "$ARTIFACTS"
               exit 1
             fi
-
-            echo "Using tag from build workflow output: $TAG"
+            echo "Using latest tag from Harbor: $TAG"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Deploying images with tag: $TAG"
 
       - name: Checkout repository
         uses: actions/checkout@v4.2.0
+        with:
+          # Pin the Helm charts to the commit the images were built from (passed
+          # by the build via deploy_ref) so charts can't drift ahead of the
+          # image if hcl-main advances during the build. Blank on manual runs →
+          # checkout defaults to the triggering ref (hcl-main HEAD).
+          ref: ${{ inputs.deploy_ref }}
+          # Full history: deploy_ref is often a non-tip commit (hcl-main moved
+          # on during the build), and a depth-1 fetch of an arbitrary SHA only
+          # works if the server allows reachable-SHA-in-want. fetch-depth: 0
+          # fetches all refs so the build SHA is always reachable.
+          fetch-depth: 0
 
       - name: Add NATS Helm repo
         run: |
@@ -529,7 +551,7 @@ jobs:
           TAG=${{ steps.determine-tag.outputs.tag }}
           COMMIT_SHA=${{ github.sha }}
           SHORT_SHA=$(echo ${COMMIT_SHA} | cut -c1-7)
-          BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
+          BRANCH="${{ github.ref_name }}"
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           if [ "${{ job.status }}" = "success" ]; then
