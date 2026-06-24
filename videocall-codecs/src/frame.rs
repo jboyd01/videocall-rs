@@ -73,6 +73,9 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
     /// The timestamp of the frame.
     pub timestamp: f64,
+    /// Sender-side capture wall-clock (ms since UNIX epoch), or 0 when the publisher did not stamp it (#1656).
+    #[serde(default)]
+    pub capture_unix_ms: u64,
 }
 
 /// A wrapper for a `VideoFrame` that includes metadata used by the jitter buffer.
@@ -101,5 +104,13 @@ impl FrameBuffer {
 
     pub fn is_keyframe(&self) -> bool {
         self.frame.frame_type == FrameType::KeyFrame
+    }
+
+    /// Sender-side capture wall-clock (ms since UNIX epoch) of the wrapped frame,
+    /// or 0 when the publisher did not stamp it (#1656). Reads through to
+    /// `self.frame.capture_unix_ms`; the jitter buffer uses it for the
+    /// skew-resilient capture-age freshness trip.
+    pub fn capture_unix_ms(&self) -> u64 {
+        self.frame.capture_unix_ms
     }
 }

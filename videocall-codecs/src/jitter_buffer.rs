@@ -48,6 +48,55 @@ const MAX_PLAYOUT_DELAY_MS: f64 = 500.0;
 /// - This is a live videoconference: liveness beats completeness. ~1.8s is the boundary past which
 ///   continuing to drain buffered video does more harm (A/V desync, growing lag) than dropping it.
 const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
+
+/// Relative-lag threshold (ms) for the skew-cancelled capture-age freshness trip (#1656).
+///
+/// The existing freshness deadline (`MAX_PLAYOUT_AGE_MS`) trips on *arrival age* —
+/// `current_time - arrival_time_ms` — i.e. how long the head frame sat in THIS buffer. That misses
+/// the #1656 failure mode: a peer whose frames arrive on-time over the network but are intrinsically
+/// minutes old at the SOURCE (a stalled/looping capture, a wedged upstream encoder). Arrival age
+/// stays small, so the arrival deadline never fires, yet the viewer is watching old video.
+///
+/// The capture-age trip measures *source* lag instead: how far the head frame's capture wall-clock
+/// (`capture_unix_ms`, stamped by the sender) has fallen behind this peer's OWN best-case
+/// transit+skew baseline (`min_capture_offset_ms`). Chosen EQUAL to `MAX_PLAYOUT_AGE_MS` so the
+/// capture-age path and the arrival-age path declare "stale" at the same age budget — the only
+/// difference is WHICH age is measured (upstream/source residency vs local buffer residency).
+///
+/// This is the SOLE capture-age trip — there is deliberately NO raw `now - capture_unix_ms`
+/// absolute clock comparison. A raw absolute guard is structurally skew-SENSITIVE at *any*
+/// threshold: a sender whose clock is statically N seconds in the past (common on non-NTP machines,
+/// VMs, and manually-set phones — "real-world unsynced clocks are normal") sends perfectly FRESH
+/// live video, yet `now - capture` reads ~N seconds forever, so a raw absolute guard would trip on
+/// every tick and pin that healthy peer to a keyframe-only slideshow + spurious PLIs (it would
+/// WEDGE a healthy entity — see the CLAUDE.md hysteresis rule). A constant offset is *exactly* what
+/// the relative baseline cancels, so re-introducing an absolute comparison would re-introduce the
+/// skew sensitivity the whole design removes; raising the threshold does not fix it, it only moves
+/// the wedge to a larger-but-still-benign skew. The relative path is skew-safe by construction and
+/// catches the steady-state source lag this PR targets.
+///
+/// A late joiner whose lag GROWS after we first observe the stream is still covered by the relative
+/// path: as the played-out head falls further behind while the source keeps advancing its capture
+/// clock at real time, the head's `(now - capture_head) - min_offset` GROWS as a relative excursion
+/// and trips.
+///
+/// KNOWN LIMITATIONS (stated honestly — do not over-read this trip as "always catches up to real
+/// time"):
+/// 1. "Already-behind-on-join" blind spot. `min_capture_offset_ms` is the all-time MIN of
+///    `arrival - capture`. If the peer is ALREADY steadily N seconds behind at the very first sample
+///    we observe, that lag is baked into the baseline, so `relative_lag` reads ~0 and the trip never
+///    fires for that peer — it is indistinguishable from a constant clock skew, which is exactly the
+///    benign case we must NOT trip. Detecting an already-baked-in constant lag would require a true
+///    sender<->receiver clock sync (NTP / RTCP sender-report style), which this PR does not add.
+///    Known follow-up.
+/// 2. Receiver-side scope only. When this trip fires it can only drop what THIS jitter buffer holds —
+///    at most `MAX_BUFFER_SIZE` (200) frames (about 6.6s at 30fps). It corrects a receiver-side
+///    backlog and makes the source lag observable (`realtime_lag_ms`), but it cannot by itself undo
+///    minutes of UPSTREAM (sender/relay) staleness: if the source feeds intrinsically old frames at
+///    real-time cadence, skipping the local backlog lands on the freshest frame WE HAVE, which is
+///    still old. Fixing upstream staleness is out of scope for this receiver-side change.
+const MAX_CAPTURE_LAG_MS: f64 = 1800.0;
+
 /// *Base* (first-strike) interval between proactive keyframe requests fired by the
 /// keyframe-less eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST
 /// window (`KEYFRAME_REQUEST_WINDOW_MS`, ~1s) so the FIRST request of a stall emits at
@@ -296,6 +345,17 @@ pub struct FreshnessSkip {
     pub keyframe_seq: Option<u64>,
     /// Number of stale frames evicted in this skip.
     pub dropped: u64,
+    /// Skew-cancelled relative capture-lag (ms) at the moment of the skip when the CAPTURE-AGE
+    /// trip (issue #1656) is what tripped the deadline, else `None` (the skip was driven by the
+    /// arrival-age path #1020, or no capture wall-clock was present). Lets an in-process
+    /// `DiagEvent` consumer distinguish a capture-age-triggered skip from an arrival-age one.
+    ///
+    /// Kept INTERNAL to the in-process `FreshnessSkip` only: the worker→main `FreshnessSkipMessage`
+    /// and its `console_line` grep-contract (messages.rs) are deliberately NOT extended, the
+    /// lower-risk path — adding a token to the pinned console contract would churn the #1384 host
+    /// tests for no required field benefit (the issue's observable signal is the existing
+    /// `freshness_skip` event plus the new `realtime_lag_ms` metric).
+    pub capture_lag_ms: Option<f64>,
 }
 
 pub struct JitterBuffer<T> {
@@ -446,6 +506,31 @@ pub struct JitterBuffer<T> {
     /// Prometheus metric wired in a follow-up commit. Deliberately NOT reset by `flush()` — it
     /// is a cumulative metric, not runtime state.
     governor_skips: u64,
+
+    /// Capture-age trip (issue #1656): per-peer baseline = running ALL-TIME min over the stream of
+    /// `(arrival_time_ms as i128 - capture_unix_ms as i128)`. This cancels the constant part of
+    /// transit latency + clock skew between the sender and this receiver, leaving only the VARYING
+    /// source lag. `None` until the first frame carrying a nonzero `capture_unix_ms`. Reset on
+    /// `flush()` so a restarted stream (whose transit/skew may differ) re-baselines.
+    ///
+    /// `i128` (not `i64`): `capture_unix_ms` is a peer-controlled `u64`, so a malicious value near
+    /// `2^63` would overflow an `i64` subtraction and PANIC under overflow-checks builds (cargo
+    /// test, native bins). `u128` clock − `u64` capture both fit losslessly in `i128`, so the
+    /// subtraction is total; we narrow to `f64` only at the very end.
+    ///
+    /// Pure all-time min (no decay): a LATER source-lag excursion must be measured against the
+    /// EARLY best case, so the min must NOT re-baseline upward. The only cost is that a single
+    /// early-good sample pins the baseline for the stream's life, but that is the SAFE direction —
+    /// it can only make us MORE willing to declare lag, never less. The per-peer `flush()` on
+    /// stream restart bounds any pathological pin; there is no absolute clock guard to bound (the
+    /// relative path is the sole trip — see `MAX_CAPTURE_LAG_MS` for why no absolute comparison).
+    min_capture_offset_ms: Option<i128>,
+
+    /// Capture-age trip (issue #1656): most recent skew-cancelled relative capture-lag (ms),
+    /// recomputed on EVERY `enforce_freshness_deadline` tick (~10ms) and read at the 1Hz diagnostics
+    /// emit via [`JitterBuffer::realtime_lag_ms`]. Cached so the metric reports lag every poll, not
+    /// only on a trip. Initialized 0.0; reset on `flush()`.
+    last_capture_lag_ms: f64,
 }
 
 impl<T> JitterBuffer<T> {
@@ -483,6 +568,8 @@ impl<T> JitterBuffer<T> {
             governor_engaged: false,
             governor_last_skip_ms: None,
             governor_skips: 0,
+            min_capture_offset_ms: None,
+            last_capture_lag_ms: 0.0,
         }
     }
 
@@ -505,6 +592,14 @@ impl<T> JitterBuffer<T> {
         existing.head_age_ms = existing.head_age_ms.max(next.head_age_ms);
         existing.keyframe_seq = next.keyframe_seq;
         existing.dropped += next.dropped;
+        // Capture-lag (issue #1656): take the larger reported lag across the coalesced window, and
+        // let a present (capture-age) value win over absent (arrival-age only) so a coalesced batch
+        // that included a capture-age trip still surfaces the lag.
+        existing.capture_lag_ms = match (existing.capture_lag_ms, next.capture_lag_ms) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
         existing
     }
 
@@ -536,6 +631,27 @@ impl<T> JitterBuffer<T> {
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
         log::trace!("[JITTER_BUFFER] Inserting frame: {seq}");
+
+        // Capture-age baseline (issue #1656): fold this frame's
+        // `(arrival - capture)` offset into the per-peer running ALL-TIME min,
+        // which cancels the constant transit + constant clock-skew between the
+        // sender and this receiver. Done EARLY — before the old-frame / buffer-full
+        // rejection returns below — ON PURPOSE: the baseline must track the BEST
+        // CASE transit+skew regardless of whether this particular frame is
+        // ultimately buffered, and a frame rejected as "old" still carries a valid
+        // arrival/capture pair. Skip when the publisher did not stamp a capture
+        // wall-clock (0 = no signal); never let a missing value disturb the
+        // baseline.
+        if frame.capture_unix_ms != 0 {
+            // i128: `capture_unix_ms` is a peer-controlled u64; near 2^63 an `as i64`
+            // subtraction would overflow/panic under overflow-checks builds. u128 − u64
+            // both fit losslessly in i128, so the subtraction is total.
+            let offset = arrival_time_ms as i128 - frame.capture_unix_ms as i128;
+            self.min_capture_offset_ms = Some(match self.min_capture_offset_ms {
+                Some(existing) => existing.min(offset),
+                None => offset,
+            });
+        }
 
         // Issue #1479: ANY keyframe arrival (even an old/duplicate one) clears the proactive-PLI
         // gate. Placed before old-frame rejection because the gate is about "did the publisher
@@ -847,6 +963,74 @@ impl<T> JitterBuffer<T> {
         self.decoder.reset();
     }
 
+    /// Skew-cancelled relative capture-lag (ms) of the given head frame (issue #1656).
+    ///
+    /// Returns how far this peer's head frame has fallen behind its OWN best-case transit+skew
+    /// baseline:
+    ///
+    /// ```text
+    /// relative_lag = (now - head.capture_unix_ms) - min_capture_offset_ms
+    /// ```
+    ///
+    /// Subtracting `min_capture_offset_ms` (the all-time min of `arrival - capture`) cancels the
+    /// constant part of network transit AND any constant clock skew between the sender and this
+    /// receiver, so the result is purely the VARYING source lag — robust to a wrong-but-constant
+    /// sender clock. Clamped to `>= 0.0`.
+    ///
+    /// Returns `None` (no capture-age signal → arrival-based deadline only; NEVER trip capture-age
+    /// on missing data) when:
+    /// - the publisher did not stamp a capture wall-clock (`capture_unix_ms == 0`), or
+    /// - the capture time is implausibly far in the FUTURE relative to `now` (more than a small
+    ///   slack). A far-future capture time would make `now - capture` negative → clamp to 0 → the
+    ///   peer would look perpetually fresh. We reject it here so a buggy/forward-skewed clock simply
+    ///   falls back to the arrival deadline rather than silently disabling the trip.
+    ///
+    /// Abuse analysis (issue #1656). `capture_unix_ms` lives INSIDE the E2EE MediaPacket, so the
+    /// relay cannot forge it; but the sending PEER can lie. The relative-only trip bounds both lies
+    /// to that peer's OWN tile (no cross-peer or global impact):
+    /// - Far-FUTURE capture time → `now - capture` negative → clamp to 0 → "perpetually fresh".
+    ///   This only fails OPEN for that peer's own tile (we just don't trip capture-age on it).
+    ///   Handled here by returning `None` on an implausibly far-future capture (it would otherwise
+    ///   silently pin the relative lag at 0 forever); past the slack we fall back to the arrival
+    ///   deadline.
+    /// - Far-PAST capture time → its large `arrival - capture` offset just RAISES this peer's own
+    ///   `min_capture_offset_ms` baseline, which SUPPRESSES the relative trip for that peer (the lag
+    ///   is baked into the baseline and cancels). So a far-past lie is self-harming only in that it
+    ///   can hide the lie's own slideshow — still bounded to that peer's tile, never tripping any
+    ///   other peer or global state. (There is no absolute clock guard for a malicious far-past
+    ///   value to weaponize — see `MAX_CAPTURE_LAG_MS` for why the design omits it.)
+    ///
+    /// Takes `capture_unix_ms` by value (not the whole `FrameBuffer`) so the caller need not clone
+    /// the head frame — a per-tick clone of the full encoded `data` would be tens of KB of pointless
+    /// allocator churn (issue #1656 perf review).
+    fn capture_lag_ms(&self, current_time_ms: u128, capture_unix_ms: u64) -> Option<f64> {
+        if capture_unix_ms == 0 {
+            return None;
+        }
+        // Reject an implausibly far-future capture time (peer clock skewed forward, or a lie aimed
+        // at "looks perpetually fresh"). Small slack tolerates benign clock jitter; beyond it we
+        // fall back to the arrival deadline by returning None.
+        //
+        // i128: `capture_unix_ms` is a peer-controlled u64; near 2^63 an `as i64` subtraction would
+        // overflow/panic under overflow-checks builds. u128 − u64 both fit losslessly in i128.
+        const FUTURE_SLACK_MS: i128 = 2000;
+        let delta = current_time_ms as i128 - capture_unix_ms as i128;
+        if delta < -FUTURE_SLACK_MS {
+            return None;
+        }
+        let baseline = self.min_capture_offset_ms.unwrap_or(0);
+        let relative_lag = (delta - baseline) as f64;
+        Some(relative_lag.max(0.0))
+    }
+
+    /// Most recent skew-resilient relative capture-lag (ms) sampled by the capture-age trip
+    /// (issue #1656). Updated on every `enforce_freshness_deadline` tick (~10ms) and read at the
+    /// 1Hz diagnostics emit (`realtime_lag_ms` metric). Sampled at tick cadence, read at emit
+    /// cadence.
+    pub fn realtime_lag_ms(&self) -> f64 {
+        self.last_capture_lag_ms
+    }
+
     /// Freshness-deadline enforcement (issue #1020).
     ///
     /// Returns `true` if the head-of-line backlog is stale and the buffer state was advanced so
@@ -890,16 +1074,39 @@ impl<T> JitterBuffer<T> {
             return false; // Empty buffer — nothing can be stale.
         };
 
-        let head_age_ms = {
-            let frame = match self.buffered_frames.get(&head_key) {
-                Some(f) => f,
-                None => return false,
-            };
-            current_time_ms.saturating_sub(frame.arrival_time_ms) as f64
+        // Extract ONLY the two scalars we need from the head frame inside the borrow, then drop it.
+        // We must NOT clone the whole `FrameBuffer` here — it owns the full encoded `data` (`Vec<u8>`,
+        // tens of KB), and this runs every ~10ms tick per stream, so a clone would be megabytes/sec
+        // of pointless allocator churn in a multi-peer call just to read 2 scalars (issue #1656 perf
+        // review). Copying the scalars also frees the `&self.buffered_frames` borrow so the later
+        // `&mut self` skip/evict paths are unobstructed.
+        let (head_arrival_ms, head_capture_unix_ms) = match self.buffered_frames.get(&head_key) {
+            Some(f) => (f.arrival_time_ms, f.capture_unix_ms()),
+            None => return false,
         };
 
-        if head_age_ms < MAX_PLAYOUT_AGE_MS {
-            // Within freshness bounds — normal jitter handling is byte-for-byte unaffected.
+        // (1) Arrival-based age (issue #1020): how long the head sat in THIS buffer.
+        let head_age_ms = current_time_ms.saturating_sub(head_arrival_ms) as f64;
+
+        // (2) Capture-age trip (issue #1656): catch intrinsically-stale frames that arrive on-time
+        // but are old at SOURCE — arrival age stays small so #1020's deadline never sees them.
+        // `relative_lag` is the skew-cancelled "how far this peer fell behind its OWN best case".
+        // There is deliberately NO raw `now - capture` absolute guard: a constant clock skew (common
+        // on non-NTP senders) would trip it forever and wedge a healthy peer — see `MAX_CAPTURE_LAG_MS`.
+        // The capture-age path NEVER trips on missing data: a 0 capture wall-clock yields
+        // `relative_lag == None`, so older publishers are unaffected.
+        let relative_lag = self.capture_lag_ms(current_time_ms, head_capture_unix_ms);
+        // Cache the relative lag for the 1Hz `realtime_lag_ms` diagnostics metric on EVERY tick
+        // (this method runs each ~10ms `find_and_move_continuous_frames` poll), not only on a trip,
+        // so the metric reports current source-lag continuously. None (no signal) reports as 0.0.
+        self.last_capture_lag_ms = relative_lag.unwrap_or(0.0);
+
+        let capture_trips = relative_lag.is_some_and(|l| l >= MAX_CAPTURE_LAG_MS);
+
+        if head_age_ms < MAX_PLAYOUT_AGE_MS && !capture_trips {
+            // Within BOTH freshness bounds — normal jitter handling is byte-for-byte unaffected.
+            // The arrival-age path catches local stalls; the capture-age path catches upstream /
+            // steady-state source lag. We only fall through to recovery when at least one trips.
             return false;
         }
 
@@ -938,12 +1145,16 @@ impl<T> JitterBuffer<T> {
                         "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms >= {MAX_PLAYOUT_AGE_MS:.0}ms). Skipped to live keyframe {keyframe_seq}, dropped {dropped} stale frame(s)."
                     );
                     // Surface the skip for field-log visibility (#1045); the worker forwards it.
+                    // #1656: tag the capture-relative lag iff the capture-age path is what tripped
+                    // the deadline, so an in-process DiagEvent consumer can tell capture-age skips
+                    // from arrival-age ones.
                     self.record_freshness_skip(
                         current_time_ms,
                         FreshnessSkip {
                             head_age_ms,
                             keyframe_seq: Some(keyframe_seq),
                             dropped,
+                            capture_lag_ms: if capture_trips { relative_lag } else { None },
                         },
                     );
                     true
@@ -971,12 +1182,14 @@ impl<T> JitterBuffer<T> {
                 );
                 // Surface the skip for field-log visibility (#1045); the worker forwards it.
                 // `keyframe_seq: None` marks the keyframe-less (held last-good) case.
+                // #1656: tag the capture-relative lag iff the capture-age path tripped.
                 self.record_freshness_skip(
                     current_time_ms,
                     FreshnessSkip {
                         head_age_ms,
                         keyframe_seq: None,
                         dropped,
+                        capture_lag_ms: if capture_trips { relative_lag } else { None },
                     },
                 );
                 // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
@@ -1247,6 +1460,12 @@ impl<T> JitterBuffer<T> {
         self.governor_sustain_ticks = 0;
         self.governor_engaged = false;
         self.governor_last_skip_ms = None;
+        // Reset the capture-age baseline (issue #1656) so a restarted stream re-baselines its
+        // transit+skew from scratch — a restart (camera switch / reconnect) may change both the
+        // network transit and the sender's clock offset, so inheriting the old min would mismeasure
+        // source lag. The cached relative-lag metric resets too.
+        self.min_capture_offset_ms = None;
+        self.last_capture_lag_ms = 0.0;
         // Consider resetting jitter estimator as well if needed
         self.jitter_estimator = JitterEstimator::new();
     }
@@ -1505,6 +1724,27 @@ mod tests {
             codec: crate::frame::FrameCodec::default(),
             data: vec![0; 10],
             timestamp: 0.0,
+            // #1656: 0 = no capture-age signal. All existing freshness tests use
+            // this builder, so capture_lag_ms returns None for them and they are
+            // unaffected by the new capture-age trip (arrival-based only).
+            capture_unix_ms: 0,
+        }
+    }
+
+    /// Like [`create_test_frame`] but stamps a sender-side capture wall-clock
+    /// (#1656) so a test can drive the skew-resilient capture-age freshness trip.
+    fn create_test_frame_with_capture(
+        seq: u64,
+        frame_type: FrameType,
+        capture_unix_ms: u64,
+    ) -> VideoFrame {
+        VideoFrame {
+            sequence_number: seq,
+            frame_type,
+            codec: crate::frame::FrameCodec::default(),
+            data: vec![0; 10],
+            timestamp: 0.0,
+            capture_unix_ms,
         }
     }
 
@@ -2640,6 +2880,210 @@ mod tests {
         assert_eq!(queue[2].sequence_number, 3);
         // Nothing dropped by the deadline.
         assert_eq!(jb.get_dropped_frames_count(), 0);
+    }
+
+    /// Issue #1656: the skew-resilient CAPTURE-AGE catch-up trips on a peer whose frames arrive
+    /// on-time (small arrival age — the #1020 arrival deadline NEVER fires) but are intrinsically
+    /// stale at the SOURCE (the head frame's capture wall-clock fell far behind this peer's own
+    /// best-case baseline).
+    ///
+    /// Construction (per #1656 design):
+    /// - Frame 1 (keyframe) carries capture == arrival (offset 0), establishing
+    ///   `min_capture_offset_ms ≈ 0` — the EARLY good baseline. It is decoded so we are mid-stream.
+    /// - The head delta (seq 2) arrives FRESH (arrival = now-100 → arrival age 100ms, far under
+    ///   MAX_PLAYOUT_AGE_MS) but its capture wall-clock is back-dated 2000ms, so
+    ///   `relative_lag = (now - capture_2) - baseline ≈ 2000 - 0 = 2000 >= MAX_CAPTURE_LAG_MS`.
+    ///   This is the skew-resilient-positive excursion: keeping capture uniformly back-dated would
+    ///   bake the lag into the baseline and cancel it (relative_lag ≈ 0) — the whole point of skew
+    ///   resilience — so the lag must appear as a LATER excursion vs the EARLY best case.
+    /// - A fresh keyframe (seq 5) is buffered so the has-keyframe skip-to-live branch fires and the
+    ///   stale head is dropped.
+    ///
+    /// FAILS-ON-REVERT: on the un-fixed arrival-only code, `head_age_ms` (100ms) < 1800ms so
+    /// `enforce_freshness_deadline` returns `false` immediately, NOTHING is dropped, and
+    /// `get_dropped_frames_count()` stays 0 → the assertions below fail. The capture-age OR-trip is
+    /// the only thing that makes a steadily-arriving-but-source-stale backlog drop.
+    #[test]
+    fn capture_age_catch_up_trips_on_source_stale_steady_arrival() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+
+        // ONE wall-clock epoch shared by arrival, capture, and the poll time — matching production,
+        // where `arrival_time_ms` (Date::now at receive) and `capture_unix_ms` (Date.now at the
+        // sender) are both ms since the UNIX epoch. (Mixing a small arrival origin with a real epoch
+        // capture would make `now - capture` hugely negative and fall into the future-slack guard.)
+        let base: u128 = 1_700_000_000_000;
+
+        // Frame 1 (keyframe): capture == arrival → offset 0, the EARLY good baseline. Decode it so
+        // we become mid-stream (last_decoded = 1).
+        jb.insert_frame(
+            create_test_frame_with_capture(1, FrameType::KeyFrame, base as u64),
+            base,
+        );
+        // Advance past the playout delay to release frame 1 (still a tiny arrival age).
+        jb.find_and_move_continuous_frames(base + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        decoded_frames.lock().unwrap().clear();
+
+        // Poll time: far enough after base that frame 1's arrival is old, but we keep the seq-2/5
+        // ARRIVALS tight to `now` so the arrival deadline never trips for the head.
+        let now: u128 = base + 10_000;
+
+        // A fresh keyframe (seq 5) to skip TO, inserted FIRST while it is fresh so its own
+        // end-of-insert poll does not trip. Capture ≈ now so it is not source-stale; its offset
+        // (arrival - capture ≈ 0) does not disturb the baseline downward. Arrival is `now - 100`
+        // (NOT later than any poll's `current_time_ms`) so the release gate's plain
+        // `current_time - arrival` subtraction never underflows.
+        let keyframe_capture = (now - 100) as u64;
+        jb.insert_frame(
+            create_test_frame_with_capture(5, FrameType::KeyFrame, keyframe_capture),
+            now - 100,
+        );
+
+        // Baseline drop count captured BEFORE the stale head arrives, so the delta counts the
+        // capture-age eviction that fires inside `insert_frame(2)`'s own end-of-insert poll (the
+        // production code polls on every insert), not only a separate explicit poll.
+        let dropped_before = jb.get_dropped_frames_count();
+
+        // Head delta (seq 2): FRESH arrival (age 100ms << 1800ms) but capture back-dated 2000ms from
+        // `now`. arrival - capture is large positive, so it does NOT lower the all-time-min baseline
+        // (which stays ≈ 0 from frame 1). Inserting it runs an end-of-insert poll at `now - 100`
+        // where head=seq 2: relative_lag = (now-100 - capture_2) - 0 ≈ 1900 >= MAX_CAPTURE_LAG_MS,
+        // while head_age (arrival) ≈ 0. With keyframe 5 buffered, the has-keyframe skip-to-live
+        // branch drops seq 2.
+        let head_capture = (now - 2000) as u64;
+        jb.insert_frame(
+            create_test_frame_with_capture(2, FrameType::DeltaFrame, head_capture),
+            now - 100,
+        );
+
+        // A final explicit poll for parity with the other freshness tests; seq 2 is already gone, so
+        // this is a no-op for the drop count.
+        jb.find_and_move_continuous_frames(now);
+
+        // The capture-age trip fired: the stale head was skipped past to the newest buffered
+        // keyframe, so at least one frame was dropped and a FreshnessSkip was recorded with the
+        // capture-lag tagged (distinguishing it from an arrival-age skip).
+        assert!(
+            jb.get_dropped_frames_count() > dropped_before,
+            "capture-age catch-up must drop the source-stale head even though its arrival age is well under MAX_PLAYOUT_AGE_MS (#1656)"
+        );
+        let skip = jb
+            .take_freshness_skip()
+            .expect("a capture-age trip must record a FreshnessSkip (#1656)");
+        assert!(
+            skip.capture_lag_ms.is_some_and(|l| l >= MAX_CAPTURE_LAG_MS),
+            "the recorded skip must carry the capture-relative lag (>= MAX_CAPTURE_LAG_MS) so a capture-age skip is distinguishable from an arrival-age one: {skip:?}"
+        );
+    }
+
+    /// Issue #1656 (FIX 1): a HEALTHY peer whose clock is statically back-skewed (here 6000ms, e.g.
+    /// a non-NTP machine / VM / manually-set phone) but is sending FRESH live video must NOT be
+    /// tripped. Its constant skew is exactly what `min_capture_offset_ms` cancels, so `relative_lag`
+    /// stays ≈ 0 (the per-frame capture lag never GROWS vs the baseline) — nothing is dropped.
+    ///
+    /// FAILS-ON-REVERT: re-introducing the deleted raw absolute guard
+    /// (`absolute_lag = now - capture >= MAX_ABSOLUTE_CAPTURE_LAG_MS`, old 5000ms) would compute
+    /// `absolute_lag ≈ 6100 >= 5000` on every tick and trip the capture-age path → the head is
+    /// skipped to keyframe-only and `get_dropped_frames_count()` rises → these assertions fail. Only
+    /// the relative-only `capture_trips` (post-FIX-1) leaves this peer alone.
+    #[test]
+    fn capture_age_does_not_trip_on_constant_clock_skew_with_fresh_video() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+
+        // ONE wall-clock epoch shared by arrival, capture, and the poll time (production: both
+        // arrival_time_ms and capture_unix_ms are ms since the UNIX epoch).
+        let base: u128 = 1_700_000_000_000;
+        const SKEW_MS: u128 = 6000; // constant back-skew: capture is always 6000ms behind arrival.
+
+        // Frame 1 (keyframe): FRESH (capture = arrival - SKEW). Establishes baseline ≈ SKEW. Decode
+        // it so we are mid-stream.
+        jb.insert_frame(
+            create_test_frame_with_capture(1, FrameType::KeyFrame, (base - SKEW_MS) as u64),
+            base,
+        );
+        jb.find_and_move_continuous_frames(base + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        decoded_frames.lock().unwrap().clear();
+
+        // Poll time and the fresh-but-skewed frames. Keep arrivals at `now - 100` (NOT later than any
+        // poll's current_time, so the release gate's plain subtraction never underflows). Each
+        // frame's capture is its arrival minus the SAME constant skew → relative_lag ≈ 100ms << 1800.
+        let now: u128 = base + 10_000;
+        let dropped_before = jb.get_dropped_frames_count();
+
+        // Several contiguous FRESH delta frames, plus a fresh keyframe — exactly the inputs that the
+        // (deleted) absolute guard would have wrongly tripped on. On the relative-only path none of
+        // these trips, so the stream plays through and nothing is dropped.
+        for seq in 2..=4u64 {
+            let arrival = now - 100;
+            jb.insert_frame(
+                create_test_frame_with_capture(
+                    seq,
+                    FrameType::DeltaFrame,
+                    (arrival - SKEW_MS) as u64,
+                ),
+                arrival,
+            );
+        }
+        let kf_arrival = now - 100;
+        jb.insert_frame(
+            create_test_frame_with_capture(5, FrameType::KeyFrame, (kf_arrival - SKEW_MS) as u64),
+            kf_arrival,
+        );
+        jb.find_and_move_continuous_frames(now);
+
+        assert_eq!(
+            jb.get_dropped_frames_count(),
+            dropped_before,
+            "a healthy peer with a CONSTANT clock skew sending fresh video must NOT be tripped by the capture-age path (#1656 FIX 1): the skew is cancelled by the baseline"
+        );
+        assert!(
+            jb.take_freshness_skip().is_none(),
+            "no freshness skip should be recorded for a constant-skew fresh peer (#1656 FIX 1)"
+        );
+    }
+
+    /// Issue #1656 (FIX 3): a peer-controlled `capture_unix_ms` near `2^63` (here `i64::MIN as u64`)
+    /// must not panic. The old `as i64` subtraction (`now as i64 - (i64::MIN)`) overflows and PANICS
+    /// under overflow-checks builds (cargo test, native bins); the i128 path is total. The huge
+    /// negative delta is far past the future-slack, so `capture_lag_ms` returns `None` → no trip, no
+    /// drop (the sane/clamped result).
+    #[test]
+    fn capture_age_handles_u64_capture_near_i64_overflow_without_panic() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let base: u128 = 1_700_000_000_000;
+
+        // Decode a normal keyframe so we are mid-stream.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), base);
+        jb.find_and_move_continuous_frames(base + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        decoded_frames.lock().unwrap().clear();
+
+        let now: u128 = base + 10_000;
+        let dropped_before = jb.get_dropped_frames_count();
+
+        // Malicious capture value at 2^63. `insert_frame`'s baseline (`arrival as i128 - capture`)
+        // and the end-of-insert poll's `capture_lag_ms` (`now as i128 - capture`) must both stay
+        // total and NOT panic. Inserting a head delta runs the poll at `now - 100`.
+        let evil_capture = i64::MIN as u64; // == 2^63
+        jb.insert_frame(
+            create_test_frame_with_capture(2, FrameType::DeltaFrame, evil_capture),
+            now - 100,
+        );
+        // An explicit poll for good measure — also must not panic.
+        jb.find_and_move_continuous_frames(now);
+
+        // The implausible (effectively far-future) capture is rejected by the future-slack guard, so
+        // the capture-age path returns None: no trip, no drop. Reaching here at all proves no panic.
+        assert_eq!(
+            jb.get_dropped_frames_count(),
+            dropped_before,
+            "an out-of-range capture_unix_ms must yield a None capture-lag (no trip), not a panic or spurious drop (#1656 FIX 3)"
+        );
+        assert!(
+            jb.take_freshness_skip().is_none(),
+            "no freshness skip for an out-of-range capture value (#1656 FIX 3)"
+        );
     }
 
     /// A frame sitting just under the deadline is still released normally (boundary check).

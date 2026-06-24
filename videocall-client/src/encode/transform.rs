@@ -43,17 +43,26 @@ pub fn buffer_to_uint8array(buf: &mut [u8]) -> Uint8Array {
 /// from receiver diagnostics — is host-testable off-wasm. The codec is passed
 /// in (rather than read via the browser-only `get_video_codec()`) so the helper
 /// stays host-safe; the production caller passes `get_video_codec().into()`.
+///
+/// `capture_unix_ms` (#1656) is the sender-side capture wall-clock time
+/// (`Date.now()`, ms since UNIX epoch). It is passed IN rather than read from a
+/// clock inside the helper so the helper stays pure/host-testable; the
+/// production caller passes `js_sys::Date::now() as u64`. Pass `0` when unknown
+/// — proto3 default-zero makes it wire-absent and the receiver treats 0 as "no
+/// capture-age signal".
 fn build_camera_video_metadata(
     sequence: u64,
     codec: protobuf::EnumOrUnknown<VideoCodec>,
     source_width: u32,
     source_height: u32,
+    capture_unix_ms: u64,
 ) -> VideoMetadata {
     VideoMetadata {
         sequence,
         codec,
         source_width,
         source_height,
+        capture_unix_ms,
         ..Default::default()
     }
 }
@@ -94,6 +103,11 @@ pub fn transform_video_chunk(
             get_video_codec().into(),
             source_width,
             source_height,
+            // #1656: stamp the sender-side capture wall-clock so the receiver's
+            // jitter buffer can detect intrinsically-stale frames that arrive
+            // on-time but are minutes old at source. `Date::now()` is ms since
+            // UNIX epoch as f64; cast to u64.
+            js_sys::Date::now() as u64,
         ))
         .into(),
         ..Default::default()
@@ -168,6 +182,10 @@ pub fn transform_screen_chunk(
             encoder_target_bitrate_kbps,
             adaptive_tier,
             cause_hint,
+            // #1656: stamp the sender-side capture wall-clock (ms since UNIX
+            // epoch) so the receiver's jitter buffer can detect intrinsically-
+            // stale screen frames that arrive on-time but are old at source.
+            capture_unix_ms: js_sys::Date::now() as u64,
             ..Default::default()
         })
         .into(),
@@ -310,6 +328,7 @@ mod tests {
             VideoCodec::VP9_PROFILE0_LEVEL10_8BIT.into(),
             640,
             480,
+            1_700_000_000_000,
         );
         assert_eq!(meta.sequence, 7);
         assert_eq!(meta.source_width, 640);
@@ -320,19 +339,49 @@ mod tests {
         let parsed = VideoMetadata::parse_from_bytes(&bytes).unwrap();
         assert_eq!(parsed.source_width, 640);
         assert_eq!(parsed.source_height, 480);
+        // #1656: the capture wall-clock round-trips through the wire too.
+        assert_eq!(parsed.capture_unix_ms, 1_700_000_000_000);
     }
 
-    /// Unknown source dims (0/0) must serialize as proto3 default-absent, so a
-    /// publisher that doesn't know its capture size is wire-identical to the
-    /// pre-#1196 emitter (no new bytes on the common path).
+    /// Issue #1656: the camera helper stamps the sender-side capture wall-clock
+    /// and it round-trips through protobuf. Drives the SAME
+    /// `build_camera_video_metadata` helper the production `transform_video_chunk`
+    /// calls, so dropping the field in the helper fails this test.
+    #[test]
+    fn camera_video_metadata_carries_capture_unix_ms() {
+        let capture = 1_700_000_123_456u64;
+        let meta = super::build_camera_video_metadata(
+            9,
+            VideoCodec::VP9_PROFILE0_LEVEL10_8BIT.into(),
+            1280,
+            720,
+            capture,
+        );
+        assert_eq!(meta.capture_unix_ms, capture);
+
+        let bytes = meta.write_to_bytes().unwrap();
+        let parsed = VideoMetadata::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            parsed.capture_unix_ms, capture,
+            "capture_unix_ms must round-trip through the wire (#1656)"
+        );
+    }
+
+    /// Unknown source dims (0/0) AND an unset capture wall-clock (0) must
+    /// serialize as proto3 default-absent, so a publisher that doesn't know its
+    /// capture size — or an older publisher that never stamps capture_unix_ms
+    /// (#1656) — is wire-identical to the pre-#1196 emitter (no new bytes on the
+    /// common path). `capture_unix_ms = 0` is the load-bearing #1656 case: the
+    /// receiver MUST treat 0 as "no capture-age signal", which requires it to be
+    /// wire-absent.
     #[test]
     fn camera_video_metadata_zero_dims_are_wire_absent() {
-        let with_zero = super::build_camera_video_metadata(0, Default::default(), 0, 0);
+        let with_zero = super::build_camera_video_metadata(0, Default::default(), 0, 0, 0);
         let baseline = VideoMetadata::default();
         assert_eq!(
             with_zero.write_to_bytes().unwrap(),
             baseline.write_to_bytes().unwrap(),
-            "0/0 source dims must be byte-identical to a metadata that never set them"
+            "0/0 source dims + 0 capture_unix_ms must be byte-identical to a metadata that never set them"
         );
     }
 }

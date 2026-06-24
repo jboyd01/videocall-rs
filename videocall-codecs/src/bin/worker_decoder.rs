@@ -397,6 +397,16 @@ thread_local! {
     /// `console::*` for internal errors — this flag is belt-and-suspenders against any
     /// future change that introduces a nested record.
     static WORKER_LOG_IN_LOG: Cell<bool> = const { Cell::new(false) };
+    /// `FRAMES_EMITTED` snapshot at the previous 1Hz diagnostics emit, used to derive the TRUE
+    /// painted-frame fps (`fps_painted`, issue #1656). `fps_painted` counts frames actually RELEASED
+    /// to the renderer (`FRAMES_EMITTED`, incremented per decoded frame posted to main) per
+    /// wall-second — distinct from `fps_received` (decode-call count), which reads ~30 even during a
+    /// freeze. `wrapping_sub` against this snapshot guards a counter reset.
+    static LAST_FPS_PAINTED_FRAMES: Cell<u64> = const { Cell::new(0) };
+    /// `Date::now()` (ms) at the previous 1Hz emit that sampled `fps_painted` (issue #1656). The
+    /// fps is `(frames_now - prev_frames) * 1000 / (now - prev_ms)`. `0.0` until the first emit, in
+    /// which case `fps_painted` reports `0.0` (no interval to divide by yet).
+    static LAST_FPS_PAINTED_MS: Cell<f64> = const { Cell::new(0.0) };
 }
 
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
@@ -510,6 +520,9 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
                 codec: frame.frame.codec,
                 data: frame.frame.data.clone(),
                 timestamp: frame.frame.timestamp,
+                // #1656: preserve the sender-side capture wall-clock so the
+                // jitter buffer's capture-age trip can read it.
+                capture_unix_ms: frame.frame.capture_unix_ms,
             };
 
             // Get current time in milliseconds
@@ -549,6 +562,9 @@ fn inject_stale_frame_to_jitter_buffer(frame: FrameBuffer) {
                 codec: frame.frame.codec,
                 data: frame.frame.data.clone(),
                 timestamp: frame.frame.timestamp,
+                // #1656: preserve the caller-supplied capture wall-clock (the
+                // InjectStaleFrame test path may craft a back-dated value).
+                capture_unix_ms: frame.frame.capture_unix_ms,
             };
             // Use the caller-supplied (back-dated) arrival time, NOT Date::now().
             jb.insert_frame(video_frame, arrival_time_ms);
@@ -648,6 +664,37 @@ fn check_jitter_buffer_for_ready_frames() {
                                     // governor fired in the field.
                                     let playout_skip_to_live_total = jb.governor_skip_count();
 
+                                    // Skew-resilient relative capture-lag (issue #1656): how far
+                                    // this peer's video is behind its own best-case source cadence,
+                                    // sampled by the capture-age trip every ~10ms tick and read here
+                                    // at the 1Hz emit. Reports source/upstream lag that the
+                                    // arrival-based playout-latency metric cannot see (frames that
+                                    // arrive on-time but are old at the source).
+                                    let realtime_lag_ms = jb.realtime_lag_ms();
+
+                                    // TRUE painted-frame fps (issue #1656): frames actually RELEASED
+                                    // to the renderer (FRAMES_EMITTED, posted to main per decoded
+                                    // frame) per wall-second. Distinct from `fps_received`
+                                    // (decode-call count), which reads ~30 even during a freeze
+                                    // because the decode loop keeps being called — see
+                                    // peer_decode_manager.rs. `wrapping_sub` guards a counter reset;
+                                    // `dt`/`prev_ms` guards divide-by-zero and the very first emit.
+                                    let fps_painted = {
+                                        let frames_now = FRAMES_EMITTED.with(|c| c.get());
+                                        let prev_frames = LAST_FPS_PAINTED_FRAMES.with(|c| c.get());
+                                        let prev_ms = LAST_FPS_PAINTED_MS.with(|c| c.get());
+                                        let dt = now - prev_ms;
+                                        let fps = if prev_ms > 0.0 && dt > 0.0 {
+                                            (frames_now.wrapping_sub(prev_frames) as f64) * 1000.0
+                                                / dt
+                                        } else {
+                                            0.0
+                                        };
+                                        LAST_FPS_PAINTED_FRAMES.with(|c| c.set(frames_now));
+                                        LAST_FPS_PAINTED_MS.with(|c| c.set(now));
+                                        fps
+                                    };
+
                                     let evt = DiagEvent {
                                         subsystem: "video",
                                         stream_id: None,
@@ -666,6 +713,9 @@ fn check_jitter_buffer_for_ready_frames() {
                                                 "playout_skip_to_live_total",
                                                 playout_skip_to_live_total
                                             ),
+                                            // #1656: source/upstream lag + true painted cadence.
+                                            metric!("realtime_lag_ms", realtime_lag_ms),
+                                            metric!("fps_painted", fps_painted),
                                         ],
                                     };
                                     let _ = global_sender().try_broadcast(evt);

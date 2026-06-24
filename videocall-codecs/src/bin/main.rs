@@ -53,6 +53,7 @@ fn main() {
                 frame_type: FrameType::KeyFrame,
                 data: vec![0; 1000],
                 timestamp: 0.0,
+                capture_unix_ms: 0,
             });
             sequence_number += 1;
 
@@ -62,6 +63,7 @@ fn main() {
                     frame_type: FrameType::DeltaFrame,
                     data: vec![0; 200],
                     timestamp: 0.0,
+                    capture_unix_ms: 0,
                 });
                 sequence_number += 1;
             }

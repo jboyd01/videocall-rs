@@ -765,6 +765,11 @@ impl PeerDecode for VideoPeerDecoder {
                 frame_type: self.get_frame_type(packet),
                 codec: frame_codec,
                 data: packet.data.clone(),
+                // #1656: carry the sender-side capture wall-clock from the
+                // protobuf VideoMetadata into the codecs VideoFrame so the
+                // jitter buffer's skew-resilient capture-age freshness trip can
+                // read it. 0 when the publisher did not stamp it (older clients).
+                capture_unix_ms: video_metadata.capture_unix_ms,
             };
 
             // Create a FrameBuffer and push it to the decoder

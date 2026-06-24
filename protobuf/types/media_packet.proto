@@ -78,6 +78,17 @@ message VideoMetadata {
   // "manual-cap", or "" when no constraint is engaged. Kept as a free-form
   // string so new causes can be added without a wire-format break.
   string cause_hint = 7;
+  // Sender-side capture wall-clock time (ms since UNIX epoch, Date.now()) of the
+  // frame, used by the receiver's jitter buffer to detect intrinsically-stale
+  // frames that arrive on-time but are minutes old at source (#1656). Distinct
+  // from `MediaPacket.timestamp` (WebCodecs media-time microseconds on a
+  // per-track origin), which does NOT carry wall-clock. Optional: proto3
+  // default-zero (0) means "unknown / not sent" — older publishers omit it and
+  // receivers MUST treat 0 as absent (no capture-age signal). Peer-controlled
+  // value (inside the E2EE packet): the relay cannot forge it, but the sending
+  // peer can lie; the receiver clamps/sanity-ranges it and bounds blast radius
+  // to that peer's own tile (see jitter_buffer capture-age logic).
+  uint64 capture_unix_ms = 8;
 }
 
 // Video codec enum with profile/level details for scalability.
