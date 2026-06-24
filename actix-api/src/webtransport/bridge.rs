@@ -311,6 +311,16 @@ impl WebTransportBridge {
         join_set.spawn(async move {
             let mut persistent_stream: Option<web_transport_quinn::SendStream> = None;
 
+            // Backpressure poll ticker, constructed ONCE for the lifetime of this
+            // writer task and reused across every frame. The per-frame shed helper
+            // borrows it mutably and `reset()`s it at the start of each call, so a
+            // frame that writes promptly allocates no timer (recovering the prior
+            // `tokio::time::timeout` design's zero-alloc-on-success property). The
+            // shed accumulator is per-call and local to the helper, so sharing this
+            // ticker carries no stall state between frames (see
+            // `write_framed_with_backpressure_shed`).
+            let mut backpressure_ticker = tokio::time::interval(WT_UNISTREAM_BACKPRESSURE_POLL);
+
             while let Some(data) = unistream_rx.recv().await {
                 // Ensure we have a stream, opening one if needed.
                 if persistent_stream.is_none() {
@@ -346,9 +356,14 @@ impl WebTransportBridge {
                 // immutably for the depth probe — disjoint from the `&mut stream`
                 // borrowed by the write future.
                 let stream = persistent_stream.as_mut().expect("stream was just opened");
-                let shed_reason =
-                    write_framed_with_backpressure_shed(stream, &len_header, &data, &unistream_rx)
-                        .await;
+                let shed_reason = write_framed_with_backpressure_shed(
+                    stream,
+                    &len_header,
+                    &data,
+                    &unistream_rx,
+                    &mut backpressure_ticker,
+                )
+                .await;
 
                 if let Some(reason) = shed_reason {
                     RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL
@@ -479,13 +494,25 @@ fn channel_is_backed_up(depth: usize, max_capacity: usize) -> bool {
 ///   how long one wedged receiver can hold the channel full.
 ///
 /// `unistream_rx` is borrowed immutably here purely to read `capacity()` /
-/// `max_capacity()`; the write future borrows the `stream` mutably. The two
-/// borrows are disjoint.
+/// `max_capacity()`; the write future borrows the `stream` mutably; `ticker` is
+/// borrowed mutably to arm the backpressure poll. All three borrows are disjoint.
+///
+/// `ticker` is owned by the caller ([`Self::spawn_unistream_writer`]) and reused
+/// across every frame on this writer task, so the success path performs **no**
+/// timer allocation (it was previously rebuilt per frame). The per-call
+/// `stalled_while_backed_up` accumulator below is a fresh local each call, so
+/// reusing the ticker cannot leak stall state from a prior frame: a stale tick
+/// that became ready between frames only samples the (now-empty) channel and
+/// resets the fresh accumulator. We still [`reset`](tokio::time::Interval::reset)
+/// the ticker at the top of each call so its next tick fires one full poll
+/// interval from now rather than immediately — preserving the prior design's
+/// "a promptly-completing write never samples backpressure" fast path.
 async fn write_framed_with_backpressure_shed(
     stream: &mut web_transport_quinn::SendStream,
     len_header: &[u8; 4],
     data: &Bytes,
     unistream_rx: &mpsc::Receiver<Bytes>,
+    ticker: &mut tokio::time::Interval,
 ) -> Option<&'static str> {
     let max_capacity = unistream_rx.max_capacity();
 
@@ -498,14 +525,18 @@ async fn write_framed_with_backpressure_shed(
     };
     tokio::pin!(framed_write);
 
-    let mut ticker = tokio::time::interval(WT_UNISTREAM_BACKPRESSURE_POLL);
-    // The first tick of `interval` fires immediately; skip it so a write that
+    // The hoisted `ticker` is shared across frames, so its next tick may already
+    // be ready (or even overdue) from a prior frame. Reset it so the next tick
+    // fires one full `WT_UNISTREAM_BACKPRESSURE_POLL` from NOW: a write that
     // completes promptly never samples backpressure at all (pure fast path), and
-    // so the accumulator only advances after a real poll interval has elapsed.
-    ticker.tick().await;
+    // the accumulator only advances after a real poll interval has elapsed. This
+    // is the zero-alloc equivalent of constructing a fresh `interval` per frame.
+    ticker.reset();
 
     // Total time the write has stayed parked WHILE the channel was backed up.
-    // Advances only on backed-up ticks; reset to zero on any healthy tick.
+    // Fresh per call (NOT carried in the shared ticker), so reusing the ticker
+    // across frames cannot leak a prior frame's accumulated stall. Advances only
+    // on backed-up ticks; reset to zero on any healthy tick.
     let mut stalled_while_backed_up = std::time::Duration::ZERO;
 
     loop {
@@ -1311,9 +1342,11 @@ mod writer_shed_tests {
         // A payload large enough to exhaust the fresh stream's AND the
         // connection's flow-control window so a SINGLE `write_all` genuinely
         // parks mid-frame (the receiver never reads). quinn's default stream
-        // receive window is ~1 MiB and the connection window ~1.5 MiB; a 4 MiB
-        // frame (= MAX_FRAME_SIZE, a real 1080p keyframe ceiling) blows past both,
-        // so the write parks rather than completing into the buffer. We assert
+        // receive window is ~1.25 MiB and the connection window ~1.5 MiB; a 4 MiB
+        // frame — above `MAX_FRAME_SIZE` (4_000_000) and well past a real 1080p
+        // keyframe ceiling — blows past both windows, so the write parks rather
+        // than completing into the buffer. The test only needs the frame to exceed
+        // the quinn window (it does), not to equal `MAX_FRAME_SIZE`. We assert
         // below that it actually parked (the helper must NOT return promptly).
         let len: u32 = (4 * 1024 * 1024) as u32;
         let header = len.to_be_bytes();
@@ -1323,8 +1356,12 @@ mod writer_shed_tests {
         // non-backed-up channel, that is the spurious-reset bug.
         let watchdog = WT_UNISTREAM_WRITE_DEADLINE * 4 + Duration::from_secs(2);
 
+        // The production writer owns one ticker for the whole task and reuses it
+        // per frame; mirror that here by constructing one and passing it in.
+        let mut ticker = tokio::time::interval(WT_UNISTREAM_BACKPRESSURE_POLL);
+
         tokio::select! {
-            shed = write_framed_with_backpressure_shed(&mut stream, &header, &data, &uni_rx) => {
+            shed = write_framed_with_backpressure_shed(&mut stream, &header, &data, &uni_rx, &mut ticker) => {
                 panic!(
                     "REGRESSION (#1638): the writer SHED a healthy, non-backed-up \
                      stream (channel depth 0) just because the write parked past \

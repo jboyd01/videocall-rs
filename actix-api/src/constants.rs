@@ -386,8 +386,15 @@ pub const WT_UNISTREAM_BACKPRESSURE_SHED_RATIO: f64 = 0.5;
 /// On each tick the writer samples the outbound channel depth: a tick spent at or
 /// above [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] advances the shed accumulator;
 /// a tick below it resets the accumulator. The poll only runs while a write is
-/// actually parked (it is one arm of a `select!` against the write future), so it
-/// costs nothing on the fast path where writes complete promptly.
+/// actually parked (it is one arm of a `select!` against the write future).
+///
+/// The interval timer itself is constructed ONCE per writer task — in
+/// `spawn_unistream_writer`, before the drain loop — and the per-frame shed
+/// helper borrows it and `reset()`s it at the start of each call rather than
+/// rebuilding it. So on the fast path (a write that completes promptly) this poll
+/// touches no timer allocation at all: the shared interval's next tick is reset
+/// one period into the future and the write returns before that tick ever arms.
+/// A timer only does work while a write is actually parked.
 ///
 /// ## Why 50 ms
 ///
