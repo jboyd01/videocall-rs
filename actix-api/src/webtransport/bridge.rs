@@ -381,7 +381,7 @@ impl WebTransportBridge {
                             break;
                         }
                     }
-                    // The current frame was sched away; do not fire the
+                    // The current frame was shed away; do not fire the
                     // packet-sent callback for it. Continue to the next frame.
                     continue;
                 }
