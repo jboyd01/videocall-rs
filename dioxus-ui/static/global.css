@@ -3,8 +3,8 @@
   position: fixed;
   inset: 0;
   background: var(--overlay-backdrop);
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  backdrop-filter: saturate(180%) blur(var(--effect-blur-md));
+  -webkit-backdrop-filter: saturate(180%) blur(var(--effect-blur-md));
   z-index: 9600;
   display: flex;
   align-items: center;
@@ -1437,7 +1437,9 @@ html[data-theme="light"] #invite-overlay p {
 
   /* v0.1 component/effect extension tokens */
   --effect-blur-sm: 4px;
+  --effect-blur-surface: 12px;
   --effect-blur-md: 14px;
+  --effect-blur-glass: 16px;
   --effect-blur-lg: var(--glass-blur);
 
   /* v0.1 component-extension defaults — theme-agnostic baseline.
@@ -2002,7 +2004,7 @@ html[data-theme="light"] #invite-overlay p {
   gap: 1.2rem;
   padding: 0.85rem 1.5rem;
   background: rgba(28, 28, 30, 0.85);
-  backdrop-filter: blur(14px);
+  backdrop-filter: blur(var(--effect-blur-md));
   border-radius: 2.5rem;
   border: 1px solid #38383a;
   box-shadow:
@@ -2163,8 +2165,8 @@ html[data-theme="light"] #invite-overlay p {
   border-radius: 10px;
   border-top: 1px solid var(--glass-popover-border);
   background: var(--glass-popover-bg);
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);
 }
 
@@ -2868,8 +2870,8 @@ html[data-theme="light"] #invite-overlay p {
   max-width: min(260px, calc(100vw - 4rem));
   padding: 0.5rem 0.625rem;
   background: rgba(28, 28, 30, 0.96);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
-  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg)) saturate(180%);
+  backdrop-filter: blur(var(--effect-blur-lg)) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-md);
   box-shadow:
@@ -3124,256 +3126,6 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 /* ============================================================
-   Issue 1175: received shared-content zoom / pan / detach.
-
-   The shared-content (received screen share) subtree on the
-   receiving side is wrapped so the viewer can zoom in/out, pan
-   when zoomed, and detach the content into its own window. The
-   layout below is movable as ONE node into a Document
-   Picture-in-Picture window (`.ss-pip-host`), where it keeps the
-   SAME <canvas> element so the decoder keeps painting it live.
-
-   Zoom grows the canvas via CSS width/height percentage (with
-   `object-fit: fill`) on the canvas only — never a re-decode /
-   re-raster: the canvas backing store stays untouched, so the GPU
-   just upscales the already-rendered frame and it stays cheap per
-   frame. (Width/height is used, not `transform: scale()`, because a
-   transform creates no scrollable overflow for drag-to-pan; see
-   `apply_zoom` in `screen_share_zoom_dom.rs`.)
-   ============================================================ */
-
-/* Permanent grid home for the shared content. The movable host is
-   appended here at mount and re-appended here on reattach. */
-.ss-pip-slot {
-  width: 100%;
-  height: 100%;
-}
-
-/* Movable subtree: viewport + canvas + controls + name. Positioned
-   so the floating name and corner controls overlay the viewport. */
-.ss-pip-host {
-  position: relative;
-  width: 100%;
-  height: 100%;
-}
-
-/* Pannable viewport around the screen-share canvas. At fit (zoom == 1)
-   it clips with the existing `.canvas-container` overflow:hidden. When
-   zoomed past fit the `--pannable` modifier turns on scrolling so the
-   user can reach the off-screen content. */
-.ss-zoom-viewport {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  overflow: hidden;
-}
-
-.ss-zoom-viewport.ss-zoom-viewport--pannable {
-  overflow: auto;
-  /* Switch OFF the inherited `.canvas-container` flex-centering while
-     pannable: flex centering an oversized child clips the overflow on the
-     centered axis so it can't be scrolled to. Block layout + align-start
-     lets the full zoomed canvas live inside the scrollable area. */
-  display: block;
-  /* Grab cursor signals drag-to-pan; switches to grabbing mid-drag. */
-  cursor: grab;
-}
-
-.ss-zoom-viewport.ss-zoom-viewport--pannable[data-panning="true"] {
-  cursor: grabbing;
-}
-
-/* B1: keyboard-focus ring on the zoom viewport so a keyboard / switch user
-   sees where focus is. The viewport carries an unconditional `tabindex="0"`,
-   so it is a tab-stop even at fit (100%, the default) when nothing is
-   pannable yet; scoping the ring to the base class (not the
-   `--pannable` modifier) keeps the focus indicator visible in that state
-   too (WCAG 2.4.7). Mirrors `.ss-zoom-btn:focus-visible` below. */
-.ss-zoom-viewport:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-/* Zoom / detach control cluster. Mirrors the `.tile-top-icons`
-   placement language (corner overlay) but sits at the BOTTOM so it does
-   not collide with the top signal / pin / crop icons, and travels with
-   the content into the detached window. */
-.ss-zoom-controls {
-  position: absolute;
-  bottom: min(8px, calc(var(--tile-h, 240px) * 0.04));
-  left: 50%;
-  transform: translateX(-50%);
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: min(8px, calc(var(--tile-w, 320px) * 0.025));
-  padding: 4px 8px;
-  /* P2: bump toward opaque + blur so the control pill stays legible over any
-     shared content (a bright slide could wash out the lighter overlay). */
-  background-color: var(--overlay-opaque);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
-  border-radius: var(--radius-lg);
-  z-index: 4;
-  /* Hidden until the tile is hovered, matching the pin/crop affordance.
-     Always visible inside the detached PiP window (rule below). */
-  opacity: 0;
-  transition: opacity 0.15s ease;
-}
-
-.split-screen-tile:hover .ss-zoom-controls,
-.ss-zoom-controls:hover,
-.ss-zoom-controls:focus-within {
-  opacity: 1;
-}
-
-.ss-zoom-btn {
-  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
-  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background-color: transparent;
-  color: var(--text-on-glass-strong);
-  border-radius: 50%;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-  transition: background-color 0.15s ease;
-  font: inherit;
-  -webkit-appearance: none;
-  appearance: none;
-}
-
-.ss-zoom-btn svg {
-  width: min(20px, calc(var(--tile-h, 240px) * 0.1));
-  height: min(20px, calc(var(--tile-h, 240px) * 0.1));
-  flex-shrink: 0;
-}
-
-.ss-zoom-btn:hover {
-  background-color: var(--overlay-opaque);
-}
-
-.ss-zoom-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* S3: zoom buttons disabled at the min/max limit (set imperatively after each
-   zoom). Reduced opacity + not-allowed cursor signal the no-op state. */
-.ss-zoom-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.ss-zoom-label {
-  min-width: 3.2em;
-  text-align: center;
-  color: var(--text-on-glass-strong);
-  font-size: 0.8rem;
-  font-variant-numeric: tabular-nums;
-  user-select: none;
-}
-
-/* S5: thin divider separating the [−][%][+] step cluster from the
-   [reset][detach] cluster so reset doesn't read as just another step. */
-.ss-zoom-sep {
-  align-self: stretch;
-  width: 0;
-  margin: 2px 2px;
-  border-left: 1px solid var(--border-emphasis);
-}
-
-/* S1: placeholder filling the grid hole while the content is detached into the
-   PiP window. Hidden by default; shown (flex) only when the SLOT is marked
-   detached. The moved host is gone from the slot by then, so this is what the
-   viewer sees in the grid. */
-.ss-pip-placeholder {
-  display: none;
-}
-
-.ss-pip-slot[data-detached="true"] .ss-pip-placeholder {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  width: 100%;
-  height: 100%;
-  padding: 16px;
-  text-align: center;
-  color: var(--text-on-glass-strong);
-  background-color: var(--overlay-heavy);
-  border-radius: var(--radius-lg);
-}
-
-.ss-pip-placeholder svg {
-  width: 32px;
-  height: 32px;
-  opacity: 0.8;
-}
-
-.ss-pip-placeholder-text {
-  font-size: 0.9rem;
-}
-
-.ss-pip-placeholder-btn {
-  padding: 6px 14px;
-  font: inherit;
-  font-size: 0.85rem;
-  color: var(--text-on-glass-strong);
-  background-color: var(--overlay-opaque);
-  border: 1px solid var(--border-emphasis);
-  border-radius: var(--radius-lg);
-  cursor: pointer;
-  -webkit-appearance: none;
-  appearance: none;
-}
-
-.ss-pip-placeholder-btn:hover {
-  border-color: var(--accent);
-}
-
-.ss-pip-placeholder-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* ── Document PiP window body ─────────────────────────────────────────
-   The PiP document starts blank; we copy the app stylesheets in and tag
-   its <body> with `.ss-pip-body` so the moved subtree fills the window
-   on a dark backdrop, and the controls stay always-visible (no tile to
-   hover in the popped-out window). */
-.ss-pip-body {
-  margin: 0;
-  width: 100vw;
-  height: 100vh;
-  background: var(--bg, #000000); /* @token-exempt: PiP fallback when tokens absent */
-  overflow: hidden;
-}
-
-.ss-pip-body .ss-pip-host {
-  width: 100vw;
-  height: 100vh;
-}
-
-.ss-pip-body .ss-zoom-controls {
-  opacity: 1;
-}
-
-/* Hide pin/crop/zoom controls on mobile narrow grid tiles -- the split
-   layout is the primary surface for these (matches the existing
-   pin/crop mobile hide). The detached window is desktop-only (Document
-   PiP is unsupported on mobile browsers), so the controls there are
-   unaffected. */
-@media (max-width: 767px) {
-  .grid-item .ss-zoom-controls {
-    display: none;
-  }
-}
-
-/* ============================================================
    Clip peer-tile video feed to the tile's rounded corners.
 
    `.grid-item` carries the tile's `border-radius` (var(--radius-lg)
@@ -3419,8 +3171,8 @@ html[data-theme="light"] #invite-overlay p {
 .copy-toast {
   color: #ffffff;
   background: rgba(44, 44, 46, 0.75);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
-  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(var(--effect-blur-lg));
+  backdrop-filter: saturate(180%) blur(var(--effect-blur-lg));
   border: 1px solid rgba(255, 255, 255, 0.18);
   padding: 0.5rem 0.75rem;
   border-radius: var(--radius-lg);
@@ -3691,8 +3443,8 @@ html[data-theme="light"] #invite-overlay p {
   top: calc(100% + 8px);
   min-width: 220px;
   background: rgba(30, 30, 30, 0.95);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(var(--effect-blur-lg));
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-lg);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);

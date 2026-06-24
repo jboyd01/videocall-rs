@@ -4895,15 +4895,6 @@ pub fn AttendantsComponent(
     let mut active_decode_set: HashSet<u64> = decoded_bucket.clone();
     if let Some(active_peer) = active_screen_sharer.as_ref() {
         if let Ok(session_id) = active_peer.parse::<u64>() {
-            // The active screen sharer is UNCONDITIONALLY decoded: phases 3-4
-            // below only add / intersect-affirm, never remove, so this membership
-            // reaches `set_active_decode_set` and keeps the screen frames flowing
-            // regardless of decode-budget pressure. Issue 1175 (detach to a
-            // Document PiP window) RELIES on this: detach moves only the DOM
-            // subtree — it does NOT change `is_screen_share_enabled_for_peer`, so
-            // `active_screen_sharer` stays this peer and the share keeps decoding
-            // while detached. Do not gate this insert on tile visibility / DOM
-            // location, or a detached (actively-watched) share would freeze.
             active_decode_set.insert(session_id);
         }
     }

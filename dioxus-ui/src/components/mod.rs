@@ -33,11 +33,6 @@ pub mod neteq_chart;
 pub mod okta_sign_in_button;
 pub mod peer_list_item;
 pub mod performance_settings;
-pub mod screen_share_zoom;
-// Imperative DOM glue for the received-shared-content viewport (issue 1175).
-// wasm-only: it touches `web_sys::window`, Document PiP, and pointer events.
-#[cfg(target_arch = "wasm32")]
-pub mod screen_share_zoom_dom;
 pub mod search_modal;
 pub mod signal_quality;
 pub mod toggle_switch;

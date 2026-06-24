@@ -9,4 +9,3 @@ pub mod peer;
 pub mod push_pin;
 pub mod signal_bars;
 pub mod youtube;
-pub mod zoom;
