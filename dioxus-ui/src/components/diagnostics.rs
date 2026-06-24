@@ -237,9 +237,9 @@ fn peer_jitter_class(jitter_ms: u64) -> (&'static str, &'static str) {
 /// poor "severely behind real-time". Returns `(class, reason)` (`""` for good).
 ///
 /// PLACEHOLDER thresholds, pending performance-reviewer. The poor boundary
-/// (`1800ms`) is derived from the backend `MAX_CAPTURE_LAG_MS = 1800.0`
-/// (videocall-codecs/src/jitter_buffer.rs) — the point at which the jitter
-/// buffer treats capture as stalled. The warn boundary (`1000ms`) is an interim
+/// (`1800ms`) is a standalone UI display cut meaning "≥1.8s behind real-time =
+/// severe / slow motion" — it is the UI's own severity threshold, not derived
+/// from any backend constant. The warn boundary (`1000ms`) is an interim
 /// midpoint, NOT a localhost-tuned final value; real-network tuning (latency,
 /// jitter, mobile) is owned by performance-reviewer. Pure / host-testable.
 fn peer_lag_class(lag_ms: f64) -> (&'static str, &'static str) {
@@ -253,13 +253,12 @@ fn peer_lag_class(lag_ms: f64) -> (&'static str, &'static str) {
 }
 
 /// issue 1656: poor capture-lag boundary (ms). The chip turns "severely behind
-/// real-time" at this value, derived from the backend
-/// `MAX_CAPTURE_LAG_MS = 1800.0` (videocall-codecs/src/jitter_buffer.rs) — the
-/// point at which the jitter buffer treats capture as stalled. That constant is
-/// a private `const` across a crate boundary and is NOT importable from
-/// videocall-ui, so this is a deliberate, drift-marked copy: the
-/// `peer_lag_poor_threshold_matches_backend` test pins this value so a future
-/// edit to the UI threshold is visible/intentional rather than a silent drift.
+/// real-time" at this value — a standalone UI display threshold meaning "≥1.8s
+/// behind real-time = severe". It is the UI's own severity cut, not derived from
+/// or coupled to any backend constant. The
+/// `peer_lag_poor_threshold_is_severe_display_value` test pins this value on its
+/// own terms so a future edit to `PEER_LAG_POOR_MS` is visible/intentional
+/// rather than a silent drift.
 const PEER_LAG_POOR_MS: f64 = 1800.0;
 
 /// issue 1656: per-peer VIDEO worker/heartbeat readout threaded from the
@@ -2796,9 +2795,10 @@ mod tests {
 
     /// issue 1656: per-peer capture-LAG classifier boundaries (PLACEHOLDER
     /// thresholds, see `peer_lag_class`). good `< 1000`; warn `[1000, 1800)`;
-    /// poor `>= 1800` (1800 derived from backend `MAX_CAPTURE_LAG_MS`). Mutating
-    /// either threshold flips a boundary case — e.g. raising the warn boundary
-    /// from 1000.0 breaks the 1000.0→warn assertion.
+    /// poor `>= 1800` (the standalone UI "severely behind real-time" display
+    /// cut, `PEER_LAG_POOR_MS`). Mutating either threshold flips a boundary
+    /// case — e.g. raising the warn boundary from 1000.0 breaks the
+    /// 1000.0→warn assertion.
     #[test]
     fn peer_lag_class_boundaries() {
         assert_eq!(peer_lag_class(999.9), ("is-good", ""));
@@ -3157,20 +3157,19 @@ mod tests {
         );
     }
 
-    /// issue 1656 (optional drift-guard): the UI's "poor" capture-lag threshold
-    /// is a deliberate cross-crate COPY of the backend `MAX_CAPTURE_LAG_MS`
-    /// (videocall-codecs/src/jitter_buffer.rs), which is a private `const` not
-    /// importable from videocall-ui. This drift marker pins the UI value so any
-    /// future edit to `PEER_LAG_POOR_MS` is visible/intentional (and a reviewer
-    /// is reminded to re-check the backend coupling) rather than a silent drift.
-    /// It references the production const directly — mutating `PEER_LAG_POOR_MS`
+    /// issue 1656 (drift-guard): pins the UI's "poor" capture-lag display
+    /// threshold (`PEER_LAG_POOR_MS`) on its own terms — it is the UI's own
+    /// "severely behind real-time" severity cut, not coupled to any backend
+    /// constant. This guard makes any future edit to `PEER_LAG_POOR_MS`
+    /// visible/intentional rather than a silent drift. It references the
+    /// production const + classifier directly — mutating `PEER_LAG_POOR_MS`
     /// fails this test AND flips `peer_lag_class`'s poor boundary.
     #[test]
-    fn peer_lag_poor_threshold_matches_backend() {
+    fn peer_lag_poor_threshold_is_severe_display_value() {
         assert_eq!(
             PEER_LAG_POOR_MS, 1800.0,
-            "UI poor capture-lag threshold must track backend MAX_CAPTURE_LAG_MS \
-             (videocall-codecs/src/jitter_buffer.rs); update both deliberately"
+            "PEER_LAG_POOR_MS is the UI 'severely behind real-time' display cut; \
+             change it deliberately (the chip + alarm key off it)"
         );
         // And the classifier must actually USE the const at its boundary.
         assert_eq!(

@@ -1852,7 +1852,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    DECOUPLED from legibility (WCAG AA at --fs-2 11px text needs 4.5:1, which the
    saturated --diag-q-* tokens fail against --surface-elevated — see the
    .simulcast-recv-peer-stats note). The VALUE text inherits the high-contrast
-   neutral --text-primary (13.94:1 dark / 16.55:1 light); the severity HUE lives
+   neutral --text-primary (~13.0:1 dark / 16.55:1 light; the dark figure reflects
+   the #diagnostics-sidebar dark remap of --text-primary to the settings-modal
+   near-opaque-white token composited over --surface-elevated, not plain white);
+   the severity HUE lives
    only on the non-text DOT (a UI component, AA non-text floor 3:1). The
    title/aria-label carries the reason, so meaning never depends on color (WCAG
    1.4.1). The dot is decorative (aria-hidden in markup). */
@@ -10104,7 +10107,10 @@ details.perf-peers[open] .perf-peers__chev {
    (11px, "small" text) the AA floor is 4.5:1, which the saturated --diag-q-*
    severity tokens FAIL against --surface-elevated (e.g. dark poor 4.09:1, light
    good 3.31:1). So the numeric VALUE text renders in the neutral --text-primary
-   (13.94:1 dark / 16.55:1 light — passes), and severity is carried ONLY by a
+   (~13.0:1 dark / 16.55:1 light — passes; the dark figure reflects the
+   #diagnostics-sidebar dark remap of --text-primary to the settings-modal
+   near-opaque-white token composited over --surface-elevated, not plain white),
+   and severity is carried ONLY by a
    non-text status DOT filled with the canonical --diag-q-* token (a dot is a
    non-text UI component, AA non-text floor 3:1). The `title`/aria-label carries
    the reason, so meaning never depends on color alone (WCAG 1.4.1). The
