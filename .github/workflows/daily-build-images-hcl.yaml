@@ -165,20 +165,53 @@ jobs:
           echo ""
           echo "Triggering deployment workflow..."
 
-      - name: Trigger deploy workflow
+      - name: Trigger deploy workflows
         if: success()
         run: |
           TAG=${{ steps.generate-tag.outputs.tag }}
-          echo "Triggering daily deploy workflow with tag: ${TAG}"
+          echo "Triggering daily deploy workflows with tag: ${TAG}"
 
-          # Use GitHub API to trigger workflow_dispatch
-          curl -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/daily-deploy-hcl.yaml/dispatches" \
-            -d "{\"ref\":\"hcl-main\",\"inputs\":{\"image_tag\":\"${TAG}\"}}"
+          # Deploy the freshly-built tag to every target cluster in lockstep.
+          # Each deploy runs as a workflow_dispatch with the tag passed in (no
+          # workflow_run trigger — that path can't retrieve job outputs via the
+          # GitHub REST API; see the deploy workflows' history).
+          DEPLOY_WORKFLOWS=(
+            "daily-deploy-hcl.yaml"
+            "daily-deploy-labsworkspace.yaml"
+          )
 
-          echo "✅ Deploy workflow triggered"
+          FAILED=()
+          for WF in "${DEPLOY_WORKFLOWS[@]}"; do
+            echo "Dispatching ${WF} ..."
+            # `|| true`: a transport-level curl failure (DNS/refused/TLS) exits
+            # non-zero, which under `set -euo pipefail` would abort the loop and
+            # skip the remaining cluster(s). Swallow it so an empty HTTP_CODE
+            # falls through to the per-workflow failure handling below.
+            # ref=hcl-main runs the deploy workflow body from the default branch
+            # (workflow_dispatch requires a branch, not a SHA); deploy_ref pins
+            # the deploy's chart checkout to THIS build's commit so the Helm
+            # charts match the images just built, even if hcl-main advances
+            # during the build.
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/${WF}/dispatches" \
+              -d "{\"ref\":\"hcl-main\",\"inputs\":{\"image_tag\":\"${TAG}\",\"deploy_ref\":\"${{ github.sha }}\"}}" || true)
+
+            # workflow_dispatch returns 204 No Content on success.
+            if [ "$HTTP_CODE" = "204" ]; then
+              echo "  ✅ ${WF} triggered (HTTP ${HTTP_CODE})"
+            else
+              echo "  ❌ ${WF} dispatch failed (HTTP ${HTTP_CODE})"
+              FAILED+=("${WF}")
+            fi
+          done
+
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "::error::Failed to trigger deploy workflow(s): ${FAILED[*]}"
+            exit 1
+          fi
+          echo "✅ All deploy workflows triggered"
 
       - name: Cleanup build directory
         if: always()
