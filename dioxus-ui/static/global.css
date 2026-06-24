@@ -1495,6 +1495,24 @@ html[data-theme="light"] #invite-overlay p {
   --fs-title:       var(--fs-10);  /* 24px — page-level headings             */
   --fs-display:     var(--fs-12);  /* 32px — hero display                    */
 
+  /* ─── Fixed dark surfaces ─────────────────────────────────────────────────
+     Theme-independent "always dark" tokens for components that maintain a
+     dark appearance regardless of the active theme (toasts, banners, context
+     menus, fixed-dark overlays).  Defined on `html` — NOT per-theme — so
+     they never flip.  Components rendered on these surfaces must use the
+     --on-dark-* text tokens below, NOT theme-aware tokens like --text-primary
+     or --text-on-glass-* (those flip to dark in light theme → invisible).
+     ─────────────────────────────────────────────────────────────────────── */
+  --fixed-dark:        rgba(30, 30, 30, 0.88);  /* light glass — toast       */
+  --fixed-dark-strong: rgba(30, 30, 30, 0.95);  /* medium glass — controls   */
+  --fixed-dark-heavy:  rgba(30, 30, 30, 0.97);  /* near-opaque — banner      */
+  --fixed-dark-opaque: rgba(30, 30, 30, 0.98);  /* opaque — context menu     */
+
+  /* Text on fixed dark surfaces */
+  --on-dark-text:      #ffffff;
+  --on-dark-text-high: rgba(255, 255, 255, 0.95);
+  --on-dark-text-muted: rgba(255, 255, 255, 0.5);
+
   /* Vertical room to reserve below the controls dock: dock bottom 20px + dock
      height ~79px + ~12px gap = 112px. (The ~79px = .video-control-button 3.1rem
      ≈49.6px + .video-controls-container padding 0.85rem×2 ≈27.2px + 2px border;
