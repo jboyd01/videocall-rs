@@ -45,7 +45,9 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{Element, HtmlElement};
 
-use super::screen_share_zoom::{clamp_zoom, is_zoomed, zoom_in, zoom_out, RESET_ZOOM};
+use super::screen_share_zoom::{
+    at_max_zoom, at_min_zoom, clamp_zoom, is_zoomed, pan_key_delta, zoom_in, zoom_out, RESET_ZOOM,
+};
 
 /// DOM id of the movable subtree wrapper for a peer's shared content. This is
 /// the single node moved between the grid and the Document PiP window, so it
@@ -69,6 +71,46 @@ pub fn zoom_label_id(peer_id: &str) -> String {
 /// so reattach always has a home to return to.
 pub fn grid_slot_id(peer_id: &str) -> String {
     format!("screen-share-{peer_id}-slot")
+}
+
+/// DOM id of the detach toggle button for a peer. Stable so the imperative
+/// a11y-state updates (`aria-pressed`, label/title) can find it across BOTH
+/// documents — the button travels into the PiP doc with its subtree (B2).
+pub fn detach_btn_id(peer_id: &str) -> String {
+    format!("screen-share-{peer_id}-detach-btn")
+}
+
+/// DOM id of the zoom-IN button for a peer. Stable so [`apply_zoom`] can toggle
+/// its `disabled` state at the max-zoom limit across both documents (S3).
+pub fn zoom_in_btn_id(peer_id: &str) -> String {
+    format!("screen-share-{peer_id}-zoom-in")
+}
+
+/// DOM id of the zoom-OUT button for a peer (S3, see [`zoom_in_btn_id`]).
+pub fn zoom_out_btn_id(peer_id: &str) -> String {
+    format!("screen-share-{peer_id}-zoom-out")
+}
+
+/// DOM id of the visually-hidden `aria-live` announcement region for a peer.
+/// This region lives in the MAIN document only (NOT inside the movable host),
+/// so detach/reattach announcements are heard by the main-document user even
+/// while the content is popped out (B2).
+pub fn live_region_id(peer_id: &str) -> String {
+    format!("screen-share-{peer_id}-live")
+}
+
+/// Announce `msg` to assistive tech via the peer's main-document `aria-live`
+/// region. Resolved against the MAIN document only: the region is a sibling of
+/// the movable host and never travels into the PiP window, so a main-document
+/// screen-reader user hears detach/reattach state changes (B2).
+pub fn announce(peer_id: &str, msg: &str) {
+    if let Some(win) = web_sys::window() {
+        if let Some(doc) = win.document() {
+            if let Some(region) = doc.get_element_by_id(&live_region_id(peer_id)) {
+                region.set_text_content(Some(msg));
+            }
+        }
+    }
 }
 
 /// Feature-detect the Document Picture-in-Picture API. Returns `true` only when
@@ -169,6 +211,30 @@ fn apply_zoom(peer_id: &str, host: &Element, zoom: f64) {
     // Update the % label.
     if let Some(label) = doc.get_element_by_id(&zoom_label_id(peer_id)) {
         label.set_text_content(Some(&super::screen_share_zoom::zoom_percent_label(zoom)));
+    }
+
+    // S3: disable the zoom-IN button at max and the zoom-OUT button at min so
+    // they don't silently no-op. Resolved against the host's owner document
+    // (`doc`) so they're found in the PiP document while detached. The disabled
+    // state is driven from the PURE predicates (host-tested) — never recomputed
+    // inline here.
+    set_btn_disabled(&doc, &zoom_in_btn_id(peer_id), at_max_zoom(zoom));
+    set_btn_disabled(&doc, &zoom_out_btn_id(peer_id), at_min_zoom(zoom));
+}
+
+/// Set or clear the `disabled` + `aria-disabled` state of a button by id within
+/// `doc`. `disabled` is a boolean attribute: its mere PRESENCE disables the
+/// control, so we must REMOVE it (not set it to "false") to re-enable — else a
+/// button stays stuck disabled after zooming back into range (S3).
+fn set_btn_disabled(doc: &web_sys::Document, btn_id: &str, disabled: bool) {
+    if let Some(btn) = doc.get_element_by_id(btn_id) {
+        if disabled {
+            let _ = btn.set_attribute("disabled", "");
+            let _ = btn.set_attribute("aria-disabled", "true");
+        } else {
+            let _ = btn.remove_attribute("disabled");
+            let _ = btn.remove_attribute("aria-disabled");
+        }
     }
 }
 
@@ -374,7 +440,32 @@ where
         if let Some(h) = host_element(&peer_id) {
             apply_zoom(&peer_id, &h, current_zoom(&h));
             let _ = h.set_attribute("data-detached", "true");
+
+            // B2: update the detach toggle's a11y state. The button travelled
+            // INTO the PiP doc with this subtree, so resolve it via the host's
+            // owner document (the PiP document now), set it "pressed", and swap
+            // the label/title to the reattach copy.
+            set_detach_btn_state(&h, &peer_id, true);
+            // Move focus into the PiP window so keyboard/SR focus follows the
+            // content out of the grid. Focus the detach button (now in PiP).
+            if let Some(owner) = h.owner_document() {
+                if let Some(btn) = owner.get_element_by_id(&detach_btn_id(&peer_id)) {
+                    if let Ok(btn) = btn.dyn_into::<HtmlElement>() {
+                        let _ = btn.focus();
+                    }
+                }
+            }
         }
+
+        // S1: mark the grid SLOT (which stayed in the MAIN doc) detached so its
+        // placeholder ("Shared content is in a separate window" + Bring it back)
+        // shows in the now-empty hole. The moved host is gone from the slot, so
+        // this attr lives on the slot, not the host.
+        set_slot_detached(&peer_id, true);
+
+        // B2: announce the state change in the MAIN document so a main-doc SR
+        // user hears it (the live region never travels into the PiP).
+        announce(&peer_id, "Shared content opened in a separate window");
 
         // Wire the close handler: when the PiP window goes away (user closes
         // it, OR we close it on presenter-stop/meeting-end), move the subtree
@@ -414,10 +505,12 @@ pub fn reattach_from_pip(peer_id: &str) {
         Some(h) => h,
         None => return,
     };
-    // Already home? nothing to do.
+    // Already home? Make sure the detach UI is reset, then nothing else to do.
     if let Some(parent) = host.parent_element() {
         if parent.id() == grid_slot_id(peer_id) {
             let _ = host.remove_attribute("data-detached");
+            set_detach_btn_state(&host, peer_id, false);
+            set_slot_detached(peer_id, false);
             return;
         }
     }
@@ -432,6 +525,68 @@ pub fn reattach_from_pip(peer_id: &str) {
         // Re-apply zoom so the label / viewport / canvas size resolve against
         // the main document again (they were last applied in the PiP document).
         apply_zoom(peer_id, &h, current_zoom(&h));
+
+        // B2: reset the detach toggle's a11y state (now resolving in the main
+        // doc), restore the "open" label/title, and RESTORE FOCUS to it so the
+        // keyboard user lands back on the control that triggered the round trip.
+        set_detach_btn_state(&h, peer_id, false);
+        if let Some(btn) = main_doc.get_element_by_id(&detach_btn_id(peer_id)) {
+            if let Ok(btn) = btn.dyn_into::<HtmlElement>() {
+                let _ = btn.focus();
+            }
+        }
+    }
+
+    // S1: the host is back in the grid slot, so clear the slot's detached flag
+    // (hides the placeholder again).
+    set_slot_detached(peer_id, false);
+
+    // B2: announce the return in the MAIN document.
+    announce(peer_id, "Shared content returned to the grid");
+}
+
+/// B2 helper: set the detach toggle's `aria-pressed` + label/title for the
+/// given state. Resolved via the host's OWNER document so it's found whether the
+/// button currently lives in the main doc or the PiP doc (it travels with the
+/// subtree). `pressed == true` means content is detached (label → reattach
+/// copy); `false` restores the original "open in a separate window" copy.
+fn set_detach_btn_state(host: &Element, peer_id: &str, pressed: bool) {
+    let owner = match host.owner_document() {
+        Some(d) => d,
+        None => return,
+    };
+    if let Some(btn) = owner.get_element_by_id(&detach_btn_id(peer_id)) {
+        let _ = btn.set_attribute("aria-pressed", if pressed { "true" } else { "false" });
+        let (label, title) = if pressed {
+            (
+                "Return shared content to the grid",
+                "Return shared content to the grid",
+            )
+        } else {
+            (
+                "Open shared content in a separate window",
+                "Open shared content in a separate window",
+            )
+        };
+        let _ = btn.set_attribute("aria-label", label);
+        let _ = btn.set_attribute("title", title);
+    }
+}
+
+/// S1 helper: set/clear `data-detached` on the grid SLOT in the MAIN document.
+/// The slot stays in the grid while the host pops out, so its placeholder
+/// visibility is driven from the slot, not the (moved-away) host.
+fn set_slot_detached(peer_id: &str, detached: bool) {
+    let doc = match web_sys::window().and_then(|w| w.document()) {
+        Some(d) => d,
+        None => return,
+    };
+    if let Some(slot) = doc.get_element_by_id(&grid_slot_id(peer_id)) {
+        if detached {
+            let _ = slot.set_attribute("data-detached", "true");
+        } else {
+            let _ = slot.remove_attribute("data-detached");
+        }
     }
 }
 
@@ -467,6 +622,9 @@ pub struct PanHandlers {
     _down: Closure<dyn FnMut(web_sys::PointerEvent)>,
     _move: Closure<dyn FnMut(web_sys::PointerEvent)>,
     _up: Closure<dyn FnMut(web_sys::PointerEvent)>,
+    // B1: keyboard-pan listener. Kept alive for the element's lifetime exactly
+    // like the pointer closures above; dropping it detaches the keydown handler.
+    _key: Closure<dyn FnMut(web_sys::KeyboardEvent)>,
 }
 
 /// Attach drag-to-pan listeners to the viewport element for `peer_id`. No-op if
@@ -521,14 +679,65 @@ pub fn install_pan(peer_id: &str) -> Option<PanHandlers> {
             let _ = up_vp.remove_attribute("data-panning");
         });
 
+    // B1 (WCAG 2.1.1): keyboard panning. A keyboard / switch user can zoom but
+    // not drag, so arrow / page / Home / End keys pan the viewport here. We ONLY
+    // act (and `preventDefault`) when the viewport is actually scrollable
+    // (zoomed past fit) — matching the SAME scrollability gate the pointerdown
+    // handler uses (above). At fit we do nothing and do NOT swallow the keys, so
+    // normal focus navigation is never trapped.
+    let key_vp = vp.clone();
+    let on_key =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+            // Same pannability check as pointerdown: nothing to scroll → bail
+            // without preventing default.
+            let pannable = key_vp.scroll_width() > key_vp.client_width()
+                || key_vp.scroll_height() > key_vp.client_height();
+            if !pannable {
+                return;
+            }
+            let key = e.key();
+            match key.as_str() {
+                // Home / End need the max scroll extent, which the pure delta
+                // helper can't know; handle them here against scroll_width /
+                // scroll_height.
+                "Home" => {
+                    e.prevent_default();
+                    key_vp.set_scroll_left(0);
+                    key_vp.set_scroll_top(0);
+                }
+                "End" => {
+                    e.prevent_default();
+                    let max_x = key_vp.scroll_width() - key_vp.client_width();
+                    let max_y = key_vp.scroll_height() - key_vp.client_height();
+                    key_vp.set_scroll_left(max_x.max(0));
+                    key_vp.set_scroll_top(max_y.max(0));
+                }
+                other => {
+                    // Arrow / Page keys: pure delta calc (host-tested). Other
+                    // keys → None → leave the event untouched.
+                    if let Some((dx, dy)) =
+                        pan_key_delta(other, key_vp.client_width(), key_vp.client_height())
+                    {
+                        e.prevent_default();
+                        // REUSE the same scroll mutation the pointermove path
+                        // uses (set_scroll_left / set_scroll_top).
+                        key_vp.set_scroll_left(key_vp.scroll_left() + dx);
+                        key_vp.set_scroll_top(key_vp.scroll_top() + dy);
+                    }
+                }
+            }
+        });
+
     let _ = vp.add_event_listener_with_callback("pointerdown", on_down.as_ref().unchecked_ref());
     let _ = vp.add_event_listener_with_callback("pointermove", on_move.as_ref().unchecked_ref());
     let _ = vp.add_event_listener_with_callback("pointerup", on_up.as_ref().unchecked_ref());
     let _ = vp.add_event_listener_with_callback("pointerleave", on_up.as_ref().unchecked_ref());
+    let _ = vp.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
 
     Some(PanHandlers {
         _down: on_down,
         _move: on_move,
         _up: on_up,
+        _key: on_key,
     })
 }

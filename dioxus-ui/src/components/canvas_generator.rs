@@ -707,6 +707,10 @@ pub fn generate_for_peer(
         let ss_slot_id = format!("screen-share-{}-slot", &key);
         let ss_pip_host_id = format!("screen-share-{}-pip-host", &key);
         let ss_viewport_id = format!("screen-share-{}-viewport", &key);
+        // Issue 1175 (B2): stable id for the main-document aria-live region used
+        // to announce detach/reattach. Kept OUTSIDE the movable host so it never
+        // travels into the PiP window (a main-doc SR user must still hear it).
+        let ss_live_region_id = format!("screen-share-{}-live", &key);
         return rsx! {
             div {
                 id: "{ss_div_id}",
@@ -730,6 +734,15 @@ pub fn generate_for_peer(
                         div {
                             id: "{ss_viewport_id}",
                             class: "ss-zoom-viewport canvas-container video-on",
+                            // Issue 1175 (B1, WCAG 2.1.1): make the viewport a
+                            // focusable group so keyboard / switch users can pan
+                            // the zoomed content with arrow / page / Home / End
+                            // keys (the keydown handler in `install_pan` only
+                            // acts when actually scrollable, so these are
+                            // harmless at fit).
+                            tabindex: "0",
+                            role: "group",
+                            "aria-label": "Shared content, zoomed — arrow keys to pan",
                             ScreenCanvas { peer_id: key.clone() }
                         }
                         h4 {
@@ -785,7 +798,42 @@ pub fn generate_for_peer(
                         }
                         } // .tile-top-icons
                     } // .ss-pip-host
+                    // Issue 1175 (S1): placeholder shown in the grid hole while
+                    // the host is detached into the PiP window. It is a SIBLING
+                    // of the movable `.ss-pip-host`, so it stays put when the
+                    // host is moved out. Visibility is driven off the SLOT's
+                    // `data-detached` attr (set imperatively on detach), since
+                    // the host is gone from the grid by then.
+                    div { class: "ss-pip-placeholder",
+                        DetachIcon {}
+                        span { class: "ss-pip-placeholder-text",
+                            "Shared content is in a separate window"
+                        }
+                        button {
+                            r#type: "button",
+                            class: "ss-pip-placeholder-btn",
+                            "data-testid": "ss-pip-bring-back",
+                            onclick: move |_| {
+                                // Closing the PiP window triggers reattach via
+                                // the pagehide handler.
+                                #[cfg(target_arch = "wasm32")]
+                                crate::components::screen_share_zoom_dom::close_pip_if_open();
+                                #[cfg(not(target_arch = "wasm32"))]
+                                let _ = ();
+                            },
+                            "Bring it back"
+                        }
+                    }
                 } // .ss-pip-slot
+                // Issue 1175 (B2): visually-hidden polite live region in the
+                // MAIN document. Sibling of `.ss-pip-slot` (NOT inside the
+                // movable host) so detach/reattach announcements reach the
+                // main-document SR user even while the content is popped out.
+                div {
+                    id: "{ss_live_region_id}",
+                    class: "visually-hidden",
+                    "aria-live": "polite",
+                }
                 if show_signal_popup {
                     {
                         let h = signal_history.clone();
@@ -1552,6 +1600,13 @@ fn ScreenShareZoomControls(peer_id: String) -> Element {
     }
 
     let zoom_label_id = format!("screen-share-{peer_id}-zoom-label");
+    // Issue 1175: stable ids so the imperative DOM helpers can find these
+    // controls across BOTH documents (they travel into the PiP window with the
+    // subtree). Zoom buttons get disabled at min/max (S3); detach toggles
+    // aria-pressed + label (B2).
+    let zoom_in_id = format!("screen-share-{peer_id}-zoom-in");
+    let zoom_out_id = format!("screen-share-{peer_id}-zoom-out");
+    let detach_btn_id = format!("screen-share-{peer_id}-detach-btn");
 
     let peer_in = peer_id.clone();
     let peer_out = peer_id.clone();
@@ -1561,6 +1616,7 @@ fn ScreenShareZoomControls(peer_id: String) -> Element {
     rsx! {
         div { class: "ss-zoom-controls",
             button {
+                id: "{zoom_out_id}",
                 r#type: "button",
                 class: "ss-zoom-btn",
                 title: "Zoom out",
@@ -1574,13 +1630,18 @@ fn ScreenShareZoomControls(peer_id: String) -> Element {
                 },
                 ZoomOutIcon {}
             }
+            // P3: make the % label a polite live region so SR users hear zoom
+            // changes (it's already updated imperatively by `apply_zoom`).
             span {
                 id: "{zoom_label_id}",
                 class: "ss-zoom-label",
                 "data-testid": "ss-zoom-label",
+                "aria-live": "polite",
+                role: "status",
                 "{initial_label}"
             }
             button {
+                id: "{zoom_in_id}",
                 r#type: "button",
                 class: "ss-zoom-btn",
                 title: "Zoom in",
@@ -1594,6 +1655,9 @@ fn ScreenShareZoomControls(peer_id: String) -> Element {
                 },
                 ZoomInIcon {}
             }
+            // S5: thin separator so [reset][detach] read as a distinct cluster
+            // from the [−][%][+] step group (reset isn't just another step).
+            span { class: "ss-zoom-sep", "aria-hidden": "true" }
             button {
                 r#type: "button",
                 class: "ss-zoom-btn",
@@ -1610,10 +1674,12 @@ fn ScreenShareZoomControls(peer_id: String) -> Element {
             }
             if pip_supported {
                 button {
+                    id: "{detach_btn_id}",
                     r#type: "button",
                     class: "ss-zoom-btn ss-detach-btn",
                     title: "Open shared content in a separate window",
                     "aria-label": "Open shared content in a separate window",
+                    "aria-pressed": "false",
                     "data-testid": "ss-detach",
                     onclick: move |_| {
                         #[cfg(target_arch = "wasm32")]

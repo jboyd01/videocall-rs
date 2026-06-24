@@ -3164,6 +3164,13 @@ html[data-theme="light"] #invite-overlay p {
   cursor: grabbing;
 }
 
+/* B1: keyboard-focus ring on the pannable viewport so a keyboard / switch user
+   sees where pan focus is. Mirrors `.ss-zoom-btn:focus-visible` below. */
+.ss-zoom-viewport--pannable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 /* Zoom / detach control cluster. Mirrors the `.tile-top-icons`
    placement language (corner overlay) but sits at the BOTTOM so it does
    not collide with the top signal / pin / crop icons, and travels with
@@ -3178,7 +3185,11 @@ html[data-theme="light"] #invite-overlay p {
   align-items: center;
   gap: min(8px, calc(var(--tile-w, 320px) * 0.025));
   padding: 4px 8px;
-  background-color: var(--overlay-heavy);
+  /* P2: bump toward opaque + blur so the control pill stays legible over any
+     shared content (a bright slide could wash out the lighter overlay). */
+  background-color: var(--overlay-opaque);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
   border-radius: var(--radius-lg);
   z-index: 4;
   /* Hidden until the tile is hovered, matching the pin/crop affordance.
@@ -3226,6 +3237,13 @@ html[data-theme="light"] #invite-overlay p {
   outline-offset: 2px;
 }
 
+/* S3: zoom buttons disabled at the min/max limit (set imperatively after each
+   zoom). Reduced opacity + not-allowed cursor signal the no-op state. */
+.ss-zoom-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .ss-zoom-label {
   min-width: 3.2em;
   text-align: center;
@@ -3233,6 +3251,70 @@ html[data-theme="light"] #invite-overlay p {
   font-size: 0.8rem;
   font-variant-numeric: tabular-nums;
   user-select: none;
+}
+
+/* S5: thin divider separating the [−][%][+] step cluster from the
+   [reset][detach] cluster so reset doesn't read as just another step. */
+.ss-zoom-sep {
+  align-self: stretch;
+  width: 0;
+  margin: 2px 2px;
+  border-left: 1px solid var(--border-emphasis);
+}
+
+/* S1: placeholder filling the grid hole while the content is detached into the
+   PiP window. Hidden by default; shown (flex) only when the SLOT is marked
+   detached. The moved host is gone from the slot by then, so this is what the
+   viewer sees in the grid. */
+.ss-pip-placeholder {
+  display: none;
+}
+
+.ss-pip-slot[data-detached="true"] .ss-pip-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  width: 100%;
+  height: 100%;
+  padding: 16px;
+  text-align: center;
+  color: var(--text-on-glass-strong);
+  background-color: var(--overlay-heavy);
+  border-radius: var(--radius-lg);
+}
+
+.ss-pip-placeholder svg {
+  width: 32px;
+  height: 32px;
+  opacity: 0.8;
+}
+
+.ss-pip-placeholder-text {
+  font-size: 0.9rem;
+}
+
+.ss-pip-placeholder-btn {
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--text-on-glass-strong);
+  background-color: var(--overlay-opaque);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.ss-pip-placeholder-btn:hover {
+  border-color: var(--accent);
+}
+
+.ss-pip-placeholder-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* ── Document PiP window body ─────────────────────────────────────────
