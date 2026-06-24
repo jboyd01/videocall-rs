@@ -53,8 +53,13 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
-/// Heartbeat interval for WebTransport sessions
-const WT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Heartbeat interval for WebTransport sessions.
+///
+/// `pub(crate)` so the #1637 relay-side QUIC path-stat sampler in
+/// `webtransport::handle_webtransport_session` can sample at the SAME cadence as
+/// this actor's heartbeat (the cadence the issue specifies), driven by the single
+/// source of truth rather than a duplicated literal.
+pub(crate) const WT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Keep-alive ping data (WebTransport-specific)
 const KEEP_ALIVE_PING: &[u8] = b"ping";
@@ -283,6 +288,18 @@ impl WtChatSession {
             datagram_tx,
             activated: false,
         }
+    }
+
+    /// The canonical per-session id for this connection (`SessionLogic::id`).
+    ///
+    /// This is the SAME `u64` that `record_session_drop` / `forget_session_drops`
+    /// stringify for the `session_id` label on `relay_session_drops_total`, so a
+    /// caller reading it here (e.g. to label the #1637 relay RTT gauge) produces a
+    /// series that JOINS with the per-session drop series for this connection.
+    /// Read on the constructed actor value BEFORE `start()` consumes it —
+    /// `SessionLogic` assigns the id in `new`, so it is stable from construction.
+    pub fn session_id(&self) -> SessionId {
+        self.logic.id
     }
 
     /// Send outbound message via the channel (reliable unidirectional stream).
