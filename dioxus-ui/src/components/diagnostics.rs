@@ -245,11 +245,127 @@ fn peer_jitter_class(jitter_ms: u64) -> (&'static str, &'static str) {
 fn peer_lag_class(lag_ms: f64) -> (&'static str, &'static str) {
     if lag_ms < 1000.0 {
         ("is-good", "")
-    } else if lag_ms < 1800.0 {
+    } else if lag_ms < PEER_LAG_POOR_MS {
         ("is-warn", "falling behind")
     } else {
         ("is-poor", "severely behind real-time")
     }
+}
+
+/// issue 1656: poor capture-lag boundary (ms). The chip turns "severely behind
+/// real-time" at this value, derived from the backend
+/// `MAX_CAPTURE_LAG_MS = 1800.0` (videocall-codecs/src/jitter_buffer.rs) — the
+/// point at which the jitter buffer treats capture as stalled. That constant is
+/// a private `const` across a crate boundary and is NOT importable from
+/// videocall-ui, so this is a deliberate, drift-marked copy: the
+/// `peer_lag_poor_threshold_matches_backend` test pins this value so a future
+/// edit to the UI threshold is visible/intentional rather than a silent drift.
+const PEER_LAG_POOR_MS: f64 = 1800.0;
+
+/// issue 1656: per-peer VIDEO worker/heartbeat readout threaded from the
+/// subscribe loop into the receive breakdown + Per-Peer Summary triage chip.
+/// Each field is `Option` so a peer absent from the map (or a `None` field)
+/// renders the em-dash "unknown" idiom, while a folded `0.0` renders a real
+/// value. The three metrics arrive from TWO producers on the SAME subsystem
+/// `"video"` bus: the diagnostics-manager HEARTBEAT carries `fps_received`
+/// (+ `media_type`), the worker event carries `realtime_lag_ms` +
+/// `fps_painted` (NO `media_type`). Both key by `to_peer`. Because a heartbeat
+/// updates only `recv_fps` and a worker updates only `lag_ms`/`painted_fps`,
+/// the fold is PER-FIELD latest-wins (see [`fold_video_readout`]).
+///
+/// `recv_fps` is VIDEO-only. The heartbeat fires for BOTH VIDEO and SCREEN with
+/// the SAME `to_peer`, so [`fold_video_readout`] folds `fps_received` into
+/// `recv_fps` ONLY when `media_type == "VIDEO"` (or is absent, as on the worker
+/// event); a SCREEN heartbeat is ignored for this readout and never sets
+/// `recv_fps`. `lag_ms`/`painted_fps` come from the worker event (which carries
+/// no `media_type` and is structurally the video pipeline), so they are not
+/// affected by the media-type filter.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+struct PeerVideoReadout {
+    recv_fps: Option<f64>,
+    lag_ms: Option<f64>,
+    painted_fps: Option<f64>,
+}
+
+/// issue 1656: fold one `"video"` [`DiagEvent`]'s worker/heartbeat fields into
+/// the per-peer readout map, per-field latest-wins. Returns `true` IFF a value
+/// actually changed (so the caller can change-gate the signal `.set()` and not
+/// wake the drawer on every ~1 Hz tick). A field is overwritten ONLY when its
+/// metric is `Some` on THIS event — a heartbeat (recv only) must not clobber a
+/// prior worker's lag/painted, and vice-versa. Rounds to the displayed
+/// precision (recv/painted to 1 decimal, lag to whole ms) so jitter below the
+/// shown digits can't defeat the change-gate. Returns `false` (no change) for
+/// an event lacking `to_peer` or any of the three metrics. Pure / host-testable.
+///
+/// `media_type` filter (issue 1656): `recv_fps` is the VIDEO (camera) pipeline
+/// ONLY. The heartbeat producer emits this `"video"` subsystem event for BOTH
+/// VIDEO and SCREEN (it excludes only AUDIO —
+/// diagnostics_manager.rs:463-477) with the SAME `to_peer`, so a SCREEN
+/// heartbeat's `fps_received` would otherwise last-writer-wins over the camera's
+/// in the same `to_peer`-keyed entry. We therefore DROP `recv` whenever the
+/// event explicitly carries a non-VIDEO `media_type`. An ABSENT `media_type`
+/// (the worker event carries none) is treated as the video pipeline and KEEPS
+/// recv. `lag_ms`/`painted_fps` carry no `media_type` and are emitted only by
+/// the worker event, so the filter does not touch them. A SCREEN-only heartbeat
+/// (whose sole relevant metric was `fps_received`) thus folds nothing and
+/// returns `false` without creating or dirtying an entry.
+fn fold_video_readout(
+    map: &mut HashMap<String, PeerVideoReadout>,
+    evt: &videocall_diagnostics::DiagEvent,
+) -> bool {
+    let mut peer: Option<String> = None;
+    let mut recv: Option<f64> = None;
+    let mut lag: Option<f64> = None;
+    let mut painted: Option<f64> = None;
+    let mut media_type: Option<String> = None;
+    for m in &evt.metrics {
+        match (m.name, &m.value) {
+            ("to_peer", MetricValue::Text(t)) => peer = Some(t.to_string()),
+            ("media_type", MetricValue::Text(t)) => media_type = Some(t.to_string()),
+            ("fps_received", MetricValue::F64(v)) => recv = Some((*v * 10.0).round() / 10.0),
+            ("realtime_lag_ms", MetricValue::F64(v)) => lag = Some((*v).round()),
+            ("fps_painted", MetricValue::F64(v)) => painted = Some((*v * 10.0).round() / 10.0),
+            _ => {}
+        }
+    }
+    let Some(peer) = peer else {
+        return false;
+    };
+    // issue 1656 (media_type filter): `recv_fps` comes from the heartbeat, which
+    // emits a `"video"` subsystem event for BOTH VIDEO and SCREEN (it excludes
+    // only AUDIO — see diagnostics_manager.rs:463-477) with the SAME
+    // `to_peer = peer_id`. This readout is the camera/VIDEO pipeline only, so a
+    // SCREEN heartbeat's `fps_received` must NOT land in `recv_fps` (last-writer
+    // -wins would otherwise show the screen's recv fps on the camera row). DROP
+    // recv whenever the event explicitly tags a non-VIDEO `media_type`. ABSENT
+    // media_type (the worker event carries none) is treated as the video
+    // pipeline → recv is kept. lag/painted are unaffected: they arrive only on
+    // the worker event, which carries no media_type and no recv, so there is no
+    // cross-contamination on those fields.
+    if let Some(mt) = &media_type {
+        if mt != "VIDEO" {
+            recv = None;
+        }
+    }
+    // Nothing of interest left to fold on this event (e.g. the loss/keyframe
+    // `"video"` event, or a SCREEN heartbeat whose only relevant metric was the
+    // now-dropped `fps_received`) → leave the map untouched, no change, no entry
+    // created.
+    if recv.is_none() && lag.is_none() && painted.is_none() {
+        return false;
+    }
+    let entry = map.entry(peer).or_default();
+    let before = *entry;
+    if recv.is_some() {
+        entry.recv_fps = recv;
+    }
+    if lag.is_some() {
+        entry.lag_ms = lag;
+    }
+    if painted.is_some() {
+        entry.painted_fps = painted;
+    }
+    *entry != before
 }
 
 // Serializable versions of DiagEvent structures
@@ -719,13 +835,14 @@ pub fn Diagnostics(
     let mut neteq_buffer_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut peer_transport_per_peer = use_signal(HashMap::<String, String>::new);
-    // issue 1656: per-peer worker readout — `(realtime_lag_ms, fps_painted)`,
-    // each `Option` so a peer absent from the map (or a `None` field) renders the
-    // em-dash "unknown" in the Receive breakdown, while a folded `0.0` renders a
-    // real value. Keyed by `Peer::sid_str` (u64-as-String) == the worker event's
-    // `to_peer`. `.set()` is change-gated in the subscribe loop (mirrors
-    // `peer_transport_per_peer`) so a 1 Hz worker event doesn't wake the drawer.
-    let mut peer_lag_fps_per_peer = use_signal(HashMap::<String, (Option<f64>, Option<f64>)>::new);
+    // issue 1656: per-peer VIDEO readout — recv fps + capture-lag + painted fps
+    // (see `PeerVideoReadout`), each `Option` so a peer absent from the map (or a
+    // `None` field) renders the em-dash "unknown" in the Receive breakdown /
+    // triage chip, while a folded `0.0` renders a real value. Keyed by
+    // `Peer::sid_str` (u64-as-String) == the worker/heartbeat event's `to_peer`.
+    // `.set()` is change-gated in the subscribe loop (mirrors
+    // `peer_transport_per_peer`) so a 1 Hz event doesn't wake the drawer.
+    let mut peer_lag_fps_per_peer = use_signal(HashMap::<String, PeerVideoReadout>::new);
     let mut diag_task = use_signal(|| None::<Task>);
     let mut backend_versions = use_signal(Vec::<serde_json::Value>::new);
 
@@ -786,12 +903,14 @@ pub fn Diagnostics(
             // loop-local like `last_push_ms`, so it resets on drawer reopen
             // along with everything else.
             let mut reception = BTreeMap::<(String, String), ReceptionEntry>::new();
-            // issue 1656: per-peer worker readout `(lag_ms, fps_painted)`,
-            // locally cached. The worker `"video"` event arrives ~1 Hz, so we
-            // only push to the signal when a peer's tuple actually changes —
-            // mirrors `peer_transport` to keep the drawer body from re-rendering
-            // on every worker tick. Keyed by `to_peer` (u64-as-String).
-            let mut peer_lag_fps = HashMap::<String, (Option<f64>, Option<f64>)>::new();
+            // issue 1656: per-peer VIDEO readout (recv fps + lag + painted fps,
+            // see `PeerVideoReadout`), locally cached. The heartbeat AND worker
+            // `"video"` events each arrive ~1 Hz from DIFFERENT producers, so we
+            // fold both into this map per-field latest-wins and only push to the
+            // signal when a peer's readout actually changes — mirrors
+            // `peer_transport` to keep the drawer body from re-rendering on every
+            // tick. Keyed by `to_peer` (u64-as-String).
+            let mut peer_lag_fps = HashMap::<String, PeerVideoReadout>::new();
 
             while let Ok(evt) = rx.recv().await {
                 match evt.subsystem {
@@ -826,43 +945,15 @@ pub fn Diagnostics(
                                 }
                             }
                         }
-                        // issue 1656: per-peer worker readout. Parse `to_peer`
-                        // plus `realtime_lag_ms`/`fps_painted` (only the worker
-                        // event carries the latter two). Round lag to whole ms
-                        // and painted to 1 decimal so sub-second jitter below the
-                        // displayed precision doesn't defeat the change-gate.
-                        // Update + `.set()` only when a peer's tuple changed
-                        // (mirrors `peer_transport` above).
-                        let mut wp: Option<String> = None;
-                        let mut wlag: Option<f64> = None;
-                        let mut wpainted: Option<f64> = None;
-                        for m in &evt.metrics {
-                            match (m.name, &m.value) {
-                                ("to_peer", MetricValue::Text(t)) => wp = Some(t.to_string()),
-                                ("realtime_lag_ms", MetricValue::F64(v)) => {
-                                    wlag = Some((*v).round())
-                                }
-                                ("fps_painted", MetricValue::F64(v)) => {
-                                    wpainted = Some((*v * 10.0).round() / 10.0)
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Only act on the worker event (has to_peer AND at least
-                        // one worker field). The heartbeat/loss `"video"` events
-                        // carry neither, so they leave the map untouched.
-                        if let Some(p) = wp {
-                            if wlag.is_some() || wpainted.is_some() {
-                                let next = (wlag, wpainted);
-                                let changed = match peer_lag_fps.get(&p) {
-                                    Some(prev) => prev != &next,
-                                    None => true,
-                                };
-                                if changed {
-                                    peer_lag_fps.insert(p, next);
-                                    peer_lag_fps_per_peer.set(peer_lag_fps.clone());
-                                }
-                            }
+                        // issue 1656: per-peer VIDEO readout. Fold `to_peer` +
+                        // `fps_received` (heartbeat) / `realtime_lag_ms` +
+                        // `fps_painted` (worker) per-field latest-wins via the
+                        // pure helper, which rounds to the displayed precision so
+                        // sub-second jitter can't defeat the change-gate, and
+                        // returns whether a value actually changed. Push to the
+                        // signal only on a real change (mirrors `peer_transport`).
+                        if fold_video_readout(&mut peer_lag_fps, &evt) {
+                            peer_lag_fps_per_peer.set(peer_lag_fps.clone());
                         }
                     }
                     "sender" => {
@@ -1506,6 +1597,12 @@ pub fn Diagnostics(
                         div { class: "peer-summary",
                             {
                                 let transport_map = peer_transport_per_peer();
+                                // BLOCKER 2: read the per-peer VIDEO readout here in
+                                // the same parent scope and join on the `peer_id`
+                                // key (NetEq target peer = session-id string ==
+                                // `to_peer`), so the triage chip can show "which peer
+                                // is in slow motion" at a glance next to Buffer/Jitter.
+                                let lag_fps_map = peer_lag_fps_per_peer();
                                 rsx! {
                                     for (peer_id, _) in stats_map.iter() {
                                         {
@@ -1522,6 +1619,36 @@ pub fn Diagnostics(
                                                 Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
                                                 _ => ("\u{2014}", "connection-type", "Transport unknown"),
                                             };
+                                            // BLOCKER 2 triage chip: lag + recv/painted fps for
+                                            // this peer. Same contrast-safe treatment as the
+                                            // receive row (BLOCKER 1): neutral value text + a
+                                            // non-text severity dot. The chip is color-accent +
+                                            // TITLE only (no aria-live) — the receive row owns the
+                                            // single aria-live "poor" announcement, so we do NOT
+                                            // double-announce the same peer's poor lag here (that
+                                            // would spam AT). The title carries the reason text, so
+                                            // the chip is never color-only. Unknown → em-dash with
+                                            // a specific title/aria-label (item 4).
+                                            let readout = lag_fps_map.get(peer_id).copied().unwrap_or_default();
+                                            let recv_txt = readout
+                                                .recv_fps
+                                                .map(|v| format!("{v:.0}"))
+                                                .unwrap_or_else(|| "\u{2014}".into());
+                                            let painted_txt = readout
+                                                .painted_fps
+                                                .map(|v| format!("{v:.1}"))
+                                                .unwrap_or_else(|| "\u{2014}".into());
+                                            let (lag_txt, lag_class, lag_title) = match readout.lag_ms {
+                                                Some(v) => {
+                                                    let (c, reason) = peer_lag_class(v);
+                                                    // good has no reason word; give the title a
+                                                    // neutral phrase so AT never reads a bare value.
+                                                    let title = if reason.is_empty() { "on time" } else { reason };
+                                                    (format!("{v:.0} ms"), c, title)
+                                                }
+                                                None => ("\u{2014}".to_string(), "", "Capture lag unknown"),
+                                            };
+                                            let lag_has_dot = !lag_class.is_empty();
                                             rsx! {
                                                 div { class: "peer-summary-item",
                                                     strong { "{display}" }
@@ -1533,6 +1660,54 @@ pub fn Diagnostics(
                                                             span { class: "peer-stat {buf_class}", title: "{buf_title}", "{latest_buffer}ms" }
                                                             ", Jitter: "
                                                             span { class: "peer-stat {jit_class}", title: "{jit_title}", "{latest_jitter}ms" }
+                                                        }
+                                                        // Triage chip: fps gap + lag with dot accent.
+                                                        span {
+                                                            class: "peer-summary-item__lag",
+                                                            "data-testid": "diag-peer-summary-lag-{peer_id}",
+                                                            "Lag: "
+                                                            if lag_has_dot {
+                                                                span {
+                                                                    class: "peer-stat__dot {lag_class}",
+                                                                    "aria-hidden": "true",
+                                                                }
+                                                            }
+                                                            if lag_txt == "\u{2014}" {
+                                                                span {
+                                                                    class: "peer-stat__value",
+                                                                    title: "{lag_title}",
+                                                                    "aria-label": "{lag_title}",
+                                                                    "{lag_txt}"
+                                                                }
+                                                            } else {
+                                                                span {
+                                                                    class: "peer-stat__value",
+                                                                    title: "{lag_title}",
+                                                                    "{lag_txt}"
+                                                                }
+                                                            }
+                                                            ", fps "
+                                                            if recv_txt == "\u{2014}" {
+                                                                span {
+                                                                    class: "peer-stat__value",
+                                                                    title: "Received fps unknown",
+                                                                    "aria-label": "Received fps unknown",
+                                                                    "{recv_txt}"
+                                                                }
+                                                            } else {
+                                                                span { class: "peer-stat__value", "{recv_txt}" }
+                                                            }
+                                                            "/"
+                                                            if painted_txt == "\u{2014}" {
+                                                                span {
+                                                                    class: "peer-stat__value",
+                                                                    title: "Painted fps unknown",
+                                                                    "aria-label": "Painted fps unknown",
+                                                                    "{painted_txt}"
+                                                                }
+                                                            } else {
+                                                                span { class: "peer-stat__value", "{painted_txt}" }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1884,11 +2059,12 @@ fn DiagnosticsPerformancePanel(controls: PerfControlsHandle, audio_source_active
 fn SimulcastLayersSection(
     is_open: bool,
     reader: Option<DiagnosticsReader>,
-    /// issue 1656: per-peer worker readout `(realtime_lag_ms, fps_painted)`,
-    /// keyed by `Peer::sid_str` (u64-as-String). Passed as a plain value clone
-    /// (NOT a signal handle) — this section re-renders at 4 Hz via its own tick,
-    /// so reading the parent signal once and threading the value down is fine.
-    lag_fps: HashMap<String, (Option<f64>, Option<f64>)>,
+    /// issue 1656: per-peer VIDEO readout (`recv_fps` + `lag_ms` +
+    /// `painted_fps`, see [`PeerVideoReadout`]), keyed by `Peer::sid_str`
+    /// (u64-as-String). Passed as a plain value clone (NOT a signal handle) —
+    /// this section re-renders at 4 Hz via its own tick, so reading the parent
+    /// signal once and threading the value down is fine.
+    lag_fps: HashMap<String, PeerVideoReadout>,
 ) -> Element {
     // 4 Hz refresh tick scoped to THIS component. Gated to `is_open`; the handle
     // lives in a `use_hook` cell and `use_drop` cancels it on unmount.
@@ -2124,11 +2300,12 @@ fn SimulcastReceiveBreakdown(
     /// rather than an `Rc<dyn Fn>` (which the `#[component]` macro can't derive
     /// `PartialEq` for). Empty → the Device section renders nothing.
     device_blocks: Vec<DeviceBlock>,
-    /// issue 1656: per-peer worker readout `(realtime_lag_ms, fps_painted)`,
-    /// keyed by `Peer::sid_str` (u64-as-String) == `PeerReceiveDiag.session_id`
-    /// rendered as a String. A peer absent (or a `None` field) renders the
-    /// em-dash unknown idiom. Only consumed for the VIDEO kind rows.
-    lag_fps: HashMap<String, (Option<f64>, Option<f64>)>,
+    /// issue 1656: per-peer VIDEO readout (`recv_fps` + `lag_ms` +
+    /// `painted_fps`, see [`PeerVideoReadout`]), keyed by `Peer::sid_str`
+    /// (u64-as-String) == `PeerReceiveDiag.session_id` rendered as a String. A
+    /// peer absent (or a `None` field) renders the em-dash unknown idiom. Only
+    /// consumed for the VIDEO kind rows.
+    lag_fps: HashMap<String, PeerVideoReadout>,
 ) -> Element {
     rsx! {
         div { class: "simulcast-recv",
@@ -2202,31 +2379,41 @@ fn SimulcastReceiveBreakdown(
                                         let line = format_peer_kind_line(kind_label, Some(&p.snap))
                                             .map(|l| format!("{}: {l}", p.label))
                                             .unwrap_or(p.label);
-                                        // issue 1656: per-peer VIDEO worker readout. Only the
-                                        // video kind shows the painted-fps and capture-lag chip;
-                                        // audio/screen render nothing new. Look up by
-                                        // session_id-as-String == the worker event's `to_peer`.
-                                        // A peer absent from the map (or a `None` field) renders
-                                        // the em-dash unknown idiom. `0.0` (a real "on time"
-                                        // reading once a worker event has arrived) renders `0`.
+                                        // issue 1656: per-peer VIDEO readout. Only the video
+                                        // kind shows the recv/painted fps pair and capture-lag
+                                        // chip; audio/screen render nothing new. Look up by
+                                        // session_id-as-String == the event's `to_peer`. A peer
+                                        // absent (or a `None` field) renders the em-dash unknown
+                                        // idiom. `0.0` (a real "on time"/"no frames" reading once
+                                        // an event has arrived) renders a real value.
                                         let is_video = kind == PrefMediaKind::Video;
-                                        let (lag_opt, painted_opt) = if is_video {
-                                            lag_fps
-                                                .get(&session_id.to_string())
-                                                .copied()
-                                                .unwrap_or((None, None))
+                                        let readout = if is_video {
+                                            lag_fps.get(&session_id.to_string()).copied().unwrap_or_default()
                                         } else {
-                                            (None, None)
+                                            PeerVideoReadout::default()
                                         };
-                                        let painted_txt = painted_opt
+                                        // issue 1656 (item 3): the recv-vs-painted GAP is the
+                                        // slow-motion signature — both numbers must be visible
+                                        // together and labelled. recv whole-number, painted .1.
+                                        let recv_txt = readout
+                                            .recv_fps
+                                            .map(|v| format!("{v:.0}"))
+                                            .unwrap_or_else(|| "\u{2014}".into());
+                                        let painted_txt = readout
+                                            .painted_fps
                                             .map(|v| format!("{v:.1}"))
                                             .unwrap_or_else(|| "\u{2014}".into());
-                                        // Lag chip: class+reason from peer_lag_class when known.
-                                        // Unknown (no worker event yet) → neutral em-dash, no
-                                        // alarm. The poor state additionally announces an
+                                        // BLOCKER 1: legibility is DECOUPLED from severity. The
+                                        // lag VALUE text renders in a high-contrast neutral
+                                        // (.peer-stat__value → --text-primary, passes WCAG AA at
+                                        // --fs-2 in both themes); the severity HUE is carried only
+                                        // by a non-text dot (.peer-stat__dot, filled with the
+                                        // --diag-q-* token). `lag_class` styles the DOT, not the
+                                        // value text. Unknown (no event yet) → em-dash, no dot, no
+                                        // alarm. The poor state additionally announces an sr-only
                                         // aria-live status so the alarm is not color-only.
                                         let (lag_txt, lag_class, lag_title, lag_alarm) =
-                                            match lag_opt {
+                                            match readout.lag_ms {
                                                 Some(v) => {
                                                     let (c, reason) = peer_lag_class(v);
                                                     (
@@ -2238,6 +2425,9 @@ fn SimulcastReceiveBreakdown(
                                                 }
                                                 None => ("\u{2014}".to_string(), "", "", false),
                                             };
+                                        // Show the dot only when we have a real lag reading
+                                        // (a class). Unknown → no dot (em-dash carries "unknown").
+                                        let lag_has_dot = !lag_class.is_empty();
                                         rsx! {
                                             div {
                                                 class: "simulcast-recv-peer",
@@ -2271,24 +2461,76 @@ fn SimulcastReceiveBreakdown(
                                                     div {
                                                         class: "simulcast-recv-peer-stats",
                                                         "data-testid": "diag-simulcast-recv-stats-{session_id}",
+                                                        // issue 1656 (item 3): recv-vs-painted GAP,
+                                                        // both numbers visible + labelled. Values
+                                                        // render in the neutral container color
+                                                        // (passes AA); the em-dash carries a title/
+                                                        // aria-label for AT when unknown (item 4).
                                                         span {
-                                                            class: "simulcast-recv-peer-painted",
-                                                            "painted: {painted_txt} fps"
+                                                            class: "simulcast-recv-peer-fps",
+                                                            "recv "
+                                                            if recv_txt == "\u{2014}" {
+                                                                span {
+                                                                    class: "peer-stat__value",
+                                                                    title: "Received fps unknown",
+                                                                    "aria-label": "Received fps unknown",
+                                                                    "{recv_txt}"
+                                                                }
+                                                            } else {
+                                                                span { class: "peer-stat__value", "{recv_txt}" }
+                                                            }
+                                                            " / painted "
+                                                            if painted_txt == "\u{2014}" {
+                                                                span {
+                                                                    class: "peer-stat__value",
+                                                                    title: "Painted fps unknown",
+                                                                    "aria-label": "Painted fps unknown",
+                                                                    "{painted_txt}"
+                                                                }
+                                                            } else {
+                                                                span { class: "peer-stat__value", "{painted_txt}" }
+                                                            }
+                                                            " fps"
                                                         }
                                                         span {
                                                             class: "simulcast-recv-peer-lag",
                                                             "lag: "
-                                                            span {
-                                                                class: "peer-stat {lag_class}",
-                                                                title: "{lag_title}",
-                                                                "{lag_txt}"
+                                                            // BLOCKER 1: severity hue is a non-text
+                                                            // dot; the VALUE text is neutral and
+                                                            // high-contrast. The dot's class carries
+                                                            // the --diag-q-* color; aria-hidden since
+                                                            // the title/reason text conveys meaning.
+                                                            if lag_has_dot {
+                                                                span {
+                                                                    class: "peer-stat__dot {lag_class}",
+                                                                    "aria-hidden": "true",
+                                                                }
+                                                            }
+                                                            if lag_txt == "\u{2014}" {
+                                                                span {
+                                                                    class: "peer-stat__value",
+                                                                    title: "Capture lag unknown",
+                                                                    "aria-label": "Capture lag unknown",
+                                                                    "{lag_txt}"
+                                                                }
+                                                            } else {
+                                                                span {
+                                                                    class: "peer-stat__value",
+                                                                    title: "{lag_title}",
+                                                                    "{lag_txt}"
+                                                                }
                                                             }
                                                         }
                                                         if lag_alarm {
-                                                            // a11y: the poor lag is not color-only —
-                                                            // announce it politely for assistive tech.
+                                                            // a11y: the poor lag is NOT color-only —
+                                                            // the visible chip already shows it via
+                                                            // the dot + neutral "N ms" text + title.
+                                                            // This element is a REDUNDANT, sr-only
+                                                            // announcement for assistive tech, so it
+                                                            // is visually-hidden (not merely a faint
+                                                            // color, which would itself fail AA).
                                                             span {
-                                                                class: "simulcast-recv-peer-lag-alarm",
+                                                                class: "visually-hidden",
                                                                 role: "status",
                                                                 "aria-live": "polite",
                                                                 "Capture lag {lag_title}"
@@ -2653,5 +2895,291 @@ mod tests {
             "painted folded: {text}"
         );
         assert!(text.contains("lag: 1234 ms"), "lag folded: {text}");
+    }
+
+    /// issue 1656 (item 3): `fold_video_readout` must merge the HEARTBEAT
+    /// (`fps_received` only) and the WORKER (`realtime_lag_ms` + `fps_painted`
+    /// only) events for the SAME peer PER-FIELD latest-wins — a heartbeat must
+    /// NOT clobber a prior worker's lag/painted, and a worker must NOT clobber a
+    /// prior heartbeat's recv. Reverting the fold to whole-struct overwrite
+    /// (dropping the `is_some()` guards) makes the heartbeat null out lag/painted
+    /// (or the worker null out recv) → one of the `Some(...)` asserts fails.
+    #[test]
+    fn fold_video_readout_per_field_latest_wins() {
+        let mut map = HashMap::<String, PeerVideoReadout>::new();
+        // Heartbeat first: recv only.
+        let heartbeat = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1,
+            metrics: vec![
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("7".into())),
+                m("fps_received", MetricValue::F64(30.0)),
+            ],
+        };
+        assert!(
+            fold_video_readout(&mut map, &heartbeat),
+            "first fold changes"
+        );
+        assert_eq!(
+            map["7"],
+            PeerVideoReadout {
+                recv_fps: Some(30.0),
+                lag_ms: None,
+                painted_fps: None
+            }
+        );
+        // Worker next: lag + painted only — must NOT erase recv.
+        let worker = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 2,
+            metrics: vec![
+                m("to_peer", MetricValue::Text("7".into())),
+                m("realtime_lag_ms", MetricValue::F64(1234.4)),
+                m("fps_painted", MetricValue::F64(12.34)),
+            ],
+        };
+        assert!(fold_video_readout(&mut map, &worker), "worker fold changes");
+        assert_eq!(
+            map["7"],
+            PeerVideoReadout {
+                // recv retained across the worker event (the recv-vs-painted GAP
+                // signature depends on both surviving): 30 recv / 12.3 painted.
+                recv_fps: Some(30.0),
+                // lag rounded to whole ms; painted rounded to 1 decimal.
+                lag_ms: Some(1234.0),
+                painted_fps: Some(12.3),
+            }
+        );
+        // A later heartbeat (recv only) must NOT erase lag/painted either.
+        let heartbeat2 = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 3,
+            metrics: vec![
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("7".into())),
+                m("fps_received", MetricValue::F64(29.0)),
+            ],
+        };
+        assert!(
+            fold_video_readout(&mut map, &heartbeat2),
+            "recv change folds"
+        );
+        assert_eq!(
+            map["7"],
+            PeerVideoReadout {
+                recv_fps: Some(29.0),
+                lag_ms: Some(1234.0),
+                painted_fps: Some(12.3),
+            }
+        );
+    }
+
+    /// issue 1656: the fold's change-gate verdict. A re-fold of the SAME rounded
+    /// values must return `false` (so the caller suppresses the signal `.set()`
+    /// and the drawer doesn't re-render on every ~1 Hz tick), while an event with
+    /// no `to_peer` or no recognized metric must also return `false` and leave
+    /// the map untouched. Removing the `*entry != before` change-gate makes the
+    /// same-value re-fold return `true` → the suppression assert fails.
+    #[test]
+    fn fold_video_readout_change_gate_and_noop_events() {
+        let mut map = HashMap::<String, PeerVideoReadout>::new();
+        let worker = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1,
+            metrics: vec![
+                m("to_peer", MetricValue::Text("9".into())),
+                m("realtime_lag_ms", MetricValue::F64(500.0)),
+                m("fps_painted", MetricValue::F64(24.0)),
+            ],
+        };
+        assert!(fold_video_readout(&mut map, &worker), "first fold changes");
+        // Sub-precision jitter (below the displayed digits) re-rounds to the same
+        // values → no change → no re-render.
+        let worker_jitter = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 2,
+            metrics: vec![
+                m("to_peer", MetricValue::Text("9".into())),
+                m("realtime_lag_ms", MetricValue::F64(500.4)),
+                m("fps_painted", MetricValue::F64(24.04)),
+            ],
+        };
+        assert!(
+            !fold_video_readout(&mut map, &worker_jitter),
+            "same rounded values must not re-render"
+        );
+        // No `to_peer` → no fold.
+        let no_peer = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 3,
+            metrics: vec![m("realtime_lag_ms", MetricValue::F64(900.0))],
+        };
+        assert!(
+            !fold_video_readout(&mut map, &no_peer),
+            "no to_peer → no fold"
+        );
+        // `to_peer` but no recognized metric (e.g. a loss/keyframe event) → no
+        // fold, map untouched.
+        let loss = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 4,
+            metrics: vec![
+                m("to_peer", MetricValue::Text("9".into())),
+                m("video_seq_loss_per_sec", MetricValue::F64(2.0)),
+            ],
+        };
+        assert!(
+            !fold_video_readout(&mut map, &loss),
+            "no metric of interest → no fold"
+        );
+        assert_eq!(map.len(), 1, "no spurious entries created");
+        assert_eq!(
+            map["9"],
+            PeerVideoReadout {
+                recv_fps: None,
+                lag_ms: Some(500.0),
+                painted_fps: Some(24.0),
+            }
+        );
+    }
+
+    /// issue 1656 (media_type filter): the heartbeat producer emits the
+    /// `"video"` subsystem event for BOTH VIDEO and SCREEN with the SAME
+    /// `to_peer` (diagnostics_manager.rs:463-477). A peer screen-sharing while
+    /// camera-on therefore produces TWO heartbeats per tick under one key — and
+    /// `recv_fps` is the VIDEO (camera) row only. This pins that a SCREEN
+    /// heartbeat's `fps_received` does NOT touch `recv_fps` (it must not even
+    /// create/dirty the entry), while a VIDEO heartbeat DOES, and the worker
+    /// event (no `media_type`) still folds lag/painted regardless. Removing the
+    /// media_type filter (folding recv from SCREEN too) makes the SCREEN
+    /// heartbeat set `recv_fps = 99.0` → the `recv_fps: None` / `recv_fps:
+    /// Some(30.0)` asserts fail.
+    #[test]
+    fn fold_video_readout_ignores_screen_heartbeat_recv() {
+        let mut map = HashMap::<String, PeerVideoReadout>::new();
+        // SCREEN heartbeat FIRST: carries to_peer + fps_received + media_type
+        // SCREEN. Its fps_received (99) must NOT land in recv_fps, and because
+        // that was its only foldable field, it must not create an entry at all.
+        let screen_heartbeat = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1,
+            metrics: vec![
+                m("media_type", MetricValue::Text("SCREEN".into())),
+                m("to_peer", MetricValue::Text("7".into())),
+                m("fps_received", MetricValue::F64(99.0)),
+            ],
+        };
+        assert!(
+            !fold_video_readout(&mut map, &screen_heartbeat),
+            "SCREEN heartbeat must not fold (recv dropped, nothing left)"
+        );
+        assert!(
+            !map.contains_key("7"),
+            "SCREEN-only heartbeat must not create an entry"
+        );
+        // VIDEO heartbeat for the SAME peer: this one DOES set recv_fps.
+        let video_heartbeat = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 2,
+            metrics: vec![
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("7".into())),
+                m("fps_received", MetricValue::F64(30.0)),
+            ],
+        };
+        assert!(
+            fold_video_readout(&mut map, &video_heartbeat),
+            "VIDEO heartbeat folds recv_fps"
+        );
+        assert_eq!(
+            map["7"],
+            PeerVideoReadout {
+                recv_fps: Some(30.0),
+                lag_ms: None,
+                painted_fps: None,
+            }
+        );
+        // A LATER SCREEN heartbeat (higher fps) for the same peer must NOT
+        // overwrite the camera recv_fps that was just set — this is the exact
+        // last-writer-wins bug the filter prevents.
+        let screen_heartbeat2 = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 3,
+            metrics: vec![
+                m("media_type", MetricValue::Text("SCREEN".into())),
+                m("to_peer", MetricValue::Text("7".into())),
+                m("fps_received", MetricValue::F64(99.0)),
+            ],
+        };
+        assert!(
+            !fold_video_readout(&mut map, &screen_heartbeat2),
+            "later SCREEN heartbeat must not change the camera readout"
+        );
+        assert_eq!(
+            map["7"].recv_fps,
+            Some(30.0),
+            "camera recv_fps unchanged by the SCREEN heartbeat"
+        );
+        // Worker event (no media_type → video pipeline) still folds lag/painted
+        // for the same peer, regardless of the SCREEN/VIDEO filtering above.
+        let worker = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 4,
+            metrics: vec![
+                m("to_peer", MetricValue::Text("7".into())),
+                m("realtime_lag_ms", MetricValue::F64(1234.0)),
+                m("fps_painted", MetricValue::F64(28.0)),
+            ],
+        };
+        assert!(
+            fold_video_readout(&mut map, &worker),
+            "worker (no media_type) folds lag/painted"
+        );
+        assert_eq!(
+            map["7"],
+            PeerVideoReadout {
+                recv_fps: Some(30.0),
+                lag_ms: Some(1234.0),
+                painted_fps: Some(28.0),
+            }
+        );
+    }
+
+    /// issue 1656 (optional drift-guard): the UI's "poor" capture-lag threshold
+    /// is a deliberate cross-crate COPY of the backend `MAX_CAPTURE_LAG_MS`
+    /// (videocall-codecs/src/jitter_buffer.rs), which is a private `const` not
+    /// importable from videocall-ui. This drift marker pins the UI value so any
+    /// future edit to `PEER_LAG_POOR_MS` is visible/intentional (and a reviewer
+    /// is reminded to re-check the backend coupling) rather than a silent drift.
+    /// It references the production const directly — mutating `PEER_LAG_POOR_MS`
+    /// fails this test AND flips `peer_lag_class`'s poor boundary.
+    #[test]
+    fn peer_lag_poor_threshold_matches_backend() {
+        assert_eq!(
+            PEER_LAG_POOR_MS, 1800.0,
+            "UI poor capture-lag threshold must track backend MAX_CAPTURE_LAG_MS \
+             (videocall-codecs/src/jitter_buffer.rs); update both deliberately"
+        );
+        // And the classifier must actually USE the const at its boundary.
+        assert_eq!(
+            peer_lag_class(PEER_LAG_POOR_MS),
+            ("is-poor", "severely behind real-time")
+        );
+        assert_eq!(
+            peer_lag_class(PEER_LAG_POOR_MS - 0.1),
+            ("is-warn", "falling behind")
+        );
     }
 }

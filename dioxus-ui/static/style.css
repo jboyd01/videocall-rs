@@ -1847,6 +1847,53 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .peer-summary .peer-stat.is-warn { color: var(--diag-q-warn); }
 .peer-summary .peer-stat.is-poor { color: var(--diag-q-poor); }
 
+/* issue 1656: contrast-safe severity chip primitives, SHARED by the Per-Peer
+   Summary triage chip and the Receive-breakdown lag chip. Severity hue is
+   DECOUPLED from legibility (WCAG AA at --fs-2 11px text needs 4.5:1, which the
+   saturated --diag-q-* tokens fail against --surface-elevated — see the
+   .simulcast-recv-peer-stats note). The VALUE text inherits the high-contrast
+   neutral --text-primary (13.94:1 dark / 16.55:1 light); the severity HUE lives
+   only on the non-text DOT (a UI component, AA non-text floor 3:1). The
+   title/aria-label carries the reason, so meaning never depends on color (WCAG
+   1.4.1). The dot is decorative (aria-hidden in markup). */
+.peer-stat__value {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Specificity guard: inside the Per-Peer Summary, the generic
+   `.peer-summary-item span` rule (0,1,1) would otherwise out-specify
+   `.peer-stat__value` (0,1,0) and repaint the value --text-secondary. This
+   (0,2,0) override keeps the value text on the high-contrast --text-primary
+   in the summary context too (the receive-row context has no such ancestor
+   rule, so the base rule already wins there). */
+.peer-summary-item .peer-stat__value {
+  color: var(--text-primary);
+}
+
+.peer-stat__dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 2px;
+  vertical-align: baseline;
+  /* Fallback hue if an unexpected class lands here; overridden below. */
+  background: var(--text-tertiary);
+}
+
+.peer-stat__dot.is-good { background: var(--diag-q-good); }
+.peer-stat__dot.is-warn { background: var(--diag-q-warn); }
+.peer-stat__dot.is-poor { background: var(--diag-q-poor); }
+
+/* issue 1656 (BLOCKER 2): Per-Peer Summary triage chip (lag + recv/painted fps
+   gap). Inherits the secondary neutral container color for its label glue text;
+   the value spans override to --text-primary via .peer-stat__value. Kept inline
+   with the Buffer/Jitter cluster (flex sibling). */
+.peer-summary-item__lag {
+  white-space: nowrap;
+}
+
 @media (max-width: 37.5em) {
   .charts-grid {
     grid-template-columns: 1fr;
@@ -10052,27 +10099,23 @@ details.perf-peers[open] .perf-peers__chev {
   display: block;
 }
 
-/* issue 1656: per-peer VIDEO worker readout (painted fps + capture-lag chip).
-   The lag chip reuses the `.peer-stat` quality classes; tints the value only
-   while the `title` attribute carries the text reason, so meaning never depends
-   on color alone (WCAG 1.4.1). The aria-live alarm element announces the poor
-   state to assistive tech and is visually muted (it is a redundant announcement
-   of the already-visible chip). */
+/* issue 1656: per-peer VIDEO readout (recv/painted fps pair + capture-lag chip).
+   WCAG AA (issue 1656): legibility is DECOUPLED from severity hue. At --fs-2
+   (11px, "small" text) the AA floor is 4.5:1, which the saturated --diag-q-*
+   severity tokens FAIL against --surface-elevated (e.g. dark poor 4.09:1, light
+   good 3.31:1). So the numeric VALUE text renders in the neutral --text-primary
+   (13.94:1 dark / 16.55:1 light — passes), and severity is carried ONLY by a
+   non-text status DOT filled with the canonical --diag-q-* token (a dot is a
+   non-text UI component, AA non-text floor 3:1). The `title`/aria-label carries
+   the reason, so meaning never depends on color alone (WCAG 1.4.1). The
+   container default is --text-secondary (6.30:1 dark / 5.69:1 light — passes),
+   NOT the old --text-tertiary (4.27:1 dark / 3.10:1 light — failed AA). */
 .simulcast-recv-peer-stats {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 10px;
   font-size: var(--fs-2);
-  color: var(--text-tertiary);
-}
-
-.simulcast-recv-peer-stats .peer-stat.is-good { color: var(--diag-q-good); }
-.simulcast-recv-peer-stats .peer-stat.is-warn { color: var(--diag-q-warn); }
-.simulcast-recv-peer-stats .peer-stat.is-poor { color: var(--diag-q-poor); }
-
-.simulcast-recv-peer-lag-alarm {
-  color: var(--diag-q-poor);
-  font-weight: 600;
+  color: var(--text-secondary);
 }
 
 .simulcast-rung-res,
