@@ -521,7 +521,8 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
                 data: frame.frame.data.clone(),
                 timestamp: frame.frame.timestamp,
                 // #1656: preserve the sender-side capture wall-clock so the
-                // jitter buffer's capture-age trip can read it.
+                // jitter buffer can compute the `realtime_lag_ms` diagnostic
+                // (observability only — it does not affect playout).
                 capture_unix_ms: frame.frame.capture_unix_ms,
             };
 
@@ -664,12 +665,15 @@ fn check_jitter_buffer_for_ready_frames() {
                                     // governor fired in the field.
                                     let playout_skip_to_live_total = jb.governor_skip_count();
 
-                                    // Skew-resilient relative capture-lag (issue #1656): how far
-                                    // this peer's video is behind its own best-case source cadence,
-                                    // sampled by the capture-age trip every ~10ms tick and read here
+                                    // Skew-resilient relative capture-lag (issue #1656),
+                                    // OBSERVABILITY ONLY: how far this peer's video is behind its own
+                                    // best-case source cadence, sampled each ~10ms tick and read here
                                     // at the 1Hz emit. Reports source/upstream lag that the
                                     // arrival-based playout-latency metric cannot see (frames that
-                                    // arrive on-time but are old at the source).
+                                    // arrive on-time but are old at the source). It is a measurement
+                                    // surfaced to diagnostics — it does NOT gate playout or PLIs (the
+                                    // freshness deadline is arrival-only; the behaviour fix for the
+                                    // real minutes-lag lives in #1662/#1479 per the #1661 analysis).
                                     let realtime_lag_ms = jb.realtime_lag_ms();
 
                                     // TRUE painted-frame fps (issue #1656): frames actually RELEASED
