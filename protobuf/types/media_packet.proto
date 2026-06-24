@@ -78,19 +78,6 @@ message VideoMetadata {
   // "manual-cap", or "" when no constraint is engaged. Kept as a free-form
   // string so new causes can be added without a wire-format break.
   string cause_hint = 7;
-  // Sender-side capture wall-clock time (ms since UNIX epoch, Date.now()) of the
-  // frame, used by the receiver to compute the `realtime_lag_ms` OBSERVABILITY
-  // metric surfaced in the diagnostics drawer (#1656). It does NOT affect
-  // playout — the receiver's freshness deadline is arrival-age only. Distinct
-  // from `MediaPacket.timestamp` (WebCodecs media-time microseconds on a
-  // per-track origin), which does NOT carry wall-clock. Optional: proto3
-  // default-zero (0) means "unknown / not sent" — older publishers omit it and
-  // receivers MUST treat 0 as absent (no real-time-lag signal; the metric
-  // reports 0). Peer-controlled value (inside the E2EE packet): the relay
-  // cannot forge it, but the sending peer can lie; because the value is purely
-  // observational the worst a lie does is report a misleading realtime_lag_ms
-  // for that peer's OWN diagnostic tile — no cross-peer or playout impact.
-  uint64 capture_unix_ms = 8;
 }
 
 // Video codec enum with profile/level details for scalability.

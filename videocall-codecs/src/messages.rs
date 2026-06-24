@@ -78,9 +78,20 @@ pub struct VideoStatsMessage {
     /// Consume via `increase()`/`rate()`, which tolerate the reset; a rising value proves the
     /// governor fired in the field.
     pub playout_skip_to_live_total: Option<u64>,
+    /// Content-staleness in ms (issue #1641): the content AGE of the video currently being painted
+    /// — how old (in capture/wall-clock terms) the released content is, drift-baselined so the
+    /// unsynchronized publisher/receiver clock offset cancels. Distinct from `playout_paint_lag_ms`,
+    /// which measures the worker→main queue DEPTH (count × interval): a stream draining at display
+    /// rate keeps that depth small and reads ~0 even for minutes-old content. Content age vs queue
+    /// depth: this surfaces the "video lagged by minutes while paint-lag/playout-latency read ~0"
+    /// case (#1631 M2). Unlike `playout_latency_ms` (capped at 1800ms) this can exceed 1800ms.
+    pub content_staleness_ms: Option<f64>,
 }
 
 impl VideoStatsMessage {
+    // 8 worker→main video-diagnostic fields (issue #1641 added content_staleness_ms as the 8th);
+    // bundling them into a struct just to dodge the lint would not improve this thin DTO ctor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         from_peer: String,
         to_peer: String,
@@ -89,6 +100,7 @@ impl VideoStatsMessage {
         playout_stage1_span_ms: f64,
         playout_paint_lag_ms: f64,
         playout_skip_to_live_total: u64,
+        content_staleness_ms: f64,
     ) -> Self {
         Self {
             kind: "video_stats".to_string(),
@@ -99,6 +111,7 @@ impl VideoStatsMessage {
             playout_stage1_span_ms: Some(playout_stage1_span_ms),
             playout_paint_lag_ms: Some(playout_paint_lag_ms),
             playout_skip_to_live_total: Some(playout_skip_to_live_total),
+            content_staleness_ms: Some(content_staleness_ms),
         }
     }
 }
@@ -334,7 +347,7 @@ mod worker_log_disambiguation_tests {
         // fields (level/target/message) are absent from every other message, so none of them can
         // deserialize into WorkerLogMessage at all -> the branch is structurally unable to swallow
         // them, independent of the kind guard.
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4);
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );

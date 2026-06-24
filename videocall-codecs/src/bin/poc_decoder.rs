@@ -208,7 +208,6 @@ fn main() -> Result<()> {
                 },
                 data: frame.data.to_vec(),
                 timestamp: current_time_ms as f64,
-                capture_unix_ms: 0,
             };
             jitter_buffer.insert_frame(video_frame, current_time_ms);
         }
@@ -233,7 +232,6 @@ fn main() -> Result<()> {
             },
             data: frame.data.to_vec(),
             timestamp: current_time_ms as f64,
-            capture_unix_ms: 0,
         };
         jitter_buffer.insert_frame(video_frame, current_time_ms);
     }

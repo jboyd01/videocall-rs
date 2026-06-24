@@ -342,6 +342,26 @@ pub struct JitterBuffer<T> {
     /// inter-arrival delta. `None` until the first release (and after a flush).
     last_released_arrival_time_ms: Option<u128>,
 
+    /// Media (capture-presentation) timestamp in MILLISECONDS of the most recently RELEASED frame,
+    /// derived from `frame.frame.timestamp` (microseconds) at the release point (issue #1641). This
+    /// is the content age anchor for the [`content_staleness_ms`] receive-path diagnostic: it tracks
+    /// the publisher-clock timestamp of the content currently being painted, which is what lets that
+    /// metric surface MINUTES of content lag that `playout_latency_ms` (capped at
+    /// `MAX_PLAYOUT_AGE_MS`) and `paint_lag_ms` (a queue-DEPTH measure) structurally cannot.
+    /// `None` until the first release (and after a flush). On the PUBLISHER's clock — do NOT subtract
+    /// a receiver-clock value from it without subtracting `min_skew_ms` first (see
+    /// [`content_staleness_ms`]).
+    last_released_media_ts_ms: Option<f64>,
+
+    /// Running MINIMUM of `arrival_time_ms − media_ts_ms` over all released frames (issue #1641).
+    /// This is the best-case (freshest) capture→arrival offset ever observed in the (receiver −
+    /// publisher) clock domain — the drift baseline that cancels the constant, unsynchronized
+    /// clock offset between the publisher's capture clock and the receiver's wall clock. Subtracting
+    /// it from `(now − last_released_media_ts_ms)` yields the EXCESS delay beyond best-case = true
+    /// content lag (see [`content_staleness_ms`]). `None` until the first release (and after a
+    /// flush). Reset on `flush()` so a stream restart re-baselines.
+    min_skew_ms: Option<f64>,
+
     // --- Decoder Interface ---
     /// The abstract decoder that will receive frames ready for decoding.
     decoder: Box<dyn Decodable<Frame = T>>,
@@ -447,33 +467,6 @@ pub struct JitterBuffer<T> {
     /// Prometheus metric wired in a follow-up commit. Deliberately NOT reset by `flush()` — it
     /// is a cumulative metric, not runtime state.
     governor_skips: u64,
-
-    /// Real-time-lag DIAGNOSTIC (issue #1656, observability only): per-peer baseline = running
-    /// ALL-TIME min over the stream of `(arrival_time_ms as i128 - capture_unix_ms as i128)`. This
-    /// cancels the constant part of transit latency + clock skew between the sender and this
-    /// receiver, leaving only the VARYING source lag for the `realtime_lag_ms` metric. It is NOT a
-    /// control input — it never gates the freshness deadline (which is arrival-only). `None` until
-    /// the first frame carrying a nonzero `capture_unix_ms`. Reset on `flush()` so a restarted
-    /// stream (whose transit/skew may differ) re-baselines.
-    ///
-    /// `i128` (not `i64`): `capture_unix_ms` is a peer-controlled `u64`, so a malicious value near
-    /// `2^63` would overflow an `i64` subtraction and PANIC under overflow-checks builds (cargo
-    /// test, native bins). `u128` clock − `u64` capture both fit losslessly in `i128`, so the
-    /// subtraction is total; we narrow to `f64` only at the very end.
-    ///
-    /// Pure all-time min (no decay): a LATER source-lag excursion is measured against the EARLY
-    /// best case, so the min must NOT re-baseline upward. The only cost is that a single early-good
-    /// sample pins the baseline for the stream's life; the per-peer `flush()` on stream restart
-    /// bounds any pathological pin. (Purely a metric, so a stale baseline only biases the reported
-    /// lag, never playout.)
-    min_capture_offset_ms: Option<i128>,
-
-    /// Real-time-lag DIAGNOSTIC (issue #1656, observability only): most recent skew-cancelled
-    /// relative capture-lag (ms), recomputed on EVERY `enforce_freshness_deadline` tick (~10ms) and
-    /// read at the 1Hz diagnostics emit via [`JitterBuffer::realtime_lag_ms`]. Cached so the metric
-    /// reports lag every poll. It is a measurement only — it does not affect playout. Initialized
-    /// 0.0; reset on `flush()`.
-    last_capture_lag_ms: f64,
 }
 
 impl<T> JitterBuffer<T> {
@@ -499,6 +492,8 @@ impl<T> JitterBuffer<T> {
             backpressure_hold_since_ms: None,
             source_frame_interval_ms: DEFAULT_SOURCE_FRAME_INTERVAL_MS,
             last_released_arrival_time_ms: None,
+            last_released_media_ts_ms: None,
+            min_skew_ms: None,
             decoder,
             request_keyframe,
             last_keyframe_request_ms: None,
@@ -511,8 +506,6 @@ impl<T> JitterBuffer<T> {
             governor_engaged: false,
             governor_last_skip_ms: None,
             governor_skips: 0,
-            min_capture_offset_ms: None,
-            last_capture_lag_ms: 0.0,
         }
     }
 
@@ -566,28 +559,6 @@ impl<T> JitterBuffer<T> {
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
         log::trace!("[JITTER_BUFFER] Inserting frame: {seq}");
-
-        // Real-time-lag DIAGNOSTIC baseline (issue #1656, observability only): fold this frame's
-        // `(arrival - capture)` offset into the per-peer running ALL-TIME min,
-        // which cancels the constant transit + constant clock-skew between the
-        // sender and this receiver. This feeds the `realtime_lag_ms` metric ONLY —
-        // it does not affect playout. Done EARLY — before the old-frame / buffer-full
-        // rejection returns below — ON PURPOSE: the baseline must track the BEST
-        // CASE transit+skew regardless of whether this particular frame is
-        // ultimately buffered, and a frame rejected as "old" still carries a valid
-        // arrival/capture pair. Skip when the publisher did not stamp a capture
-        // wall-clock (0 = no signal); never let a missing value disturb the
-        // baseline.
-        if frame.capture_unix_ms != 0 {
-            // i128: `capture_unix_ms` is a peer-controlled u64; near 2^63 an `as i64`
-            // subtraction would overflow/panic under overflow-checks builds. u128 − u64
-            // both fit losslessly in i128, so the subtraction is total.
-            let offset = arrival_time_ms as i128 - frame.capture_unix_ms as i128;
-            self.min_capture_offset_ms = Some(match self.min_capture_offset_ms {
-                Some(existing) => existing.min(offset),
-                None => offset,
-            });
-        }
 
         // Issue #1479: ANY keyframe arrival (even an old/duplicate one) clears the proactive-PLI
         // gate. Placed before old-frame rejection because the gate is about "did the publisher
@@ -899,74 +870,6 @@ impl<T> JitterBuffer<T> {
         self.decoder.reset();
     }
 
-    /// Skew-cancelled relative capture-lag (ms) of the given head frame (issue #1656).
-    ///
-    /// OBSERVABILITY ONLY. This is a MEASUREMENT surfaced to diagnostics (the `realtime_lag_ms`
-    /// metric), NEVER a control input: it does not gate the freshness deadline or any playout / PLI
-    /// decision. PR1 (#1656) ships zero behaviour change — the freshness deadline is arrival-only
-    /// (byte-for-byte the pre-#1656 #1020 behaviour). The actual minutes-lag fix is keyframe-
-    /// starvation recovery, tracked as #1662 (bound the keyframe-less hold) + #1479 (PLI backoff)
-    /// per the #1661 meeting analysis; this metric just makes the source lag visible.
-    ///
-    /// Returns how far this peer's head frame has fallen behind its OWN best-case transit+skew
-    /// baseline:
-    ///
-    /// ```text
-    /// relative_lag = (now - head.capture_unix_ms) - min_capture_offset_ms
-    /// ```
-    ///
-    /// Subtracting `min_capture_offset_ms` (the all-time min of `arrival - capture`) cancels the
-    /// constant part of network transit AND any constant clock skew between the sender and this
-    /// receiver, so the result is purely the VARYING source lag — robust to a wrong-but-constant
-    /// sender clock. Clamped to `>= 0.0`.
-    ///
-    /// Returns `None` (no capture signal → the metric reports 0.0 for this tick) when:
-    /// - the publisher did not stamp a capture wall-clock (`capture_unix_ms == 0`), or
-    /// - the capture time is implausibly far in the FUTURE relative to `now` (more than a small
-    ///   slack). A far-future capture time would make `now - capture` negative → clamp to 0, so the
-    ///   measurement would read a misleading 0; we return `None` instead so a forward-skewed clock
-    ///   does not silently pin the reported lag at 0.
-    ///
-    /// Abuse analysis (issue #1656). `capture_unix_ms` lives INSIDE the E2EE MediaPacket, so the
-    /// relay cannot forge it; but the sending PEER can lie. Because the value is purely observational
-    /// here (no playout effect), the worst a lie does is report a misleading `realtime_lag_ms` for
-    /// that peer's OWN diagnostics tile — no cross-peer or global impact, and no playout/PLI change:
-    /// - Far-FUTURE capture time → `now - capture` negative → returned as `None` (reports 0.0).
-    /// - Far-PAST capture time → its large `arrival - capture` offset just RAISES this peer's own
-    ///   `min_capture_offset_ms` baseline, so the reported relative lag for that peer stays small.
-    ///   Bounded to that peer's own metric value.
-    ///
-    /// Takes `capture_unix_ms` by value (not the whole `FrameBuffer`) so the caller need not clone
-    /// the head frame — a per-tick clone of the full encoded `data` would be tens of KB of pointless
-    /// allocator churn (issue #1656 perf review).
-    fn capture_lag_ms(&self, current_time_ms: u128, capture_unix_ms: u64) -> Option<f64> {
-        if capture_unix_ms == 0 {
-            return None;
-        }
-        // Reject an implausibly far-future capture time (peer clock skewed forward, or a lie aimed
-        // at "looks perpetually fresh"). Small slack tolerates benign clock jitter; beyond it the
-        // measurement returns None (reports 0.0) rather than a misleading clamped-to-0 value.
-        //
-        // i128: `capture_unix_ms` is a peer-controlled u64; near 2^63 an `as i64` subtraction would
-        // overflow/panic under overflow-checks builds. u128 − u64 both fit losslessly in i128.
-        const FUTURE_SLACK_MS: i128 = 2000;
-        let delta = current_time_ms as i128 - capture_unix_ms as i128;
-        if delta < -FUTURE_SLACK_MS {
-            return None;
-        }
-        let baseline = self.min_capture_offset_ms.unwrap_or(0);
-        let relative_lag = (delta - baseline) as f64;
-        Some(relative_lag.max(0.0))
-    }
-
-    /// Most recent skew-resilient relative capture-lag (ms), sampled for OBSERVABILITY (issue #1656).
-    /// Updated on every `enforce_freshness_deadline` tick (~10ms) purely to feed the 1Hz
-    /// `realtime_lag_ms` diagnostics metric; it is NOT a control input (the freshness deadline is
-    /// arrival-only). Sampled at tick cadence, read at emit cadence.
-    pub fn realtime_lag_ms(&self) -> f64 {
-        self.last_capture_lag_ms
-    }
-
     /// Freshness-deadline enforcement (issue #1020).
     ///
     /// Returns `true` if the head-of-line backlog is stale and the buffer state was advanced so
@@ -1010,32 +913,15 @@ impl<T> JitterBuffer<T> {
             return false; // Empty buffer — nothing can be stale.
         };
 
-        // Extract ONLY the two scalars we need from the head frame inside the borrow, then drop it.
-        // We must NOT clone the whole `FrameBuffer` here — it owns the full encoded `data` (`Vec<u8>`,
-        // tens of KB), and this runs every ~10ms tick per stream, so a clone would be megabytes/sec
-        // of pointless allocator churn in a multi-peer call just to read 2 scalars. Copying the
-        // scalars also frees the `&self.buffered_frames` borrow so the later `&mut self` skip/evict
-        // paths are unobstructed.
-        let (head_arrival_ms, head_capture_unix_ms) = match self.buffered_frames.get(&head_key) {
-            Some(f) => (f.arrival_time_ms, f.capture_unix_ms()),
+        // Arrival-based age (issue #1020): how long the head sat in THIS buffer. This is the SOLE
+        // freshness-deadline trip — the deadline is arrival-only. Read only the head's arrival time
+        // (a scalar copy) inside the borrow, then drop it so the later `&mut self` skip/evict paths
+        // are unobstructed.
+        let head_arrival_ms = match self.buffered_frames.get(&head_key) {
+            Some(f) => f.arrival_time_ms,
             None => return false,
         };
-
-        // Arrival-based age (issue #1020): how long the head sat in THIS buffer. This is the SOLE
-        // freshness-deadline trip — the deadline is arrival-only, byte-for-byte the pre-#1656 #1020
-        // behaviour.
         let head_age_ms = current_time_ms.saturating_sub(head_arrival_ms) as f64;
-
-        // OBSERVABILITY ONLY (issue #1656): compute the skew-cancelled relative capture-lag and cache
-        // it for the 1Hz `realtime_lag_ms` diagnostics metric. This is a MEASUREMENT surfaced to
-        // diagnostics, NEVER a control input — it does not gate the deadline below. (The #1661
-        // meeting analysis showed the real minutes-lag is keyframe-starvation freezes, not a
-        // standing source lag, so the behaviour fix lives in #1662 / #1479, not here.) Computed on
-        // every ~10ms tick so the metric reports current source-lag continuously; `None` (no capture
-        // wall-clock / older publisher) reports as 0.0.
-        self.last_capture_lag_ms = self
-            .capture_lag_ms(current_time_ms, head_capture_unix_ms)
-            .unwrap_or(0.0);
 
         if head_age_ms < MAX_PLAYOUT_AGE_MS {
             // Within freshness bounds — normal jitter handling is byte-for-byte unaffected.
@@ -1303,9 +1189,37 @@ impl<T> JitterBuffer<T> {
         let seq = frame.sequence_number();
         // Record source cadence BEFORE the frame is moved into the decoder (issue #1252).
         self.record_release_cadence(frame.arrival_time_ms);
+        // Record the content-staleness anchors BEFORE the frame is moved into the decoder
+        // (issue #1641). Pure observability: this only reads the frame's timestamps and updates
+        // two diagnostic fields — it never alters which frame is released or when.
+        self.record_release_content_staleness(frame.arrival_time_ms, frame.frame.timestamp);
         log::trace!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
         self.backpressure_hold_since_ms = None;
+    }
+
+    /// Folds a released frame's media (capture-presentation) timestamp into the content-staleness
+    /// anchors (issue #1641). Read-only diagnostic: updates `last_released_media_ts_ms` and the
+    /// `min_skew_ms` drift baseline; it does NOT affect release/decode/playout behavior in any way.
+    ///
+    /// `media_ts_us` is `frame.frame.timestamp` in MICROSECONDS on the PUBLISHER's clock;
+    /// `arrival_time_ms` is the receiver wall-clock time the frame was received. The fold is skipped
+    /// when `media_ts_ms <= 0.0`: the test-injection path stamps 0.0, and unknown-codec / very old
+    /// clients may carry no usable presentation timestamp — folding a bogus 0 would corrupt the
+    /// `min_skew_ms` baseline (it would record a skew ≈ arrival_time_ms, an enormous offset that
+    /// would then mask all real staleness). See [`content_staleness_ms`] for the formula these
+    /// anchors feed.
+    fn record_release_content_staleness(&mut self, arrival_time_ms: u128, media_ts_us: f64) {
+        let media_ts_ms = media_ts_us / 1000.0;
+        if media_ts_ms <= 0.0 {
+            return;
+        }
+        self.last_released_media_ts_ms = Some(media_ts_ms);
+        let skew = arrival_time_ms as f64 - media_ts_ms;
+        self.min_skew_ms = Some(match self.min_skew_ms {
+            Some(prev) => prev.min(skew),
+            None => skew,
+        });
     }
 
     /// Folds a released frame's arrival time into the rolling source frame-interval estimate
@@ -1368,6 +1282,15 @@ impl<T> JitterBuffer<T> {
         // across the flush gap (issue #1252). The smoothed interval estimate itself persists — the
         // source cadence does not change across a flush.
         self.last_released_arrival_time_ms = None;
+        // Reset the content-staleness anchors (issue #1641) so a stream restart (publisher
+        // re-publish / camera switch, which routes through this flush()) re-baselines from scratch.
+        // A restart may reset the publisher's capture-timestamp epoch, so the pre-flush
+        // `min_skew_ms` baseline (and the stale media_ts) MUST be discarded; a `None`-after-cold-
+        // start and a `None`-after-flush must both read 0, never a stale latch. (The decoder-error
+        // reset_pipeline path re-baselines too, but by a different mechanism — it destroys and
+        // rebuilds the whole JitterBuffer via `new()`, which inits both anchors to `None`.)
+        self.last_released_media_ts_ms = None;
+        self.min_skew_ms = None;
         // Reset the proactive keyframe-request throttle (issue #1025) so a fresh stream after a
         // flush (e.g. stream restart) can request a recovery keyframe immediately rather than
         // inheriting the pre-flush cooldown. Reset the backoff exponent too (issue #1479) so the
@@ -1386,12 +1309,6 @@ impl<T> JitterBuffer<T> {
         self.governor_sustain_ticks = 0;
         self.governor_engaged = false;
         self.governor_last_skip_ms = None;
-        // Reset the real-time-lag diagnostic baseline (issue #1656) so a restarted stream
-        // re-baselines its transit+skew from scratch — a restart (camera switch / reconnect) may
-        // change both the network transit and the sender's clock offset, so inheriting the old min
-        // would mismeasure the reported source lag. The cached relative-lag metric resets too.
-        self.min_capture_offset_ms = None;
-        self.last_capture_lag_ms = 0.0;
         // Consider resetting jitter estimator as well if needed
         self.jitter_estimator = JitterEstimator::new();
     }
@@ -1477,6 +1394,15 @@ impl<T> JitterBuffer<T> {
     pub fn governor_skip_count(&self) -> u64 {
         self.governor_skips
     }
+
+    /// Live content-staleness estimate in ms (issue #1641) for the content currently being painted,
+    /// computed against the caller's current wall-clock `now_ms`. Read-only: never mutates state.
+    /// Thin wrapper over the pure [`content_staleness_ms`] free function, passing this buffer's
+    /// stored release anchors so the arithmetic stays unit-testable off the wasm-only worker path.
+    /// Returns 0.0 before the first release / after a flush (anchors `None`).
+    pub fn content_staleness_ms_live(&self, now_ms: u128) -> f64 {
+        content_staleness_ms(now_ms, self.last_released_media_ts_ms, self.min_skew_ms)
+    }
 }
 
 /// Stage-3 paint lag in ms (issue #1252): the time-valued backlog of decoded-but-unpainted frames
@@ -1497,6 +1423,76 @@ pub fn paint_lag_ms(
 ) -> f64 {
     let outstanding = frames_emitted.saturating_sub(frames_painted);
     outstanding as f64 * source_frame_interval_ms
+}
+
+/// Content-staleness (content AGE) in ms of the video currently being painted (issue #1641).
+///
+/// This surfaces the observability hole behind #1631 M2 — "video lagged by minutes" while
+/// `playout_latency_ms` read ~0 — that BOTH existing receive-path metrics structurally cannot
+/// represent:
+/// - `playout_latency_ms` is bounded by `MAX_PLAYOUT_AGE_MS` (1800ms): its stage-1 span can never
+///   exceed ~1.8s because the freshness deadline skips the head-of-line past that.
+/// - `paint_lag_ms` is a queue-DEPTH measure (`(emitted − painted) × interval`): a stream draining
+///   at display rate keeps the outstanding count small, so it reads ~0 even for minutes-old content.
+///
+/// This function instead measures content AGE: how old (in capture/wall-clock terms) the content
+/// being painted is, regardless of how shallow the queue is.
+///
+/// ## Why a naive `now − media_ts` is WRONG (cross-clock)
+/// `last_released_media_ts_ms` comes from `VideoFrame.timestamp` — the source frame's capture
+/// presentation timestamp, on the PUBLISHER's clock with an ARBITRARY EPOCH. `now_ms` is the
+/// RECEIVER's wall clock. The two clocks are UNSYNCHRONIZED (no NTP relationship between an arbitrary
+/// browser publisher and an arbitrary browser receiver), so `now_ms − media_ts_ms` is a meaningless
+/// cross-clock subtraction dominated by the constant clock offset — it could be hugely positive or
+/// negative and bears no relation to real lag.
+///
+/// ## The drift-baselined formula
+/// We cancel the constant offset by subtracting the best-case (freshest) offset ever observed:
+///
+/// ```text
+///   skew_at_release   = arrival_time_ms − media_ts_ms       // (receiver − publisher) domain
+///   base (min_skew)   = running MIN of skew_at_release       // best-case offset + min one-way delay
+///   content_staleness = (now_ms − last_released_media_ts_ms) − base, clamped ≥ 0
+/// ```
+///
+/// `(now − media_ts_painted)` is the capture→paint span expressed in the (receiver − publisher)
+/// domain; subtracting `base` (the minimum capture→arrival offset, i.e. the freshest frame ever
+/// seen) removes both the clock offset and the irreducible best-case one-way delay, leaving the
+/// EXCESS delay beyond best-case = true content lag. The constant offset cancels because it appears
+/// in BOTH `now − media_ts` (via media_ts) and `base` (via media_ts) with the same sign.
+///
+/// Behavior across the lifecycle (issue #1641):
+/// - Painting fresh content: `now ≈ arrival`, current skew ≈ base → staleness ≈ 0. ✓
+/// - Draining minutes-old content: `now` advances with real time while `media_ts` of the drained
+///   frames is minutes old → staleness is huge. ✓ (the invisible #1631-M2 case)
+/// - Freshness-skip / skip-to-live jumps `last_released_media_ts_ms` forward → staleness drops. ✓
+/// - Frozen stream (no releases): `now` keeps advancing, `last_released_media_ts_ms` is frozen →
+///   this function's value climbs (a frozen stream IS getting more stale). ✓ NOTE: this describes
+///   the value THIS function computes. On the wire it is additionally gated by `fps_received > 0`
+///   in the health reporter, so a fully-stalled stream with NO inbound packets (fps→0 after ~1s)
+///   reports 0.0 ("at live") to Prometheus, same as the sibling #1252 ms-gauges. The #1631-M2
+///   target case (draining stale content while packets keep arriving) keeps `fps_received > 0`,
+///   so the wire value climbs there as intended; the no-arrivals stall is observed instead by the
+///   relay-side freeze signals (#1637).
+///
+/// ## Caveats
+/// - Returns `0.0` when either anchor is `None` (cold start, or post-`flush()` re-baseline) — a
+///   `None` state must read "at live", never a stale latch.
+/// - Over a long meeting the publisher/receiver clocks may DRIFT, so a `base` captured early can
+///   slowly understate the true best-case offset (making staleness read slightly high). This is
+///   acceptable for a coarse diagnostic meant to surface MINUTES of lag, and it is reset on every
+///   `flush()` (stream restart). Deliberately NOT gold-plated with a decaying/windowed min.
+///
+/// Pure and side-effect free so the arithmetic can be unit-tested off the wasm-only worker path.
+pub fn content_staleness_ms(
+    now_ms: u128,
+    last_released_media_ts_ms: Option<f64>,
+    min_skew_ms: Option<f64>,
+) -> f64 {
+    let (Some(media_ts_ms), Some(base)) = (last_released_media_ts_ms, min_skew_ms) else {
+        return 0.0;
+    };
+    ((now_ms as f64 - media_ts_ms) - base).max(0.0)
 }
 
 #[cfg(test)]
@@ -1650,28 +1646,6 @@ mod tests {
             codec: crate::frame::FrameCodec::default(),
             data: vec![0; 10],
             timestamp: 0.0,
-            // #1656: 0 = no capture signal. The freshness deadline is arrival-only,
-            // so capture_unix_ms is irrelevant to eviction; with 0, `capture_lag_ms`
-            // returns None and the `realtime_lag_ms` diagnostic reports 0.0.
-            capture_unix_ms: 0,
-        }
-    }
-
-    /// Like [`create_test_frame`] but stamps a sender-side capture wall-clock
-    /// (#1656) so a test can exercise the `realtime_lag_ms` diagnostic (and the
-    /// arrival-only deadline's indifference to capture age).
-    fn create_test_frame_with_capture(
-        seq: u64,
-        frame_type: FrameType,
-        capture_unix_ms: u64,
-    ) -> VideoFrame {
-        VideoFrame {
-            sequence_number: seq,
-            frame_type,
-            codec: crate::frame::FrameCodec::default(),
-            data: vec![0; 10],
-            timestamp: 0.0,
-            capture_unix_ms,
         }
     }
 
@@ -2809,153 +2783,6 @@ mod tests {
         assert_eq!(jb.get_dropped_frames_count(), 0);
     }
 
-    /// Issue #1656 (FIX 3): a peer-controlled `capture_unix_ms` near `2^63` (here `i64::MIN as u64`)
-    /// must not panic. The old `as i64` subtraction (`now as i64 - (i64::MIN)`) overflows and PANICS
-    /// under overflow-checks builds (cargo test, native bins); the i128 path is total. The huge
-    /// negative delta is far past the future-slack, so `capture_lag_ms` returns `None` → no trip, no
-    /// drop (the sane/clamped result).
-    #[test]
-    fn capture_age_handles_u64_capture_near_i64_overflow_without_panic() {
-        let (mut jb, decoded_frames) = create_test_jitter_buffer();
-        let base: u128 = 1_700_000_000_000;
-
-        // Decode a normal keyframe so we are mid-stream.
-        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), base);
-        jb.find_and_move_continuous_frames(base + 100);
-        assert_eq!(jb.last_decoded_sequence_number, Some(1));
-        decoded_frames.lock().unwrap().clear();
-
-        let now: u128 = base + 10_000;
-        let dropped_before = jb.get_dropped_frames_count();
-
-        // Malicious capture value at 2^63. `insert_frame`'s baseline (`arrival as i128 - capture`)
-        // and the end-of-insert poll's `capture_lag_ms` (`now as i128 - capture`) must both stay
-        // total and NOT panic. Inserting a head delta runs the poll at `now - 100`.
-        let evil_capture = i64::MIN as u64; // == 2^63
-        jb.insert_frame(
-            create_test_frame_with_capture(2, FrameType::DeltaFrame, evil_capture),
-            now - 100,
-        );
-        // An explicit poll for good measure — also must not panic.
-        jb.find_and_move_continuous_frames(now);
-
-        // The implausible (effectively far-future) capture is rejected by the future-slack guard, so
-        // the capture-age path returns None: no trip, no drop. Reaching here at all proves no panic.
-        assert_eq!(
-            jb.get_dropped_frames_count(),
-            dropped_before,
-            "an out-of-range capture_unix_ms must yield a None capture-lag (no trip), not a panic or spurious drop (#1656 FIX 3)"
-        );
-        assert!(
-            jb.take_freshness_skip().is_none(),
-            "no freshness skip for an out-of-range capture value (#1656 FIX 3)"
-        );
-    }
-
-    /// Issue #1656 (DIAGNOSTICS-ONLY removal guard): the freshness deadline is ARRIVAL-ONLY. A head
-    /// frame that arrives FRESH (small arrival age) but is heavily back-dated at SOURCE
-    /// (`capture_unix_ms` far in the past, so a *capture-age* trip would have fired the deleted
-    /// behaviour) must NOT be evicted — the deadline ignores capture age entirely now.
-    ///
-    /// This is the exact inverse of the (deleted) capture-age catch-up test: same construction
-    /// (early offset-0 baseline, then a fresh-arrival head whose capture is back-dated ~2000ms so the
-    /// skew-cancelled relative lag ≈ 1900ms), but the assertion is flipped — NOTHING is dropped and
-    /// NO freshness skip is recorded, because capture age is no longer a control input.
-    ///
-    /// FAILS-ON-REVERT: if anyone re-adds a capture-age trip (e.g. restoring
-    /// `if head_age_ms < MAX_PLAYOUT_AGE_MS && !capture_trips`), the back-dated head would trip and be
-    /// skipped to the buffered keyframe → `get_dropped_frames_count()` rises and a `FreshnessSkip` is
-    /// recorded → both assertions fail. Only the arrival-only deadline leaves this frame in place.
-    #[test]
-    fn freshness_deadline_is_arrival_only_ignores_capture_age() {
-        let (mut jb, decoded_frames) = create_test_jitter_buffer();
-
-        // Shared UNIX-epoch wall clock (arrival, capture, poll all ms since epoch).
-        let base: u128 = 1_700_000_000_000;
-
-        // Frame 1 (keyframe): capture == arrival → baseline offset 0. Decode it (mid-stream).
-        jb.insert_frame(
-            create_test_frame_with_capture(1, FrameType::KeyFrame, base as u64),
-            base,
-        );
-        jb.find_and_move_continuous_frames(base + 100);
-        assert_eq!(jb.last_decoded_sequence_number, Some(1));
-        decoded_frames.lock().unwrap().clear();
-
-        let now: u128 = base + 10_000;
-
-        // A FRESH keyframe (seq 5) buffered as a skip-to-live target — exactly what a re-added
-        // capture-age trip would jump to. Arrival `now - 100`, capture ≈ now (not source-stale).
-        jb.insert_frame(
-            create_test_frame_with_capture(5, FrameType::KeyFrame, (now - 100) as u64),
-            now - 100,
-        );
-
-        let dropped_before = jb.get_dropped_frames_count();
-
-        // Head delta (seq 2): FRESH arrival (age 100ms << MAX_PLAYOUT_AGE_MS) but capture back-dated
-        // 2000ms → relative capture lag ≈ 1900ms (the value the deleted trip used). The arrival-only
-        // deadline must NOT act on it.
-        jb.insert_frame(
-            create_test_frame_with_capture(2, FrameType::DeltaFrame, (now - 2000) as u64),
-            now - 100,
-        );
-        jb.find_and_move_continuous_frames(now);
-
-        assert_eq!(
-            jb.get_dropped_frames_count(),
-            dropped_before,
-            "the freshness deadline is arrival-only (#1656 diagnostics-only): a fresh-arrival head with a back-dated capture must NOT be evicted by a capture-age trip"
-        );
-        assert!(
-            jb.take_freshness_skip().is_none(),
-            "no freshness skip may be recorded for a fresh-arrival head, regardless of its capture age (#1656 diagnostics-only)"
-        );
-    }
-
-    /// Issue #1656 (observability): the `realtime_lag_ms` diagnostic still computes the skew-cancelled
-    /// relative capture-lag even though it no longer affects playout. Drives the SAME
-    /// `enforce_freshness_deadline` -> `capture_lag_ms` path the production metric reads (via the
-    /// `realtime_lag_ms()` accessor), so it is not a self-pin: a head back-dated ~2000ms past an
-    /// offset-0 baseline must report ≈1900ms of lag.
-    #[test]
-    fn realtime_lag_ms_reports_skew_cancelled_relative_lag() {
-        let (mut jb, decoded_frames) = create_test_jitter_buffer();
-        let base: u128 = 1_700_000_000_000;
-
-        // Frame 1: capture == arrival → baseline offset 0.
-        jb.insert_frame(
-            create_test_frame_with_capture(1, FrameType::KeyFrame, base as u64),
-            base,
-        );
-        jb.find_and_move_continuous_frames(base + 100);
-        decoded_frames.lock().unwrap().clear();
-
-        let now: u128 = base + 10_000;
-        // Head delta: fresh arrival, capture back-dated 2000ms. The end-of-insert poll runs
-        // `enforce_freshness_deadline` at `now - 100`, which samples the relative lag into the metric.
-        jb.insert_frame(
-            create_test_frame_with_capture(2, FrameType::DeltaFrame, (now - 2000) as u64),
-            now - 100,
-        );
-
-        // relative_lag = (poll_now - capture) - baseline = ((now-100) - (now-2000)) - 0 = 1900.
-        let lag = jb.realtime_lag_ms();
-        assert!(
-            (1850.0..=1950.0).contains(&lag),
-            "realtime_lag_ms must report the skew-cancelled relative source lag (~1900ms), got {lag}"
-        );
-
-        // A frame with NO capture wall-clock (older publisher) reports 0.0 (no signal).
-        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), now);
-        jb.find_and_move_continuous_frames(now + 10);
-        assert_eq!(
-            jb.realtime_lag_ms(),
-            0.0,
-            "with capture_unix_ms == 0 the diagnostic reports 0.0 (no capture signal)"
-        );
-    }
-
     /// A frame sitting just under the deadline is still released normally (boundary check).
     #[test]
     fn frame_just_under_deadline_is_released_normally() {
@@ -3934,6 +3761,198 @@ mod tests {
         assert!(
             jb.governor_last_skip_ms.is_none(),
             "flush must clear the last-skip anchor"
+        );
+    }
+
+    // ---- #1641: content-staleness (content AGE) receive-path diagnostic -----------------------
+
+    /// Build a `VideoFrame` carrying a chosen media (capture) timestamp in MICROSECONDS, so a test
+    /// can exercise the real release-path content-staleness fold (which reads `frame.frame.timestamp`
+    /// in microseconds). `create_test_frame` hard-codes `timestamp: 0.0`, which the fold skips.
+    fn create_test_frame_with_media_ts(
+        seq: u64,
+        frame_type: FrameType,
+        media_ts_us: f64,
+    ) -> VideoFrame {
+        VideoFrame {
+            sequence_number: seq,
+            frame_type,
+            codec: crate::frame::FrameCodec::default(),
+            data: vec![0; 10],
+            timestamp: media_ts_us,
+        }
+    }
+
+    /// (a) Fresh content: `now ≈ arrival` and the current skew equals `base`, so the drift-baselined
+    /// formula must read ~0. Calls the PRODUCTION `content_staleness_ms` free fn directly.
+    ///
+    /// Mutation coverage: dropping the `− base` term makes this read `now − media_ts = 500` ≠ 0 and
+    /// fail. media_ts = 1000ms (publisher clock), arrival/now = 1500ms (receiver clock) ⇒ base = 500.
+    #[test]
+    fn content_staleness_fresh_content_reads_zero() {
+        let media_ts_ms = 1000.0;
+        let base = 500.0; // arrival(1500) − media_ts(1000)
+        let now_ms = 1500u128; // now == arrival: freshest possible
+        let staleness = content_staleness_ms(now_ms, Some(media_ts_ms), Some(base));
+        assert_eq!(
+            staleness, 0.0,
+            "fresh content (now==arrival, skew==base) must read ~0; got {staleness}"
+        );
+    }
+
+    /// (b) Drained stale content: `now` has advanced minutes past the painted frame's capture time
+    /// while `base` (best-case offset) stays small — staleness must read the EXCESS over best-case,
+    /// i.e. ≈ the real content lag. This is the #1631-M2 case that `playout_latency_ms` (capped at
+    /// 1800ms) and `paint_lag_ms` (queue depth) both miss.
+    ///
+    /// Mutation coverage: the exact-equality assert (300_000, not 300_050) fails if the `− base`
+    /// term is dropped, and fails if `now − media_ts` is computed with the wrong operand order.
+    #[test]
+    fn content_staleness_drained_stale_content_reads_excess_over_base() {
+        let media_ts_ms = 1000.0; // content captured at publisher-clock t=1000ms
+        let base = 50.0; // best-case capture→arrival offset ever seen (R−P domain)
+        let five_minutes_ms = 300_000.0;
+        // now is 5 minutes + base past the painted frame's media timestamp: a stream draining
+        // 5-minute-old content while frames keep flowing (paint_lag stays ~0, playout_latency capped).
+        let now_ms = (media_ts_ms + five_minutes_ms + base) as u128;
+        let staleness = content_staleness_ms(now_ms, Some(media_ts_ms), Some(base));
+        assert_eq!(
+            staleness, five_minutes_ms,
+            "drained 5-min-old content must read the excess over best-case (300_000ms), not the raw \
+             cross-clock span; got {staleness}"
+        );
+        assert!(
+            staleness > MAX_PLAYOUT_AGE_MS,
+            "the whole point: content staleness can exceed the 1800ms playout-latency cap"
+        );
+    }
+
+    /// (c) Guard inputs: either anchor `None` (cold start / post-flush) must read 0, never a stale
+    /// latch or a NaN. Also covers the media_ts==0 effect indirectly via the None path that the
+    /// release-fold skip produces.
+    ///
+    /// Mutation coverage: replacing the `None => return 0.0` guard with an `unwrap_or` of a nonzero
+    /// default, or removing the early return, fails one of these asserts.
+    #[test]
+    fn content_staleness_none_inputs_read_zero() {
+        assert_eq!(
+            content_staleness_ms(10_000, None, Some(50.0)),
+            0.0,
+            "media_ts None (cold start) must read 0"
+        );
+        assert_eq!(
+            content_staleness_ms(10_000, Some(1000.0), None),
+            0.0,
+            "min_skew None (cold start) must read 0"
+        );
+        assert_eq!(
+            content_staleness_ms(10_000, None, None),
+            0.0,
+            "both None must read 0"
+        );
+    }
+
+    /// The release-path fold must SKIP frames whose media_ts <= 0 (test-inject path stamps 0.0;
+    /// unknown-codec / very old clients carry no usable presentation timestamp). Folding a bogus 0
+    /// would record a skew ≈ arrival_time_ms, corrupting `min_skew_ms` so all real staleness reads 0.
+    ///
+    /// Mutation coverage: removing the `media_ts_ms <= 0.0` skip latches the anchors and makes the
+    /// live staleness nonzero here, failing the `== 0.0` assert.
+    #[test]
+    fn content_staleness_release_fold_skips_zero_media_ts() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        let mut time = 1000u128;
+        // create_test_frame stamps timestamp: 0.0, so the fold must skip it.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), time);
+        time += 100;
+        jb.find_and_move_continuous_frames(time); // releases frame 1
+        assert!(
+            jb.last_released_media_ts_ms.is_none(),
+            "a media_ts==0 frame must not set the content-staleness media anchor"
+        );
+        assert!(
+            jb.min_skew_ms.is_none(),
+            "a media_ts==0 frame must not seed the min-skew baseline"
+        );
+        // With anchors still None, live staleness reads 0 regardless of how far `now` has advanced.
+        assert_eq!(jb.content_staleness_ms_live(10_000_000), 0.0);
+    }
+
+    /// (d) Integration: insert+release real frames carrying media timestamps through the PRODUCTION
+    /// release path (`find_and_move_continuous_frames` → `push_to_decoder` →
+    /// `record_release_content_staleness`), then assert the live staleness reflects content age and
+    /// that `flush()` resets it back to 0.
+    ///
+    /// Lifecycle covered: cold-start (None ⇒ 0), fresh release (~0), frozen stream (now advances,
+    /// no new release ⇒ staleness climbs), then flush (⇒ 0 re-baseline).
+    ///
+    /// Mutation coverage: failing to update the anchors in the release path leaves staleness 0 and
+    /// fails the "climbs" assert; failing to reset them in `flush()` fails the post-flush `== 0.0`
+    /// assert (live staleness would still climb against the stale media anchor).
+    #[test]
+    fn content_staleness_integration_release_then_flush_resets() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+
+        // Cold start: no release yet ⇒ 0.
+        assert_eq!(
+            jb.content_staleness_ms_live(5000),
+            0.0,
+            "cold start (no release) must read 0"
+        );
+
+        // Release a keyframe captured at publisher-clock media_ts = 2000ms, arriving at receiver
+        // wall-clock 5000ms (so base skew = 3000ms). Use the real insert→release path.
+        let media_ts_ms = 2000.0;
+        let arrival_ms = 5000u128;
+        jb.insert_frame(
+            create_test_frame_with_media_ts(1, FrameType::KeyFrame, media_ts_ms * 1000.0),
+            arrival_ms,
+        );
+        // find_and_move releases once the playout delay elapses; advance `now` past it.
+        let release_now = arrival_ms + 100;
+        jb.find_and_move_continuous_frames(release_now);
+        assert_eq!(
+            jb.last_released_media_ts_ms,
+            Some(media_ts_ms),
+            "release must record the painted frame's media_ts (µs→ms)"
+        );
+        assert_eq!(
+            jb.min_skew_ms,
+            Some(arrival_ms as f64 - media_ts_ms),
+            "release must seed the min-skew baseline from arrival − media_ts"
+        );
+
+        // Fresh-ish: just after release, staleness ≈ (release_now − media_ts) − base
+        // = (5100 − 2000) − 3000 = 100ms. Small, as expected for freshly-released content.
+        assert_eq!(
+            jb.content_staleness_ms_live(release_now),
+            100.0,
+            "freshly released content should read a small staleness (the 100ms release lag)"
+        );
+
+        // Frozen stream: no further releases, `now` advances 4 minutes. media anchor frozen ⇒
+        // staleness climbs to ~ the elapsed-since-capture minus base.
+        let frozen_now = release_now + 240_000;
+        let frozen_staleness = jb.content_staleness_ms_live(frozen_now);
+        assert_eq!(
+            frozen_staleness,
+            (frozen_now as f64 - media_ts_ms) - (arrival_ms as f64 - media_ts_ms),
+            "a frozen stream's staleness must climb as `now` advances against the frozen media anchor"
+        );
+        assert!(
+            frozen_staleness > MAX_PLAYOUT_AGE_MS,
+            "frozen-stream staleness must be able to exceed the 1800ms playout cap"
+        );
+
+        // Flush (stream restart / reset_pipeline): anchors reset ⇒ staleness back to 0 even though
+        // `now` is far in the future.
+        jb.flush();
+        assert!(jb.last_released_media_ts_ms.is_none());
+        assert!(jb.min_skew_ms.is_none());
+        assert_eq!(
+            jb.content_staleness_ms_live(frozen_now),
+            0.0,
+            "flush must reset the content-staleness anchors so a restarted stream reads 0"
         );
     }
 }

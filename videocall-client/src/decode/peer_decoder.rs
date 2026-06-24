@@ -306,6 +306,11 @@ impl VideoPeerDecoder {
             videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(on_video_frame),
             Box::new(on_request_keyframe),
+            // Issue #1641: thread this decoder's stream kind (MEDIA_TYPE_CAMERA / MEDIA_TYPE_SCREEN)
+            // into the worker→main re-broadcast so its "video" playout-stats DiagEvent is bucketed
+            // into the correct camera-vs-screen slot by health_reporter. The worker cannot supply
+            // this (it only knows peer IDs), so the kind is stamped on the main thread here.
+            media_type,
         );
 
         let decoder = Box::new(WasmVideoFrameDecoder {
@@ -765,13 +770,6 @@ impl PeerDecode for VideoPeerDecoder {
                 frame_type: self.get_frame_type(packet),
                 codec: frame_codec,
                 data: packet.data.clone(),
-                // #1656: carry the sender-side capture wall-clock from the
-                // protobuf VideoMetadata into the codecs VideoFrame so the
-                // jitter buffer can compute the `realtime_lag_ms` diagnostic
-                // (observability only — it does not trip the freshness deadline
-                // or affect playout). 0 when the publisher did not stamp it
-                // (older clients).
-                capture_unix_ms: video_metadata.capture_unix_ms,
             };
 
             // Create a FrameBuffer and push it to the decoder

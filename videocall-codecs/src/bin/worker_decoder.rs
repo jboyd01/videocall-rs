@@ -520,10 +520,6 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
                 codec: frame.frame.codec,
                 data: frame.frame.data.clone(),
                 timestamp: frame.frame.timestamp,
-                // #1656: preserve the sender-side capture wall-clock so the
-                // jitter buffer can compute the `realtime_lag_ms` diagnostic
-                // (observability only — it does not affect playout).
-                capture_unix_ms: frame.frame.capture_unix_ms,
             };
 
             // Get current time in milliseconds
@@ -563,9 +559,6 @@ fn inject_stale_frame_to_jitter_buffer(frame: FrameBuffer) {
                 codec: frame.frame.codec,
                 data: frame.frame.data.clone(),
                 timestamp: frame.frame.timestamp,
-                // #1656: preserve the caller-supplied capture wall-clock (the
-                // InjectStaleFrame test path may craft a back-dated value).
-                capture_unix_ms: frame.frame.capture_unix_ms,
             };
             // Use the caller-supplied (back-dated) arrival time, NOT Date::now().
             jb.insert_frame(video_frame, arrival_time_ms);
@@ -664,17 +657,16 @@ fn check_jitter_buffer_for_ready_frames() {
                                     // consume it via increase()/rate(); a rising value proves the
                                     // governor fired in the field.
                                     let playout_skip_to_live_total = jb.governor_skip_count();
-
-                                    // Skew-resilient relative capture-lag (issue #1656),
-                                    // OBSERVABILITY ONLY: how far this peer's video is behind its own
-                                    // best-case source cadence, sampled each ~10ms tick and read here
-                                    // at the 1Hz emit. Reports source/upstream lag that the
-                                    // arrival-based playout-latency metric cannot see (frames that
-                                    // arrive on-time but are old at the source). It is a measurement
-                                    // surfaced to diagnostics — it does NOT gate playout or PLIs (the
-                                    // freshness deadline is arrival-only; the behaviour fix for the
-                                    // real minutes-lag lives in #1662/#1479 per the #1661 analysis).
-                                    let realtime_lag_ms = jb.realtime_lag_ms();
+                                    // Content-staleness (issue #1641): the content AGE of the video
+                                    // currently being painted, drift-baselined to cancel the
+                                    // unsynchronized publisher/receiver clock offset. Computed on
+                                    // the same 1 Hz emit tick against `current_time_ms` so a FROZEN
+                                    // stream's staleness rises without needing a new release.
+                                    // Distinct from playout_paint_lag_ms (queue DEPTH): a stream
+                                    // draining minutes-old content at display rate keeps paint-lag
+                                    // ~0 but climbs here. Read-only — no playout behavior change.
+                                    let content_staleness_ms =
+                                        jb.content_staleness_ms_live(current_time_ms);
 
                                     // TRUE painted-frame fps (issue #1656): frames actually RELEASED
                                     // to the renderer (FRAMES_EMITTED, posted to main per decoded
@@ -717,8 +709,9 @@ fn check_jitter_buffer_for_ready_frames() {
                                                 "playout_skip_to_live_total",
                                                 playout_skip_to_live_total
                                             ),
-                                            // #1656: source/upstream lag + true painted cadence.
-                                            metric!("realtime_lag_ms", realtime_lag_ms),
+                                            // #1641: content staleness (media-presentation lag).
+                                            metric!("content_staleness_ms", content_staleness_ms),
+                                            // #1656: true painted-frame cadence (FRAMES_EMITTED / wall-second).
                                             metric!("fps_painted", fps_painted),
                                         ],
                                     };
@@ -736,6 +729,7 @@ fn check_jitter_buffer_for_ready_frames() {
                                             playout_stage1_span_ms,
                                             playout_paint_lag_ms,
                                             playout_skip_to_live_total,
+                                            content_staleness_ms,
                                         );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);

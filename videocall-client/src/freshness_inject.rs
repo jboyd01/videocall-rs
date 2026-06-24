@@ -250,11 +250,6 @@ fn inject_stale_video_backlog(num_frames: u32, age_ms: f64) {
                     codec: FrameCodec::Vp9Profile0Level10Bit8,
                     data: Vec::new(),
                     timestamp: 0.0,
-                    // #1656: this test-only injector forms an arrival-stale backlog
-                    // for the arrival-only freshness deadline; capture wall-clock is
-                    // irrelevant here, so leave it unstamped (0 = no capture signal,
-                    // realtime_lag_ms diagnostic reports 0.0).
-                    capture_unix_ms: 0,
                 },
                 arrival_time_ms,
             );
@@ -288,6 +283,10 @@ fn ensure_test_decoder() {
             VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(|_frame| {}),
             Box::new(|| {}),
+            // Issue #1641: this #1022/#1045 inject harness exercises the camera freshness path,
+            // so tag it as camera ("VIDEO" / MEDIA_TYPE_CAMERA) — the value health_reporter
+            // treats as non-screen.
+            crate::decode::peer_decoder::MEDIA_TYPE_CAMERA,
         );
         *slot = Some(decoder);
     });
