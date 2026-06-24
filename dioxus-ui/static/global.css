@@ -3164,9 +3164,13 @@ html[data-theme="light"] #invite-overlay p {
   cursor: grabbing;
 }
 
-/* B1: keyboard-focus ring on the pannable viewport so a keyboard / switch user
-   sees where pan focus is. Mirrors `.ss-zoom-btn:focus-visible` below. */
-.ss-zoom-viewport--pannable:focus-visible {
+/* B1: keyboard-focus ring on the zoom viewport so a keyboard / switch user
+   sees where focus is. The viewport carries an unconditional `tabindex="0"`,
+   so it is a tab-stop even at fit (100%, the default) when nothing is
+   pannable yet; scoping the ring to the base class (not the
+   `--pannable` modifier) keeps the focus indicator visible in that state
+   too (WCAG 2.4.7). Mirrors `.ss-zoom-btn:focus-visible` below. */
+.ss-zoom-viewport:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }

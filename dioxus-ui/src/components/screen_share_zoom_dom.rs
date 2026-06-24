@@ -313,6 +313,12 @@ fn copy_styles_into_pip(main_doc: &web_sys::Document, pip_doc: &web_sys::Documen
         None => return,
     };
 
+    // Same-origin by spec: the Document Picture-in-Picture window is always
+    // created same-origin with its opener (it has no navigable URL of its own),
+    // so cloning our own `<link>`/`<style>` nodes into it is safe and never
+    // crosses an origin boundary. Do NOT "harden" this into reading
+    // `sheet.cssRules` — that would throw a SecurityError for any
+    // cross-origin-served stylesheet and is unnecessary here (issue 1175).
     if let Ok(links) = main_doc.query_selector_all("link[rel=\"stylesheet\"], style") {
         for i in 0..links.length() {
             if let Some(node) = links.item(i) {

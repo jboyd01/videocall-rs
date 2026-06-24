@@ -742,7 +742,7 @@ pub fn generate_for_peer(
                             // harmless at fit).
                             tabindex: "0",
                             role: "group",
-                            "aria-label": "Shared content, zoomed — arrow keys to pan",
+                            "aria-label": "Shared content — use arrow keys to pan when zoomed",
                             ScreenCanvas { peer_id: key.clone() }
                         }
                         h4 {
