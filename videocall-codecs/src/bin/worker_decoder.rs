@@ -771,6 +771,7 @@ fn post_freshness_skip_to_main(skip: &FreshnessSkip) {
         skip.head_age_ms,
         skip.keyframe_seq,
         skip.dropped,
+        skip.escalated,
     );
     match serde_wasm_bindgen::to_value(&msg) {
         Ok(val) => {
