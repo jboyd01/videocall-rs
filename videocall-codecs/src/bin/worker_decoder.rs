@@ -647,6 +647,16 @@ fn check_jitter_buffer_for_ready_frames() {
                                     // consume it via increase()/rate(); a rising value proves the
                                     // governor fired in the field.
                                     let playout_skip_to_live_total = jb.governor_skip_count();
+                                    // Content-staleness (issue #1641): the content AGE of the video
+                                    // currently being painted, drift-baselined to cancel the
+                                    // unsynchronized publisher/receiver clock offset. Computed on
+                                    // the same 1 Hz emit tick against `current_time_ms` so a FROZEN
+                                    // stream's staleness rises without needing a new release.
+                                    // Distinct from playout_paint_lag_ms (queue DEPTH): a stream
+                                    // draining minutes-old content at display rate keeps paint-lag
+                                    // ~0 but climbs here. Read-only — no playout behavior change.
+                                    let content_staleness_ms =
+                                        jb.content_staleness_ms_live(current_time_ms);
 
                                     let evt = DiagEvent {
                                         subsystem: "video",
@@ -666,6 +676,7 @@ fn check_jitter_buffer_for_ready_frames() {
                                                 "playout_skip_to_live_total",
                                                 playout_skip_to_live_total
                                             ),
+                                            metric!("content_staleness_ms", content_staleness_ms),
                                         ],
                                     };
                                     let _ = global_sender().try_broadcast(evt);
@@ -682,6 +693,7 @@ fn check_jitter_buffer_for_ready_frames() {
                                             playout_stage1_span_ms,
                                             playout_paint_lag_ms,
                                             playout_skip_to_live_total,
+                                            content_staleness_ms,
                                         );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);

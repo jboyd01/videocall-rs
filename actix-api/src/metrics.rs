@@ -649,6 +649,22 @@ lazy_static! {
     )
     .expect("Failed to create video_playout_paint_lag_ms metric");
 
+    /// Per-peer content staleness in ms (#1641): the AGE of the video content currently being
+    /// painted — how old the just-painted frame's content is relative to live — as distinct from
+    /// `videocall_video_playout_paint_lag_ms`, which measures queue DEPTH (decoded-but-unpainted
+    /// backlog). A receiver that drains a stale backlog can keep paint_lag near 0 while still
+    /// painting minutes-old content; this gauge surfaces that age. Reported only while the tile is
+    /// actively receiving (fps_received > 0); 0 = at live. UNBOUNDED, unlike
+    /// `videocall_video_playout_latency_ms` whose client-side value is capped at 1800ms — so this is
+    /// the metric that exposes the #1631 M2 "video lagged by minutes while playout_latency_ms read
+    /// ~0" failure mode that the capped/queue-depth gauges structurally cannot show.
+    pub static ref VIDEO_CONTENT_STALENESS_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_content_staleness_ms",
+        "Per-peer content age in ms of the painted video — content-staleness (#1641); UNBOUNDED (unlike playout_latency_ms's 1800ms cap). A stream draining stale content keeps paint_lag ~0 while this climbs; surfaces the #1631 M2 minutes-of-lag",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_content_staleness_ms metric");
+
     /// Per-peer cumulative count of resync-to-live governor skips (#1252): how many times the
     /// decode-side governor jumped this receiver→source stream forward to live to shed accumulated
     /// lag. A COUNTER value held in a GaugeVec (set to the current cumulative total) so the per-pair

@@ -306,6 +306,11 @@ impl VideoPeerDecoder {
             videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(on_video_frame),
             Box::new(on_request_keyframe),
+            // Issue #1641: thread this decoder's stream kind (MEDIA_TYPE_CAMERA / MEDIA_TYPE_SCREEN)
+            // into the worker→main re-broadcast so its "video" playout-stats DiagEvent is bucketed
+            // into the correct camera-vs-screen slot by health_reporter. The worker cannot supply
+            // this (it only knows peer IDs), so the kind is stamped on the main thread here.
+            media_type,
         );
 
         let decoder = Box::new(WasmVideoFrameDecoder {
