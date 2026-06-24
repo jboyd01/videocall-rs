@@ -55,8 +55,13 @@ jobs:
           kubectl config current-context
           CLUSTER_INFO=$(kubectl cluster-info)
           echo "${CLUSTER_INFO}"
-          # Strip ANSI color codes before grep
-          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://k3s.labsworkspace.fnxlabs.com:6443"
+          # Strip ANSI color codes before grep.
+          # The labsworkspace kubeconfig advertises the control plane by node IP
+          # (10.190.75.36), which is what k3s exposes; the DNS name
+          # k3s.labsworkspace.fnxlabs.com resolves to that same IP. Accept either
+          # form so the guard still confirms the right cluster regardless of how the
+          # kubeconfig server endpoint is written.
+          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "Kubernetes control plane is running at https://(k3s\.labsworkspace\.fnxlabs\.com|10\.190\.75\.36):6443"
 
       - name: Determine image tag
         id: determine-tag
