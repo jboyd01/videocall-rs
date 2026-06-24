@@ -4543,7 +4543,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.5rem 0.75rem;
   font-size: var(--fs-3);
   line-height: 1.4;
-  color: var(--on-dark-text-high);
+  color: var(--on-dark-text-secondary);
   white-space: normal;
   width: max-content;
   max-width: 200px;

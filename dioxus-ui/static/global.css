@@ -1511,6 +1511,7 @@ html[data-theme="light"] #invite-overlay p {
   /* Text on fixed dark surfaces */
   --on-dark-text:      #ffffff;
   --on-dark-text-high: rgba(255, 255, 255, 0.95);
+  --on-dark-text-secondary: rgba(255, 255, 255, 0.7);
   --on-dark-text-muted: rgba(255, 255, 255, 0.5);
 
   /* Vertical room to reserve below the controls dock: dock bottom 20px + dock
