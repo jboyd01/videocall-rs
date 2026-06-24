@@ -51,6 +51,13 @@ impl Decodable for WasmDecoder {
         on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>,
     ) -> Self {
         log::info!("Creating WASM decoder with internal jitter buffer");
+        // Issue #1641: this `Decodable::new` path is not used for real peer rendering (peer
+        // decoders use `new_with_video_frame_callback`, which threads the owner's true media_type).
+        // It still forwards the worker's "video" stats DiagEvent, which health_reporter buckets by
+        // the `media_type` metric — so we must stamp *something*. "VIDEO" (the camera literal,
+        // `MEDIA_TYPE_CAMERA`) is the safe default: there is no real screen-share decoder on this
+        // path, so the camera bucket is correct.
+        const DECODABLE_DEFAULT_MEDIA_TYPE: &str = "VIDEO";
         // Find the worker script URL from the link tag added by Trunk.
         let worker_url = window()
             .expect("no window")
@@ -109,7 +116,7 @@ impl Decodable for WasmDecoder {
                         // is no proactive keyframe hook to fire here — but we still recognize the
                         // worker's RequestKeyframeMessage so it isn't logged as "unexpected".
                         if !handle_worker_request_keyframe(&js_val)
-                            && !handle_worker_diag_message(&js_val)
+                            && !handle_worker_diag_message(&js_val, DECODABLE_DEFAULT_MEDIA_TYPE)
                         {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
@@ -146,10 +153,20 @@ impl WasmDecoder {
     /// owner (e.g. `VideoPeerDecoder`) supplies a closure that issues a `KEYFRAME_REQUEST`
     /// for this decoder's peer/stream. Pass a no-op (`Box::new(|| {})`) when no proactive
     /// keyframe path is wired.
+    ///
+    /// `media_type` (issue #1641) is the owner's stream kind — `"VIDEO"` for a camera decoder
+    /// or `"SCREEN"` for a screen-share decoder (the `MEDIA_TYPE_CAMERA`/`MEDIA_TYPE_SCREEN`
+    /// constants in `videocall-client`). The worker does NOT know which stream it decodes (its
+    /// `SetContext` carries only peer IDs), so this main-thread re-broadcast is the only place
+    /// the kind is known. It is stamped onto the worker's "video" stats DiagEvent (see
+    /// [`handle_worker_diag_message`]) so `health_reporter` buckets the playout-family metrics
+    /// (latency / paint-lag / skip-to-live / content-staleness) into the correct camera-vs-screen
+    /// slot, mirroring how `emit_loss_metrics` already stamps its loss/keyframe metrics.
     pub fn new_with_video_frame_callback(
         _codec: crate::decoder::VideoCodec,
         on_video_frame: Box<dyn Fn(VideoFrame)>,
         on_request_keyframe: Box<dyn Fn()>,
+        media_type: &'static str,
     ) -> Self {
         log::info!("Creating WASM decoder with VideoFrame callback");
         // Find the worker script URL from the link tag added by Trunk.
@@ -200,7 +217,7 @@ impl WasmDecoder {
                         // keeps the recovery path off the (more frequent) stats path.
                         if handle_worker_request_keyframe(&js_val) {
                             request_keyframe();
-                        } else if !handle_worker_diag_message(&js_val) {
+                        } else if !handle_worker_diag_message(&js_val, media_type) {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
                     }
@@ -376,7 +393,15 @@ fn handle_worker_request_keyframe(js_val: &JsValue) -> bool {
 }
 
 /// Handle diagnostics objects posted by the worker. Returns true if handled.
-fn handle_worker_diag_message(js_val: &JsValue) -> bool {
+///
+/// `media_type` (issue #1641) is the owning decoder's stream kind (`"VIDEO"` / `"SCREEN"`),
+/// stamped onto the re-broadcast "video" DiagEvents so `health_reporter` routes their metrics
+/// into the correct camera-vs-screen bucket. The worker itself does not know its media_type
+/// (its `SetContext` carries only peer IDs), so the value is supplied here on the main thread by
+/// the owner (`VideoPeerDecoder`), the only place the kind is known. The `worker_log` branch is a
+/// `"worker_log"` subsystem event that `health_reporter` does NOT camera/screen-bucket, so it is
+/// intentionally left unstamped.
+fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> bool {
     // video_stats (issue #1252). A freshness_skip message ALSO deserializes into
     // VideoStatsMessage (its fields are all `Option`), so we must check `kind` and
     // fall through rather than treating a successful deserialize as a match.
@@ -389,6 +414,18 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                     stream_id: None,
                     ts_ms: now_ms(),
                     metrics: vec![
+                        // Issue #1641: stamp the owning decoder's stream kind so health_reporter
+                        // routes the playout-family metrics below into the correct camera-vs-screen
+                        // bucket. Without this, a peer's SCREEN-decoder worker stats landed in the
+                        // CAMERA bucket (is_screen defaults false) and raced/overwrote it. The
+                        // worker cannot supply this (it only knows peer IDs), so it is supplied here
+                        // on the main thread, mirroring `emit_loss_metrics`'s media_type stamp.
+                        // `media_type` is `&'static str`, so use the zero-alloc borrowed form
+                        // (#1421) rather than `metric!`'s allocating `From<&str>` path.
+                        Metric {
+                            name: "media_type",
+                            value: MetricValue::text_static(media_type),
+                        },
                         metric!("from_peer", stats_msg.from_peer.unwrap_or_default()),
                         metric!("to_peer", stats_msg.to_peer.unwrap_or_default()),
                         metric!("frames_buffered", stats_msg.frames_buffered.unwrap_or(0)),
@@ -408,6 +445,15 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                         metric!(
                             "playout_skip_to_live_total",
                             stats_msg.playout_skip_to_live_total.unwrap_or(0)
+                        ),
+                        // Content-staleness (#1641): content AGE of the painted video, distinct
+                        // from the paint-lag DEPTH above. This MAIN-THREAD re-broadcast is the
+                        // load-bearing one for health_reporter — the worker's own in-process
+                        // DiagEvent broadcast does not cross the worker→main boundary, so the
+                        // field reaches the health packet only via this forward.
+                        metric!(
+                            "content_staleness_ms",
+                            stats_msg.content_staleness_ms.unwrap_or(0.0)
                         ),
                     ],
                 };
@@ -458,6 +504,16 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                         Metric {
                             name: "event",
                             value: MetricValue::text_static("freshness_skip"),
+                        },
+                        // Issue #1641: this is also a `subsystem: "video"` event, so
+                        // health_reporter's video handler buckets it camera-vs-screen by
+                        // `media_type` (and bumps that bucket's timestamp). Stamp the owner's kind
+                        // here too — without it a SCREEN-decoder skip lands in the CAMERA bucket —
+                        // for consistency with the video_stats stamp above. The worker cannot supply
+                        // it (peer IDs only); it is the main thread's per-decoder static.
+                        Metric {
+                            name: "media_type",
+                            value: MetricValue::text_static(media_type),
                         },
                         metric!("from_peer", skip_msg.from_peer.unwrap_or_default()),
                         metric!("to_peer", skip_msg.to_peer.unwrap_or_default()),

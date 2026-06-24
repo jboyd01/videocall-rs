@@ -283,6 +283,10 @@ fn ensure_test_decoder() {
             VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(|_frame| {}),
             Box::new(|| {}),
+            // Issue #1641: this #1022/#1045 inject harness exercises the camera freshness path,
+            // so tag it as camera ("VIDEO" / MEDIA_TYPE_CAMERA) — the value health_reporter
+            // treats as non-screen.
+            crate::decode::peer_decoder::MEDIA_TYPE_CAMERA,
         );
         *slot = Some(decoder);
     });
