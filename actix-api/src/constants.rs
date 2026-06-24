@@ -270,6 +270,53 @@ pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 /// it to an env-resolved getter mirroring [`wt_outbound_channel_capacity`].
 pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
 
+/// Per-framed-message deadline for a write onto the persistent server→client
+/// WebTransport uni stream (issue #1638 — "#979 part 2": bound the WRITER, not
+/// the queue depth).
+///
+/// ## The defect this bounds
+///
+/// `spawn_unistream_writer` (`webtransport/bridge.rs`) owns the single
+/// persistent uni stream and drains the 512-deep `unistream_tx` channel with
+/// back-to-back `stream.write_all().await` calls. Those writes are subject to
+/// QUIC per-stream flow control: when a slow receiver stops granting credits
+/// (a downlink stall), `write_all` PARKS. The writer task is the channel's only
+/// consumer, so while it is parked the 512-slot channel fills and `try_send`
+/// starts returning `Full` (`wt_chat_session.rs`) — and at that point media
+/// drops for EVERY publisher targeting that one receiver. #979 deliberately
+/// keeps the channel SHALLOW (512) so a stall fails fast rather than hoarding
+/// stale frames; this deadline is the matching bound on the WRITER so a single
+/// wedged receiver sheds (via stream reset+reopen) instead of holding the
+/// channel full indefinitely.
+///
+/// ## Why 1000 ms
+///
+/// The deadline must straddle two requirements:
+///
+/// * **Long enough not to falsely reset a bursty-but-recovering link.** On a
+///   200 ms+ high-latency path, a single `write_all` for a large keyframe can
+///   legitimately take several RTTs while the receiver drains a transient
+///   backlog and re-grants credits. At 30 fps the frame cadence is ~33 ms, so
+///   1000 ms is ~30 frame intervals of slack — comfortably more than a healthy
+///   high-RTT link needs to clear a normal jitter burst, so we do NOT reset a
+///   stream that is merely slow-and-recovering (a needless reset throws away an
+///   in-flight frame and costs a fresh-stream round trip).
+/// * **Short enough that a genuinely stalled receiver cannot pin the channel
+///   full for multiple seconds.** Under a 4-publisher fan-in the channel can
+///   refill in ~4 s once the single writer parks; a per-frame deadline of 1 s
+///   caps the head-of-line stall to ~1 s before the writer sheds and resumes
+///   draining the next frame onto a fresh stream, well under that floor.
+///
+/// We deliberately pin it to [`CONGESTION_WINDOW`] (1000 ms) — the same window
+/// the relay already uses to decide a receiver is congested. A write that has
+/// not completed within one congestion window is, by the relay's own existing
+/// definition of congestion, a stalled (not merely jittery) stream, so resetting
+/// it is consistent with the rest of the congestion machinery. It sits below
+/// [`KEYFRAME_CONGESTION_RELAX_WINDOW`] (2 s) and well below
+/// [`RECEIVER_DOWNLINK_RELIEF_WINDOW`] (8 s), so the writer sheds a wedged stream
+/// before those longer recovery windows would even arm.
+pub const WT_UNISTREAM_WRITE_DEADLINE: Duration = Duration::from_millis(1000);
+
 // ---------------------------------------------------------------------------
 // Inbound fan-out mailbox headroom (issues #1144 / #1145)
 // ---------------------------------------------------------------------------

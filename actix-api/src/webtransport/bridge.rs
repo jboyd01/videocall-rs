@@ -69,14 +69,25 @@
 //! the full root-cause analysis.
 
 use crate::actors::transports::wt_chat_session::{WtInbound, WtInboundSource};
-use crate::constants::MAX_FRAME_SIZE;
-use crate::metrics::RELAY_INBOUND_BRIDGE_DROPS_TOTAL;
+use crate::constants::{MAX_FRAME_SIZE, WT_UNISTREAM_WRITE_DEADLINE};
+use crate::metrics::{RELAY_INBOUND_BRIDGE_DROPS_TOTAL, RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL};
 use actix::Addr;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use web_transport_quinn::Session;
+
+/// WebTransport/HTTP/3 application error code used when the relay RESETS a
+/// wedged persistent server→client uni stream (#1638).
+///
+/// The code is informational only — the client treats any reset of an inbound
+/// uni stream as an EOF/error on that stream and discards any partial frame
+/// (see `videocall-client`'s `handle_unidirectional_stream`), then accepts the
+/// freshly re-opened stream and resyncs at a clean frame boundary. We use a
+/// non-zero sentinel so the reset is distinguishable on the wire from a clean
+/// `finish()` (code 0) for anyone inspecting QUIC traces.
+const UNISTREAM_SHED_RESET_CODE: u32 = 1;
 
 /// Callback for tracking packets sent to clients (used in tests)
 pub type PacketSentCallback = Box<dyn Fn() + Send + Sync>;
@@ -228,9 +239,7 @@ impl WebTransportBridge {
     /// order they were written.
     ///
     /// The stream is opened lazily on the first write and kept alive for
-    /// the duration of the session. On write error the cached stream is
-    /// dropped and a new one is opened on the next attempt (single
-    /// retry).
+    /// the duration of the session.
     ///
     /// **Topology invariant** (the reason this task exists separately
     /// from `spawn_datagram_writer`): when QUIC flow-control credits on
@@ -240,6 +249,35 @@ impl WebTransportBridge {
     /// the unrelated `send_datagram` path even while this writer is
     /// parked. This is the central architectural fix for the 5-minute
     /// WT freeze described in discussion #756.
+    ///
+    /// **Bounded writer** (#1638 — "#979 part 2"): the per-frame write is
+    /// bounded by [`WT_UNISTREAM_WRITE_DEADLINE`]. Two failure modes are
+    /// handled distinctly, but BOTH end the same way — RESET the wedged/broken
+    /// stream, RE-OPEN a fresh persistent stream, DROP the current frame, and
+    /// continue draining the NEXT frame from the channel onto the fresh stream:
+    ///
+    /// * **Timeout (stream alive but flow-control-wedged).** A slow receiver
+    ///   stops granting QUIC credits, so `write_all` parks. Without a bound the
+    ///   writer (the channel's only consumer) stays parked, the 512-deep
+    ///   `unistream_tx` fills, and `try_send` returns `Full` for EVERY publisher
+    ///   targeting that one receiver — the #1631 M1 cascade. Resetting the
+    ///   wedged stream sheds the head-of-line frame and lets the writer resume
+    ///   draining within one deadline, so a stalled receiver can no longer hold
+    ///   the channel full indefinitely. Counted as `reason="write_timeout"`.
+    /// * **Write error (stream already torn down).** The stream returned an I/O
+    ///   error — it is genuinely broken (not merely slow). The pre-existing
+    ///   single-retry recovery. Counted as `reason="write_error"`.
+    ///
+    /// Why the CURRENT frame is dropped on BOTH paths rather than re-sent on the
+    /// fresh stream: re-sending the wedged frame first would immediately
+    /// re-stall the new stream against the same flow-control-starved receiver,
+    /// re-wedging the channel. Dropping it keeps the new stream's first bytes a
+    /// COMPLETE `[len][payload]` frame (the next frame from the channel), so the
+    /// client's per-stream framing buffer — which is freshly allocated per
+    /// accepted stream and never carries a mid-frame continuation across a reset
+    /// (see `videocall-client`'s `handle_unidirectional_stream`) — resyncs
+    /// immediately at a frame boundary. A reset mid-frame therefore discards the
+    /// client's partial frame cleanly; it never desyncs the decoder.
     fn spawn_unistream_writer(
         join_set: &mut JoinSet<()>,
         session: Session,
@@ -272,40 +310,80 @@ impl WebTransportBridge {
                     .expect("packet exceeds u32::MAX bytes; video frames should be well under 4GB");
                 let len_header = len.to_be_bytes();
 
-                // Write to the persistent stream.
+                // Write the WHOLE framed message (header + payload) under a SINGLE
+                // deadline so a stall on either half triggers the same shed. The
+                // header and payload are written back-to-back inside one
+                // `tokio::time::timeout` future; the deadline covers their sum, not
+                // each half separately.
                 let stream = persistent_stream.as_mut().expect("stream was just opened");
-                let write_result = stream.write_all(&len_header).await.err();
-                let write_err = match write_result {
-                    Some(e) => Some(e),
-                    None => stream.write_all(&data).await.err(),
+                let framed_write = async {
+                    stream.write_all(&len_header).await?;
+                    stream.write_all(&data).await
                 };
-                if let Some(e) = write_err {
-                    warn!(
-                        "Error writing to persistent UniStream ({}), retrying with new stream",
-                        e
-                    );
-                    // Drop the broken stream and try once more with a fresh one.
-                    drop(persistent_stream.take());
-                    let mut new_stream = match session.open_uni().await {
-                        Ok(s) => s,
+                let write_outcome =
+                    tokio::time::timeout(WT_UNISTREAM_WRITE_DEADLINE, framed_write).await;
+
+                // `reason` distinguishes the two shed paths for the operator-facing
+                // metric + log. `None` => the write completed within the deadline.
+                let shed_reason: Option<&'static str> = match write_outcome {
+                    // Completed within the deadline with no I/O error: fast path.
+                    Ok(Ok(())) => None,
+                    // Completed within the deadline but the stream returned an
+                    // error: the stream is genuinely broken (already torn down),
+                    // NOT merely flow-control-wedged. Pre-existing recovery path.
+                    Ok(Err(e)) => {
+                        warn!(
+                            "Error writing to persistent UniStream ({}); resetting and \
+                             reopening (frame dropped)",
+                            e
+                        );
+                        Some("write_error")
+                    }
+                    // Deadline elapsed: the stream is alive but its QUIC
+                    // flow-control credits are exhausted (the receiver's downlink
+                    // stalled). Shed by resetting so the writer stops being parked
+                    // and the channel can drain. This is the #1638 fix.
+                    Err(_elapsed) => {
+                        warn!(
+                            "Persistent UniStream write stalled past {}ms deadline \
+                             (receiver downlink wedged); resetting and reopening \
+                             (frame dropped)",
+                            WT_UNISTREAM_WRITE_DEADLINE.as_millis()
+                        );
+                        Some("write_timeout")
+                    }
+                };
+
+                if let Some(reason) = shed_reason {
+                    RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL
+                        .with_label_values(&["webtransport", reason])
+                        .inc();
+                    // RESET the wedged/broken stream so the receiver's side
+                    // surfaces an error/EOF on it and the QUIC send buffer for it
+                    // is released. `reset` may itself report `ClosedStream` (the
+                    // stream was already gone) — that is fine, we are tearing it
+                    // down regardless, so the result is intentionally ignored.
+                    if let Some(mut wedged) = persistent_stream.take() {
+                        let _ = wedged.reset(UNISTREAM_SHED_RESET_CODE);
+                    }
+                    // Re-open a fresh persistent stream for the NEXT frame. We do
+                    // NOT re-send the dropped frame here (see the doc comment): the
+                    // next loop iteration drains the next frame from the channel and
+                    // writes it whole onto this fresh stream, so the client resyncs
+                    // at a clean frame boundary.
+                    match session.open_uni().await {
+                        Ok(s) => persistent_stream = Some(s),
                         Err(e2) => {
-                            error!("Error opening new UniStream after retry: {}", e2);
+                            error!(
+                                "Error opening fresh UniStream after shed ({}): {}",
+                                reason, e2
+                            );
                             break;
                         }
-                    };
-                    // Retry with the complete framed message (length + data).
-                    if let Err(e2) = new_stream.write_all(&len_header).await {
-                        error!(
-                            "Error writing length header to new UniStream after retry: {}",
-                            e2
-                        );
-                        break;
                     }
-                    if let Err(e2) = new_stream.write_all(&data).await {
-                        error!("Error writing payload to new UniStream after retry: {}", e2);
-                        break;
-                    }
-                    persistent_stream = Some(new_stream);
+                    // The current frame was sched away; do not fire the
+                    // packet-sent callback for it. Continue to the next frame.
+                    continue;
                 }
 
                 // Call packet sent callback if provided (for test instrumentation)
@@ -803,5 +881,227 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), len);
         assert_eq!(status, TerminalStatus::CleanEof);
+    }
+}
+
+// =============================================================================
+// #1638 writer-deadline regression tests
+// =============================================================================
+//
+// These exercise the REAL production `spawn_unistream_writer` via
+// `WebTransportBridge::new_with_callback` against a REAL `web_transport_quinn`
+// session pair stood up in-process over loopback (NO NATS, NO full relay
+// server). The bridge writer is hard-typed to `web_transport_quinn::Session`,
+// so the only way to drive the genuine production code path is with a real
+// session — there is no trait seam to mock. We therefore build a minimal
+// HTTP/3 WebTransport handshake in-process and stall the CLIENT's read side so
+// QUIC flow-control credits on the server→client uni stream drain to zero,
+// reproducing the exact downlink-stall failure mode the fix targets.
+#[cfg(test)]
+mod writer_shed_tests {
+    use super::*;
+    use crate::constants::WT_UNISTREAM_WRITE_DEADLINE;
+    use actix::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use web_transport_quinn::quinn;
+
+    /// Minimal actor implementing `Handler<WtInbound>` so we can build a real
+    /// `WebTransportBridge` without standing up a full `WtChatSession` (which
+    /// needs NATS, SessionManager, addresses, …). The bridge's writer task —
+    /// the code under test — never touches this actor; it only drains the
+    /// outbound channel onto the session's uni stream. The reader tasks forward
+    /// inbound frames here, which the test ignores.
+    struct StubActor;
+    impl Actor for StubActor {
+        type Context = Context<Self>;
+    }
+    impl Handler<WtInbound> for StubActor {
+        type Result = ();
+        fn handle(&mut self, _msg: WtInbound, _ctx: &mut Self::Context) {}
+    }
+
+    /// Build a hermetic in-process `web_transport_quinn` server endpoint on an
+    /// ephemeral loopback port using the committed DER test cert + key. Returns
+    /// the bound address and the `Server` so the caller can `accept()`.
+    fn build_test_server() -> (std::net::SocketAddr, web_transport_quinn::Server) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        // CARGO_MANIFEST_DIR points at the actix-api crate root; the certs live
+        // under <crate>/certs. These are committed DER fixtures (an X.509 cert
+        // and a PKCS#8 key) — the client uses no-cert-verification, so trust is
+        // irrelevant; we only need a parseable cert+key for the server config.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let cert_der =
+            std::fs::read(format!("{manifest_dir}/certs/localhost.der")).expect("read cert der");
+        let key_der =
+            std::fs::read(format!("{manifest_dir}/certs/localhost_key.der")).expect("read key der");
+
+        let chain = vec![CertificateDer::from(cert_der)];
+        let key = PrivateKeyDer::try_from(key_der).expect("parse pkcs8 key der");
+
+        let provider = rustls::crypto::ring::default_provider();
+        let mut crypto = rustls::ServerConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("tls13")
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .expect("single cert");
+        crypto.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic server config"),
+        ));
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let endpoint = quinn::Endpoint::server(server_config, addr).expect("server endpoint");
+        let bound = endpoint.local_addr().expect("local addr");
+        (bound, web_transport_quinn::Server::new(endpoint))
+    }
+
+    /// Connect a `web_transport_quinn` client (no cert verification) to the
+    /// given loopback address.
+    async fn connect_test_client(addr: std::net::SocketAddr) -> web_transport_quinn::Session {
+        let client = web_transport_quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()
+            .expect("client builder");
+        let url =
+            url::Url::parse(&format!("https://127.0.0.1:{}/test", addr.port())).expect("parse url");
+        client.connect(url).await.expect("client connect")
+    }
+
+    /// Drive a frame onto the bridge's outbound unistream channel.
+    fn push(tx: &mpsc::Sender<Bytes>, n: usize) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        tx.try_send(Bytes::from(vec![0xCD; n]))
+    }
+
+    /// REGRESSION TEST (#1638): a stalled-downlink receiver must NOT wedge the
+    /// outbound unistream channel full indefinitely — the writer sheds within
+    /// the deadline and resumes draining.
+    ///
+    /// Setup: a real server→client uni stream where the client accepts the
+    /// stream but never reads it, so QUIC flow-control credits drain to zero and
+    /// the server's `write_all` parks. We push enough frames to fill the writer's
+    /// channel, then assert the channel does NOT stay full past the deadline (the
+    /// writer reset+reopened the wedged stream and drained more frames).
+    ///
+    /// PROOF THE TEST BITES: on the UN-bounded writer (revert the
+    /// `tokio::time::timeout` + reset/reopen), `write_all` parks forever, the
+    /// writer never drains again, and the channel stays full until the outer
+    /// `tokio::time::timeout` fires → the test FAILS (panics on timeout). With
+    /// the fix, the writer sheds within `WT_UNISTREAM_WRITE_DEADLINE` and the
+    /// channel regains capacity → the test PASSES.
+    #[actix_rt::test]
+    async fn stalled_receiver_does_not_wedge_channel_forever() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (addr, mut server) = build_test_server();
+
+        // Accept the client session on the server side in the background.
+        let server_session_fut = tokio::spawn(async move {
+            let request = server.accept().await.expect("accept request");
+            request.ok().await.expect("respond ok")
+        });
+
+        // Connect the client. CRITICAL: we hold the session but DO NOT accept or
+        // read its incoming uni stream, so once the server opens the persistent
+        // uni stream and writes a flow-control window's worth of bytes, further
+        // writes park on credit exhaustion — the exact downlink stall the fix
+        // targets.
+        let client_session = connect_test_client(addr).await;
+        let server_session = server_session_fut.await.expect("join server session");
+
+        // Build the bridge with the REAL production writer over the REAL server
+        // session. The channel cap is small so it fills quickly under stall.
+        const CAP: usize = 16;
+        let (uni_tx, uni_rx) = mpsc::channel::<Bytes>(CAP);
+        let (_dgram_tx, dgram_rx) = mpsc::channel::<Bytes>(CAP);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_cb = sent.clone();
+        let on_sent: PacketSentCallback = Box::new(move || {
+            sent_cb.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let stub = StubActor.start();
+        let _bridge = WebTransportBridge::new_with_callback(
+            server_session,
+            stub,
+            uni_rx,
+            dgram_rx,
+            Some(on_sent),
+        );
+
+        // Outer guard: if a regression causes the writer to park forever, this
+        // makes the whole test FAIL (timeout) rather than hang CI indefinitely.
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            // Push frames large enough to exhaust the receive window quickly.
+            // Some will be accepted; once the writer parks on the stalled stream
+            // the channel fills and `try_send` starts returning Full.
+            let frame_bytes = 64 * 1024;
+            let mut full_observed = false;
+            for _ in 0..(CAP * 4) {
+                if push(&uni_tx, frame_bytes).is_err() {
+                    full_observed = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                full_observed,
+                "test setup failed: channel never filled — the receiver stall did \
+                 not park the writer (window too large or frames too small)"
+            );
+
+            // The channel is now full (writer parked on the wedged stream). The
+            // FIX must shed within ~WT_UNISTREAM_WRITE_DEADLINE and resume
+            // draining, so capacity must return. Poll for capacity to reappear
+            // for up to a few deadlines' worth of time.
+            let recover_deadline = std::time::Instant::now()
+                + WT_UNISTREAM_WRITE_DEADLINE * 4
+                + Duration::from_secs(2);
+            let mut recovered = false;
+            while std::time::Instant::now() < recover_deadline {
+                if uni_tx.capacity() > 0 {
+                    recovered = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(
+                recovered,
+                "REGRESSION (#1638): outbound unistream channel stayed FULL past \
+                 the writer deadline — the writer parked on the stalled receiver \
+                 and never shed. capacity={}",
+                uni_tx.capacity()
+            );
+
+            // After recovery, a fresh push must be admitted (the writer is
+            // draining again onto the fresh stream), proving the reset+reopen
+            // recovered the writer rather than killing it.
+            // Drain any slack then confirm the channel keeps accepting.
+            let mut post_recovery_admitted = 0usize;
+            for _ in 0..CAP {
+                if push(&uni_tx, frame_bytes).is_ok() {
+                    post_recovery_admitted += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                post_recovery_admitted > 0,
+                "after shed the writer must keep draining (admitted 0 post-recovery)"
+            );
+
+            // Keep the client session alive until the end so the connection is
+            // not torn down early (which would mask the stall with a clean EOF).
+            drop(client_session);
+        })
+        .await;
+
+        outcome.expect(
+            "REGRESSION (#1638): writer never shed the stalled stream within the \
+             test window — the channel stayed wedged (un-bounded writer parks \
+             forever on QUIC flow control)",
+        );
     }
 }

@@ -1705,6 +1705,37 @@ lazy_static! {
     )
     .expect("Failed to create relay_inbound_bridge_drops_total metric");
 
+    /// Persistent server->client WebTransport uni stream RESETS at the OUTBOUND
+    /// bridge writer (`webtransport/bridge.rs` `spawn_unistream_writer`), by
+    /// transport and `reason` (#1638).
+    ///
+    /// DISTINCT from `videocall_outbound_channel_drops_total`: that counter
+    /// covers PRODUCER-side `try_send` drops at the `WtChatSession`
+    /// `Handler<Message>` enqueue hop (before the bytes ever reach the writer).
+    /// THIS counter covers the WRITER-side event the #1638 fix introduces — the
+    /// single persistent uni stream being torn down and re-opened because a write
+    /// onto it could not complete. The in-flight frame that triggered the reset
+    /// is dropped (the receiver was wedged), so this is also a drop, but it is a
+    /// transport-layer stream reset rather than a queue overflow and is counted
+    /// separately so operators can tell "the receiver's downlink stalled past the
+    /// write deadline" (`reason="write_timeout"`, the #1638 shed) apart from "the
+    /// stream errored / was already torn down" (`reason="write_error"`, the
+    /// pre-existing single-retry path). Both end in reset+reopen.
+    ///
+    /// `transport` is always `webtransport` here (only the WT bridge owns a
+    /// persistent uni stream), kept for label-shape parity with the sibling
+    /// bridge counters.
+    ///
+    /// CARDINALITY BOUND: at most 2 series
+    /// (`webtransport` x {write_timeout, write_error}). Safe for indefinite
+    /// retention; no cleanup required.
+    pub static ref RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_outbound_bridge_stream_resets_total",
+        "Persistent server->client WebTransport uni stream resets at the outbound bridge writer, by transport and reason (write_timeout|write_error) (#1638)",
+        &["transport", "reason"]
+    )
+    .expect("Failed to create relay_outbound_bridge_stream_resets_total metric");
+
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///
     /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
