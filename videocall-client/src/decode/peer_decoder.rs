@@ -75,7 +75,11 @@ struct CanvasRenderer {
 /// Shared slot for the proactive keyframe-request route (issue #1025). `Rc` so the decoder's
 /// worker-message closure and `VideoPeerDecoder` share it; `RefCell<Option<..>>` because the
 /// route is installed after construction (and may be `None` before the transport is wired).
-type KeyframeRequestRoute = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+///
+/// The route closure receives the head-of-line backlog age (`head_age_ms`, issue #1479) that
+/// tripped the freshness deadline, so the manager's per-receiver cross-sender PLI budget can
+/// prioritize the stalest stream when its global cap is reached.
+type KeyframeRequestRoute = Rc<RefCell<Option<Box<dyn Fn(f64)>>>>;
 
 ///
 /// VideoPeerDecoder
@@ -296,9 +300,9 @@ impl VideoPeerDecoder {
         // `set_keyframe_request_route`. While `None` the proactive path is a no-op.
         let keyframe_request_route: KeyframeRequestRoute = Rc::new(RefCell::new(None));
         let route_for_decoder = keyframe_request_route.clone();
-        let on_request_keyframe = move || {
+        let on_request_keyframe = move |head_age_ms: f64| {
             if let Some(route) = route_for_decoder.borrow().as_ref() {
-                route();
+                route(head_age_ms);
             }
         };
 
@@ -587,7 +591,11 @@ impl VideoPeerDecoder {
     /// manager build it once the transport send-packet callback, the local user id, and the
     /// peer's identity are all known. Replaces any previously-installed route; pass-through to
     /// the shared slot the decoder closure reads.
-    pub fn set_keyframe_request_route(&self, route: Box<dyn Fn()>) {
+    ///
+    /// The `route` receives the head-of-line backlog age (`head_age_ms`, issue #1479) that tripped
+    /// the freshness deadline; the manager's route closure feeds it to the per-receiver
+    /// cross-sender PLI budget as the staleness-priority key.
+    pub fn set_keyframe_request_route(&self, route: Box<dyn Fn(f64)>) {
         *self.keyframe_request_route.borrow_mut() = Some(route);
     }
 

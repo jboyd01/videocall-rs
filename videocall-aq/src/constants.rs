@@ -1867,6 +1867,48 @@ pub struct SelfCongestionDecision {
     pub new_snapshot: u64,
 }
 
+// =====================================================================
+// Per-receiver cross-sender proactive-PLI budget (issue #1479, option b)
+// =====================================================================
+//
+// These bound how many PROACTIVE keyframe requests (PLIs) a single receiver may
+// emit ACROSS ALL of its senders within a sliding window. They back the
+// `PliBudget` in `videocall_client::decode::pli_budget`, which sits ABOVE the
+// transport-agnostic `emit_keyframe_request` packet builder (so it applies
+// identically to WebTransport and WebSocket).
+//
+// DEFENSE-IN-DEPTH, NOT A TIGHT THROTTLE. The authoritative limiter is the
+// RELAY's per-receiver `KEYFRAME_REQUEST_MAX_PER_SEC = 32` cap (server-side,
+// `actix-api/src/constants.rs`), which already coalesces this receiver's PLIs
+// across senders. This client budget deliberately mirrors that 32/s cap rather
+// than tightening it: the server stays the binding limit, and the client is a
+// co-equal shadow that is a NO-OP in normal multi-sender recovery (a benign
+// ceiling that only sheds genuinely-redundant same-window 2nd+ pokes once the
+// shared cap is reached). It must NEVER be tighter than the relay, or it would
+// shadow a guarantee the server upholds and risk shedding legitimate recovery.
+
+/// Sliding window (ms) over which the per-receiver cross-sender proactive-PLI
+/// budget counts ALLOWED requests (issue #1479). Matches the relay's 1s
+/// `KEYFRAME_REQUEST` limiter window so the client shadow ages entries out on
+/// the same cadence the server does. Wall-clock based, so a reconnect /
+/// cold-start / tab-resume self-heals: once `now_ms` jumps past the window,
+/// every stale entry is pruned and the budget is effectively empty again.
+pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
+
+/// Maximum ALLOWED proactive PLIs per receiver across ALL senders within
+/// `KEYFRAME_REQUEST_WINDOW_MS` (issue #1479). Deliberately EQUAL to the relay's
+/// `KEYFRAME_REQUEST_MAX_PER_SEC = 32` (NOT tighter): the SERVER remains the
+/// authoritative/binding limit and this client cap is a co-equal defense-in-depth
+/// ceiling. In normal multi-sender recovery this is a NO-OP — a sender's FIRST
+/// request in each window is ALWAYS allowed (wedge-proof + the #1662 escalation
+/// exemption), and each sender is already paced to <=1 proactive PLI/s by the
+/// #1494 per-sender backoff in `jitter_buffer.rs`, so reaching 32 distinct
+/// senders' firsts within one window requires a 32-way simultaneous freeze. Only
+/// a SECOND+ same-window poke from a sender that already fired this window can be
+/// shed, and only once the cap is reached — at which point staleness priority
+/// preserves the stalest contender. It is a benign ceiling, never a tight throttle.
+pub const KEYFRAME_REQUEST_MAX_PER_WINDOW: usize = 32;
+
 #[cfg(test)]
 mod tests {
     use super::*;

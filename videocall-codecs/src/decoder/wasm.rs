@@ -114,8 +114,9 @@ impl Decodable for WasmDecoder {
                         // Issue #1025: this `Decodable::new` path is not used for real peer
                         // rendering (peer decoders use `new_with_video_frame_callback`), so there
                         // is no proactive keyframe hook to fire here — but we still recognize the
-                        // worker's RequestKeyframeMessage so it isn't logged as "unexpected".
-                        if !handle_worker_request_keyframe(&js_val)
+                        // worker's RequestKeyframeMessage so it isn't logged as "unexpected". The
+                        // carried `head_age_ms` (#1479) is ignored on this no-render path.
+                        if handle_worker_request_keyframe(&js_val).is_none()
                             && !handle_worker_diag_message(&js_val, DECODABLE_DEFAULT_MEDIA_TYPE)
                         {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
@@ -151,8 +152,9 @@ impl WasmDecoder {
     /// worker posts a [`RequestKeyframeMessage`] — i.e. the worker's jitter buffer just
     /// evicted a stale keyframe-less backlog and wants a fresh keyframe fetched now. The
     /// owner (e.g. `VideoPeerDecoder`) supplies a closure that issues a `KEYFRAME_REQUEST`
-    /// for this decoder's peer/stream. Pass a no-op (`Box::new(|| {})`) when no proactive
-    /// keyframe path is wired.
+    /// for this decoder's peer/stream. The closure receives the head-of-line backlog age
+    /// (`head_age_ms`, issue #1479) that tripped the freshness deadline. Pass a no-op
+    /// (`Box::new(|_| {})`) when no proactive keyframe path is wired.
     ///
     /// `media_type` (issue #1641) is the owner's stream kind — `"VIDEO"` for a camera decoder
     /// or `"SCREEN"` for a screen-share decoder (the `MEDIA_TYPE_CAMERA`/`MEDIA_TYPE_SCREEN`
@@ -165,7 +167,7 @@ impl WasmDecoder {
     pub fn new_with_video_frame_callback(
         _codec: crate::decoder::VideoCodec,
         on_video_frame: Box<dyn Fn(VideoFrame)>,
-        on_request_keyframe: Box<dyn Fn()>,
+        on_request_keyframe: Box<dyn Fn(f64)>,
         media_type: &'static str,
     ) -> Self {
         log::info!("Creating WASM decoder with VideoFrame callback");
@@ -214,9 +216,11 @@ impl WasmDecoder {
                         // Worker->main serde messages: try the proactive keyframe-request signal
                         // (#1025) first, then the diagnostics stats message. Order is irrelevant
                         // (each gates on its own `kind`), but checking the keyframe request first
-                        // keeps the recovery path off the (more frequent) stats path.
-                        if handle_worker_request_keyframe(&js_val) {
-                            request_keyframe();
+                        // keeps the recovery path off the (more frequent) stats path. The carried
+                        // `head_age_ms` (#1479) is forwarded to the route so the main thread's PLI
+                        // budget can prioritize the stalest stream.
+                        if let Some(head_age_ms) = handle_worker_request_keyframe(&js_val) {
+                            request_keyframe(head_age_ms);
                         } else if !handle_worker_diag_message(&js_val, media_type) {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
@@ -370,25 +374,32 @@ fn post_paint_progress(
     }
 }
 
-/// Recognize the worker's proactive keyframe-request signal (issue #1025). Returns `true` if
-/// the posted value is a [`RequestKeyframeMessage`] (so the caller should fire its keyframe
-/// callback), `false` otherwise (the caller falls through to the diagnostics parse).
+/// Recognize the worker's proactive keyframe-request signal (issue #1025). Returns
+/// `Some(head_age_ms)` if the posted value is a [`RequestKeyframeMessage`] (so the caller should
+/// fire its keyframe callback, passing the carried head-of-line backlog age), `None` otherwise
+/// (the caller falls through to the diagnostics parse).
+///
+/// The `head_age_ms` (issue #1479) is the backlog age that tripped the freshness deadline,
+/// forwarded so the main thread's per-receiver cross-sender PLI budget can prioritize the stalest
+/// stream when its global cap is reached. Old payloads that omit the field decode it as `0.0`
+/// (`#[serde(default)]`), which the budget treats as the freshest possible request.
 ///
 /// Both this and [`handle_worker_diag_message`] deserialize the same JS object shape via serde
 /// and disambiguate on the `kind` field, mirroring the existing stats dispatch. We check the
 /// discriminant explicitly so a `VideoStatsMessage` (whose extra fields are all `Option` and
 /// would deserialize fine into this struct's subset) is NOT mistaken for a keyframe request.
-fn handle_worker_request_keyframe(js_val: &JsValue) -> bool {
+fn handle_worker_request_keyframe(js_val: &JsValue) -> Option<f64> {
     match serde_wasm_bindgen::from_value::<RequestKeyframeMessage>(js_val.clone()) {
         Ok(msg) if msg.kind == REQUEST_KEYFRAME_KIND => {
             log::debug!(
-                "Proactive keyframe request from worker (#1025): from_peer={:?} to_peer={:?}",
+                "Proactive keyframe request from worker (#1025): from_peer={:?} to_peer={:?} head_age_ms={:.0}",
                 msg.from_peer,
-                msg.to_peer
+                msg.to_peer,
+                msg.head_age_ms
             );
-            true
+            Some(msg.head_age_ms)
         }
-        _ => false,
+        _ => None,
     }
 }
 

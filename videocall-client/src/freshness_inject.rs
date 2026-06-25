@@ -295,7 +295,7 @@ fn ensure_test_decoder() {
         let decoder = WasmDecoder::new_with_video_frame_callback(
             VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(|_frame| {}),
-            Box::new(|| {}),
+            Box::new(|_head_age_ms| {}),
             // Issue #1641: this #1022/#1045 inject harness exercises the camera freshness path,
             // so tag it as camera ("VIDEO" / MEDIA_TYPE_CAMERA) — the value health_reporter
             // treats as non-screen.
