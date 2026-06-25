@@ -1364,15 +1364,16 @@ impl CameraEncoder {
                     // When dual-streaming, the combined uplink burst density is higher
                     // and the same writer.ready() stall catches more concurrent frames
                     // (K-amplification). Raise the threshold to 8× the screen share's
-                    // frame interval (the longest IFI among active streams) so bursty-
-                    // but-healthy links do not false-positive. Reset to floor when the
-                    // screen share stops. The screen share top tier is 10fps (100ms
-                    // IFI); 8 × 100 = 800ms. WS users never reach this code path in a
-                    // meaningful way because the WT stall counter is held flat at 0
-                    // for WS (see block below at line ~1500).
+                    // TOP-TIER (best-case) frame interval so bursty-but-healthy links
+                    // do not false-positive. Reset to floor when the screen share stops.
+                    // The screen share top tier is 10fps (100ms IFI); 8 × 100 = 800ms.
+                    // This is a FIXED bound, not recomputed as the screen degrades (the
+                    // screen can degrade to 5fps/200ms under congestion). WS publishers
+                    // execute this write but never read the value (the WT stall counter
+                    // is held flat at 0 for WS — see block below at line ~1500).
                     if screen_active {
-                        // Use the screen share top-tier fps (10) as worst-case IFI.
-                        // SCREEN_QUALITY_TIERS[0].target_fps = 10, IFI = 100ms.
+                        // Use the screen share top-tier fps (10) as the fixed bound.
+                        // SCREEN_QUALITY_TIERS[0] is "high" (top tier, 10fps, 100ms IFI).
                         let screen_ifi_ms = 1000.0
                             / f64::from(
                                 crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS[0]

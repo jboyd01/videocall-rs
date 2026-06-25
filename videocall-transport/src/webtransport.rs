@@ -171,19 +171,20 @@ const READY_STALL_THRESHOLD_MS_FLOOR: f64 = 250.0;
 /// combined uplink burst density is higher: the SAME `writer.ready()` stall
 /// catches more concurrent frames (higher K-factor), making the count-gate
 /// easier to trip. To compensate, the client raises this threshold to
-/// `max(FLOOR, 8 × longest_active_frame_interval_ms)` — e.g. with a 10 fps
-/// screen share active, 8 × 100 ms = 800 ms. When the screen share stops, the
-/// client resets it back to the floor.
+/// `max(FLOOR, 8 × screen_top_tier_frame_interval_ms)` — a fixed 800 ms bound
+/// (10 fps top tier × 8), NOT recomputed as either stream degrades. When the
+/// screen share stops, the client resets it back to the floor.
 ///
 /// Stored as `f64::to_bits()` because `AtomicF64` does not exist in std.
 /// [`effective_stall_threshold_ms`] reads it; [`set_ready_stall_threshold_ms`]
 /// writes it. The floor guarantee is enforced at write time.
 ///
 /// Initial value: bit pattern of 250.0_f64 (IEEE 754). Pinned by unit test
-/// `ready_stall_boundary_is_pinned_to_250ms_absolute` and by the floor-reset
-/// tests which verify `effective_stall_threshold_ms() == 250.0` after reset.
-/// Using a literal because `f64::to_bits()` is not const-stable at MSRV 1.70.
-static READY_STALL_THRESHOLD_MS: AtomicU64 = AtomicU64::new(4_643_000_109_586_448_384);
+/// `threshold_static_initializer_matches_floor` to the floor constant. Using a
+/// literal because `f64::to_bits()` is not const-stable at MSRV 1.70.
+const READY_STALL_THRESHOLD_MS_INIT_BITS: u64 = 4_643_000_109_586_448_384;
+
+static READY_STALL_THRESHOLD_MS: AtomicU64 = AtomicU64::new(READY_STALL_THRESHOLD_MS_INIT_BITS);
 
 /// Read the current effective stall threshold (ms). This is the runtime value
 /// used by [`is_ready_stall`], which may be higher than the floor when
@@ -1735,19 +1736,17 @@ mod framing_tests {
 
     #[test]
     fn threshold_static_initializer_matches_floor() {
-        // Pin the bit-pattern literal in `READY_STALL_THRESHOLD_MS` to the
-        // floor constant. If someone changes the literal without updating the
-        // floor (or vice versa), this fails immediately.
-        let _guard = THRESHOLD_GUARD.lock().unwrap();
-        reset_threshold_to_floor();
+        // Pin the bit-pattern literal (READY_STALL_THRESHOLD_MS_INIT_BITS) to
+        // the floor constant. If someone changes the literal without updating
+        // the floor (or vice versa), this fails immediately. Does NOT call
+        // reset_threshold_to_floor() — reads the actual static initializer.
         assert_eq!(
-            effective_stall_threshold_ms(),
+            f64::from_bits(READY_STALL_THRESHOLD_MS_INIT_BITS),
             READY_STALL_THRESHOLD_MS_FLOOR,
             "static initializer bit pattern must decode to the floor (250.0)",
         );
         assert_eq!(
-            effective_stall_threshold_ms(),
-            250.0,
+            READY_STALL_THRESHOLD_MS_FLOOR, 250.0,
             "floor must be exactly 250.0 ms",
         );
     }
