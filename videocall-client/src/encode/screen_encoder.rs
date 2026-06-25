@@ -629,6 +629,18 @@ pub struct ScreenEncoder {
     control_loop_liveness: Rc<()>,
 }
 
+/// Clear both screen-sharing flags (Rc + Arc mirror) atomically (issue #1611).
+///
+/// Called from all teardown paths: `stop()`, `cleanup_on_error` closure, and
+/// final `run_screen_encoding` cleanup. Exists as a module-scope helper so the
+/// regression test can invoke the SAME dual-store the production code uses —
+/// test-only hand-written stores would be tautological (the anti-pattern named
+/// in CLAUDE.md adversarial check 2).
+fn clear_screen_sharing_flags(rc: &Rc<AtomicBool>, arc: &Arc<AtomicBool>) {
+    rc.store(false, Ordering::Release);
+    arc.store(false, Ordering::Release);
+}
+
 impl ScreenEncoder {
     /// Construct a screen encoder:
     ///
@@ -1661,11 +1673,8 @@ impl ScreenEncoder {
     /// It sets the encoder flags, notifies the client at the protocol level,
     /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
-        // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
-        self.screen_sharing_active.store(false, Ordering::Release);
-        // Issue #1611: mirror to the Arc copy the mic encoder reads.
-        self.screen_sharing_active_arc
-            .store(false, Ordering::Release);
+        // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+        clear_screen_sharing_flags(&self.screen_sharing_active, &self.screen_sharing_active_arc);
 
         // Signal the encoding loop to exit
         self.state.stop();
@@ -2165,10 +2174,8 @@ impl ScreenEncoder {
             }
             // Reset enabled flag
             enabled.store(false, Ordering::Release);
-            // Clear screen-sharing flag so camera drops its ceiling
-            screen_sharing_active.store(false, Ordering::Release);
-            // Mirror the Arc for the mic's audio-after-video detector (issue #1611)
-            screen_sharing_active_arc.store(false, Ordering::Release);
+            // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+            clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
             // Emit Failed event
             if let Some(ref callback) = on_state_change {
                 callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -3616,10 +3623,8 @@ impl ScreenEncoder {
             }
         }
 
-        // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
-        screen_sharing_active.store(false, Ordering::Release);
-        // Mirror the Arc for the mic's audio-after-video detector (issue #1611)
-        screen_sharing_active_arc.store(false, Ordering::Release);
+        // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+        clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
 
         // Emit Stopped event if we haven't already (onended handler might have already fired)
         // Check enabled flag - if it's still true, onended hasn't fired yet
@@ -3639,6 +3644,7 @@ mod tests {
 
     use super::cause_hint_from_trigger;
     use super::clamp_screen_layer_count;
+    use super::clear_screen_sharing_flags;
     use super::is_fatal_encoder_error_message;
     use super::keyframe_tick_decision;
     use super::record_screen_restart;
@@ -4392,75 +4398,42 @@ mod tests {
         );
     }
 
-    /// Issue #1611 regression test — the Arc mirror `screen_sharing_active_arc`
-    /// must track the primary Rc flag `screen_sharing_active` on ALL paths:
-    /// normal stop, failure teardown (`cleanup_on_error`), and final cleanup.
-    /// Without mirroring the failure paths, the Arc stays stale-`true` and the
-    /// mic's audio-after-video detector sees a phantom screen-active signal.
-    /// This test simulates the failure-teardown path by directly exercising the
-    /// Arc-mirror store that MUST be present alongside the Rc store in the
-    /// `cleanup_on_error` closure and final cleanup block.
+    /// Issue #1611 regression test — `clear_screen_sharing_flags` must store
+    /// BOTH flags (Rc + Arc). Without the Arc store, the mic's audio-after-video
+    /// detector sees a stale-true screen-active signal on failure teardown.
+    ///
+    /// This test invokes the PRODUCTION helper (`clear_screen_sharing_flags`)
+    /// used by `stop()`, `cleanup_on_error`, and final cleanup — NOT hand-written
+    /// stores (which would be tautological per CLAUDE.md adversarial check 2).
+    /// Removing the `arc.store` line from the helper **provably breaks this test**.
     #[test]
     fn screen_sharing_active_arc_mirrors_rc_on_all_paths() {
         use std::sync::Arc;
 
-        // Simulate screen-share start: both flags set true.
         let rc_flag = Rc::new(AtomicBool::new(false));
         let arc_flag = Arc::new(AtomicBool::new(false));
 
-        // Start path
+        // Simulate teardown paths (stop / cleanup_on_error / final cleanup):
+        // set both flags true (share was active), then invoke the production
+        // helper that MUST clear both atomically.
         rc_flag.store(true, Ordering::Release);
         arc_flag.store(true, Ordering::Release);
-        assert!(
-            rc_flag.load(Ordering::Acquire),
-            "Rc must be true after start"
-        );
-        assert!(arc_flag.load(Ordering::Acquire), "Arc must mirror Rc=true");
 
-        // Normal stop path (already tested by existing stop() calls, but verify)
-        rc_flag.store(false, Ordering::Release);
-        arc_flag.store(false, Ordering::Release);
+        // Invoke the PRODUCTION helper (same one stop/cleanup_on_error/final use)
+        clear_screen_sharing_flags(&rc_flag, &arc_flag);
+
+        // Both flags MUST now be false. If the helper's `arc.store(false)` is
+        // removed (or never added), this assertion FAILS — proving the test guards
+        // the production code, not its own inline copy.
         assert!(
             !rc_flag.load(Ordering::Acquire),
-            "Rc must be false after stop"
+            "Rc must be false after clear_screen_sharing_flags"
         );
         assert!(
             !arc_flag.load(Ordering::Acquire),
-            "Arc must mirror Rc=false"
-        );
-
-        // Failure teardown path (the regression case — screen_encoder.rs:2169)
-        // Reset to active state
-        rc_flag.store(true, Ordering::Release);
-        arc_flag.store(true, Ordering::Release);
-        // Simulate cleanup_on_error: BOTH must be cleared
-        rc_flag.store(false, Ordering::Release);
-        arc_flag.store(false, Ordering::Release); // ← THIS STORE is the fix
-        assert!(
-            !rc_flag.load(Ordering::Acquire),
-            "Rc must be false after failure teardown"
-        );
-        assert!(
-            !arc_flag.load(Ordering::Acquire),
-            "Arc MUST mirror Rc=false on failure teardown (cleanup_on_error path) — \
-             stale-true would wedge the audio-after-video detector"
-        );
-
-        // Final cleanup path (screen_encoder.rs:3620)
-        // Reset to active state
-        rc_flag.store(true, Ordering::Release);
-        arc_flag.store(true, Ordering::Release);
-        // Simulate final cleanup: BOTH must be cleared
-        rc_flag.store(false, Ordering::Release);
-        arc_flag.store(false, Ordering::Release); // ← THIS STORE is the fix
-        assert!(
-            !rc_flag.load(Ordering::Acquire),
-            "Rc must be false after final cleanup"
-        );
-        assert!(
-            !arc_flag.load(Ordering::Acquire),
-            "Arc MUST mirror Rc=false on final cleanup — stale-true would wedge \
-             the audio-after-video detector"
+            "Arc MUST be false after clear_screen_sharing_flags — stale-true would \
+             wedge the audio-after-video detector. REGRESSION: if this fails, the \
+             helper is missing the arc.store(false) line at screen_encoder.rs:~643"
         );
     }
 }
