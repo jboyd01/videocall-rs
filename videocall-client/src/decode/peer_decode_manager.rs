@@ -2584,6 +2584,15 @@ impl PeerDecodeManager {
         }
     }
 
+    /// Expose `local_session_id` for regression tests (issue #1640).
+    ///
+    /// Returns the stored string slice when `SESSION_ASSIGNED` has been processed
+    /// (i.e. after `set_local_session_id` has been called), or `None` before that.
+    #[cfg(test)]
+    pub fn local_session_id_str(&self) -> Option<&str> {
+        self.local_session_id.as_deref()
+    }
+
     /// Clear the send-packet callback. Called from
     /// [`VideoCallClient::disconnect()`](crate::VideoCallClient::disconnect)
     /// to break the `client -> peer_decode_manager.send_packet -> client`
@@ -9534,5 +9543,71 @@ mod tests {
         assert_eq!(age_ms_since(5000, 1000), 4000, "age is now - last");
         // Clock skew (now < last) saturates to 0 rather than wrapping.
         assert_eq!(age_ms_since(900, 1000), 0, "now < last must saturate to 0");
+    }
+
+    // -- Issue #1640: set_local_session_id regression (from_peer ID type) ----
+
+    /// Plain `#[test]` (NOT `#[wasm_bindgen_test]`): `set_local_session_id`
+    /// must store the numeric session_id as a decimal string. Reverting the
+    /// setter or removing the `local_session_id` field makes this fail to
+    /// compile or fail at the assertion.
+    #[test]
+    fn set_local_session_id_stores_decimal_string() {
+        let mut mgr = PeerDecodeManager::new();
+        // Before SESSION_ASSIGNED: field must be absent.
+        assert_eq!(
+            mgr.local_session_id_str(),
+            None,
+            "local_session_id must be None before set_local_session_id is called"
+        );
+        // After SESSION_ASSIGNED: field must hold the numeric string.
+        mgr.set_local_session_id(9_876_543_210_u64);
+        assert_eq!(
+            mgr.local_session_id_str(),
+            Some("9876543210"),
+            "set_local_session_id must store the session_id as a decimal string"
+        );
+        // A second call overwrites the previous value (reconnect / re-election).
+        mgr.set_local_session_id(1_u64);
+        assert_eq!(
+            mgr.local_session_id_str(),
+            Some("1"),
+            "set_local_session_id must overwrite the previous value on second call"
+        );
+    }
+
+    /// Plain `#[test]`: backfill path — peers added BEFORE `SESSION_ASSIGNED`
+    /// must not be corrupted or dropped when `set_local_session_id` iterates
+    /// them. The field must be set and all pre-existing peers must remain in
+    /// `connected_peers`.
+    #[test]
+    fn set_local_session_id_backfill_preserves_existing_peers() {
+        let mut mgr = PeerDecodeManager::new();
+        // Insert two peers directly (like other host tests) — `add_peer` calls
+        // JS canvas APIs that are unavailable outside wasm.
+        let (peer101, _) = make_test_peer(101);
+        let (peer202, _) = make_test_peer(202);
+        mgr.connected_peers.insert(101, peer101);
+        mgr.connected_peers.insert(202, peer202);
+        assert_eq!(
+            mgr.local_session_id_str(),
+            None,
+            "local_session_id must still be None before set_local_session_id"
+        );
+        // SESSION_ASSIGNED arrives: backfill must not panic or drop peers.
+        mgr.set_local_session_id(42_u64);
+        assert_eq!(
+            mgr.local_session_id_str(),
+            Some("42"),
+            "local_session_id must be set after set_local_session_id"
+        );
+        assert!(
+            mgr.connected_peers.get(&101).is_some(),
+            "peer 101 must still exist after backfill"
+        );
+        assert!(
+            mgr.connected_peers.get(&202).is_some(),
+            "peer 202 must still exist after backfill"
+        );
     }
 }
