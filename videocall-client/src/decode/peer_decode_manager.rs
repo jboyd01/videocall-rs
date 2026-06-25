@@ -1065,7 +1065,7 @@ impl Peer {
         ))
     }
 
-    fn reset(&mut self) -> Result<(), JsValue> {
+    fn reset(&mut self, from_peer: &str) -> Result<(), JsValue> {
         let sid_str = self.session_id.to_string();
         let (mut audio, video, screen) = Self::new_decoders(
             &self.video_canvas_id,
@@ -1084,6 +1084,13 @@ impl Peer {
         self.audio = audio;
         self.video = video;
         self.screen = screen;
+        // Issue #1640: immediately send SetContext to the new workers so they
+        // have attribution from their first frame (fixes post-reset race where
+        // `context_initialized` stays true but new workers have empty context).
+        self.video
+            .set_stream_context(from_peer.to_owned(), sid_str.clone());
+        self.screen
+            .set_stream_context(from_peer.to_owned(), sid_str);
         // Intentionally keep `has_received_heartbeat` and `*_enabled` flags:
         // the peer's last-known media state is still the best information we
         // have.  Resetting the flag would let straggler frames through until
@@ -2432,6 +2439,11 @@ pub struct PeerDecodeManager {
     send_packet: Option<Callback<PacketWrapper>>,
     /// The local user_id, needed to construct outgoing KEYFRAME_REQUEST packets.
     local_user_id: String,
+    /// The local session_id as a string, used as `from_peer` in worker diagnostics
+    /// context (issue #1640). Set when SESSION_ASSIGNED arrives; `None` before that.
+    /// Using session_id (not user_id/email) makes both `from_peer` and `to_peer`
+    /// carry the same ID type for consistent log parsing.
+    local_session_id: Option<String>,
     /// Cached snapshot of `connected_peers.ordered_keys()` rendered as
     /// `Vec<String>`. Phase 6 fix: avoids walking the ordered key list and
     /// allocating a fresh `Vec<String>` on every `sorted_peer_keys()` call
@@ -2491,6 +2503,7 @@ impl PeerDecodeManager {
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            local_session_id: None,
             cached_sorted_string_keys: RefCell::new(None),
             screen_decode_retry_tokens: HashMap::new(),
             last_delete_peer_snapshot_ms: 0,
@@ -2515,6 +2528,7 @@ impl PeerDecodeManager {
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            local_session_id: None,
             cached_sorted_string_keys: RefCell::new(None),
             screen_decode_retry_tokens: HashMap::new(),
             last_delete_peer_snapshot_ms: 0,
@@ -2545,6 +2559,29 @@ impl PeerDecodeManager {
     pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>, user_id: String) {
         self.send_packet = Some(callback);
         self.local_user_id = user_id;
+    }
+
+    /// Store the local session_id once SERVER assigns it (issue #1640).
+    ///
+    /// Used as `from_peer` in worker diagnostics context so both `from_peer` and
+    /// `to_peer` carry session_id strings (consistent ID type for log parsing).
+    /// Also backfills any peer workers that were created before SESSION_ASSIGNED
+    /// arrived — fixing the SetContext race where workers had empty `from_peer`.
+    pub fn set_local_session_id(&mut self, session_id: u64) {
+        let sid_str = session_id.to_string();
+        self.local_session_id = Some(sid_str.clone());
+
+        // Backfill: re-send SetContext to every existing peer worker so their
+        // CONTEXT_FROM is populated with the now-known local session_id. Workers
+        // that already received a SetContext simply overwrite their thread-local.
+        for peer_session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get(&peer_session_id) {
+                peer.video
+                    .set_stream_context(sid_str.clone(), peer.sid_str.clone());
+                peer.screen
+                    .set_stream_context(sid_str.clone(), peer.sid_str.clone());
+            }
+        }
     }
 
     /// Clear the send-packet callback. Called from
@@ -3191,13 +3228,20 @@ impl PeerDecodeManager {
         // of `connected_peers`, so the route closures installed below can capture it without
         // double-borrowing `self`. `Rc::clone` is cheap; all routes share one budget.
         let pli_budget_for_route = self.pli_budget.clone();
+        // Issue #1640: capture local session_id before the mutable borrow for
+        // use in set_stream_context and peer.reset().
+        let local_sid_for_context = self.local_session_id.clone().unwrap_or_default();
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             let was_screen_enabled = peer.screen_enabled;
             if !peer.context_initialized {
+                // Issue #1640: use local session_id (not user_id/email) as `from_peer`
+                // so both fields carry the same ID type for consistent log parsing.
+                // Falls back to empty string if SESSION_ASSIGNED hasn't arrived yet;
+                // `set_local_session_id` backfills all workers when it does.
                 peer.video
-                    .set_stream_context(userid.to_string(), peer.sid_str.clone());
+                    .set_stream_context(local_sid_for_context.clone(), peer.sid_str.clone());
                 peer.screen
-                    .set_stream_context(userid.to_string(), peer.sid_str.clone());
+                    .set_stream_context(local_sid_for_context.clone(), peer.sid_str.clone());
                 // Issue #1025: install the proactive keyframe-request route on each video
                 // decoder. The worker fires this (via the jitter buffer) the instant it evicts a
                 // stale keyframe-less backlog for this stream, so we request a fresh keyframe for
@@ -3285,7 +3329,7 @@ impl PeerDecodeManager {
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_decode_error(&peer.sid_str, MediaType::VIDEO);
                     }
-                    peer.reset().map_err(|_| e)
+                    peer.reset(&local_sid_for_context).map_err(|_| e)
                 }
             }
         } else {
@@ -3443,13 +3487,21 @@ impl PeerDecodeManager {
             .unwrap_or(false);
         let mut peer = Peer::new(
             self.get_video_canvas_id.emit(sid_str.clone()),
-            self.get_screen_canvas_id.emit(sid_str),
+            self.get_screen_canvas_id.emit(sid_str.clone()),
             session_id,
             user_id.to_owned(),
             aes,
             self.vad_threshold,
             cached_is_guest,
         )?;
+        // Issue #1640: send SetContext to the worker immediately at peer creation
+        // so the publisher session_id (`to_peer`) is populated from the first frame.
+        // `from_peer` = local session_id if known, else empty (backfilled when
+        // `set_local_session_id` is called on SESSION_ASSIGNED).
+        let from_peer = self.local_session_id.clone().unwrap_or_default();
+        peer.video
+            .set_stream_context(from_peer.clone(), sid_str.clone());
+        peer.screen.set_stream_context(from_peer, sid_str);
         // Apply cached display name if PARTICIPANT_JOINED arrived before
         // the first media packet created this peer entry.
         if let Some(cached_name) = self.display_name_cache.get(&session_id) {
