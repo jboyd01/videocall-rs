@@ -2678,12 +2678,10 @@ test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Recovery stability (marginal-loss): validate that on a MARGINAL impairment
-  // (enough to step down once but not enough to fully crush) the receiver's
+  // Recovery stability: validate that after downlink impairment the receiver's
   // layer does NOT oscillate (up/down flapping). This uses the WT netsim hook
-  // with a LIGHTER profile ("marginal_downlink" if available, else
-  // "crushed_downlink" with a shorter observation window — the key is that
-  // after the initial step-down the layer should SETTLE, not bounce).
+  // with `crushed_downlink` (40% loss). The key assertion is that after the
+  // initial step-down the layer should SETTLE, not bounce.
   //
   // The hysteresis in the layer chooser (consecutive-success counters or decay
   // windows for step-UP) should prevent rapid oscillation. This test polls the
