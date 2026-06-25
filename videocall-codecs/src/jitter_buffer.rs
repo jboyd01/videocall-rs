@@ -48,6 +48,7 @@ const MAX_PLAYOUT_DELAY_MS: f64 = 500.0;
 /// - This is a live videoconference: liveness beats completeness. ~1.8s is the boundary past which
 ///   continuing to drain buffered video does more harm (A/V desync, growing lag) than dropping it.
 const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
+
 /// *Base* (first-strike) interval between proactive keyframe requests fired by the
 /// keyframe-less eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST
 /// window (`KEYFRAME_REQUEST_WINDOW_MS`, ~1s) so the FIRST request of a stall emits at
@@ -1109,13 +1110,15 @@ impl<T> JitterBuffer<T> {
             return false; // Empty buffer — nothing can be stale.
         };
 
-        let head_age_ms = {
-            let frame = match self.buffered_frames.get(&head_key) {
-                Some(f) => f,
-                None => return false,
-            };
-            current_time_ms.saturating_sub(frame.arrival_time_ms) as f64
+        // Arrival-based age (issue #1020): how long the head sat in THIS buffer. This is the SOLE
+        // freshness-deadline trip — the deadline is arrival-only. Read only the head's arrival time
+        // (a scalar copy) inside the borrow, then drop it so the later `&mut self` skip/evict paths
+        // are unobstructed.
+        let head_arrival_ms = match self.buffered_frames.get(&head_key) {
+            Some(f) => f.arrival_time_ms,
+            None => return false,
         };
+        let head_age_ms = current_time_ms.saturating_sub(head_arrival_ms) as f64;
 
         if head_age_ms < MAX_PLAYOUT_AGE_MS {
             // Within freshness bounds — normal jitter handling is byte-for-byte unaffected.
