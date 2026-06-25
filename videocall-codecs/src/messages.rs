@@ -181,6 +181,13 @@ pub struct FreshnessSkipMessage {
     pub keyframe_seq: Option<u64>,
     /// Stale frames evicted in this skip.
     pub dropped: u64,
+    /// `true` when this event is the keyframe-less hold-ceiling escalation (issue #1662): the
+    /// held-last-good freeze exceeded `MAX_KEYFRAME_LESS_HOLD_MS` and the receiver forced a
+    /// decoder-pipeline reset rather than continue holding indefinitely. `false` for a routine
+    /// skip-to-live or a below-ceiling keyframe-less hold. Surfaced so the field log can
+    /// distinguish a bounded-freeze escalation (the #1662 fix firing) from a routine freshness skip.
+    #[serde(default)]
+    pub escalated: bool,
 }
 
 impl FreshnessSkipMessage {
@@ -190,6 +197,7 @@ impl FreshnessSkipMessage {
         head_age_ms: f64,
         keyframe_seq: Option<u64>,
         dropped: u64,
+        escalated: bool,
     ) -> Self {
         Self {
             kind: FRESHNESS_SKIP_KIND.to_string(),
@@ -198,6 +206,7 @@ impl FreshnessSkipMessage {
             head_age_ms,
             keyframe_seq,
             dropped,
+            escalated,
         }
     }
 
@@ -212,7 +221,10 @@ impl FreshnessSkipMessage {
     /// formatting is pinned by host tests below rather than living only in the
     /// wasm-gated emit arm (which no host test can exercise). `head_age` rounds to
     /// whole milliseconds (`{:.0}`); a `keyframe_seq` of `None` is the keyframe-less
-    /// held-last-good case and renders as `none (held last-good)`.
+    /// held-last-good case and renders as `none (held last-good)`. The `escalated=`
+    /// token (issue #1662) is `true` only for the keyframe-less hold-ceiling escalation
+    /// (decoder-pipeline reset) and `false` for routine skips, so the field investigation
+    /// can grep the bounded-freeze escalations apart from ordinary freshness skips.
     pub fn console_line(&self) -> String {
         let from = self.from_peer.as_deref().unwrap_or_default();
         let to = self.to_peer.as_deref().unwrap_or_default();
@@ -221,8 +233,8 @@ impl FreshnessSkipMessage {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "none (held last-good)".to_string());
         format!(
-            "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe}",
-            self.head_age_ms, self.dropped
+            "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe} escalated={}",
+            self.head_age_ms, self.dropped, self.escalated
         )
     }
 }
@@ -352,7 +364,7 @@ mod worker_log_disambiguation_tests {
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );
 
-        let fs = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7);
+        let fs = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&fs).unwrap()).is_err()
         );
@@ -385,6 +397,7 @@ mod freshness_skip_console_line_tests {
             1234.0,
             Some(42),
             7,
+            false,
         )
         .console_line();
         // The load-bearing grep prefix.
@@ -402,6 +415,12 @@ mod freshness_skip_console_line_tests {
             line.contains("keyframe_seq="),
             "missing keyframe_seq= token: {line}"
         );
+        // Escalation token (issue #1662): the field investigation greps it to separate
+        // bounded-freeze escalations from routine freshness skips.
+        assert!(
+            line.contains("escalated="),
+            "missing escalated= token: {line}"
+        );
         // Peer attribution rendered as from->to.
         assert!(
             line.contains("alice->bob"),
@@ -410,8 +429,25 @@ mod freshness_skip_console_line_tests {
     }
 
     #[test]
+    fn renders_escalated_flag() {
+        // Issue #1662: the keyframe-less hold-ceiling escalation renders `escalated=true`; a routine
+        // skip renders `escalated=false`. Both renderings are pinned because the field investigation
+        // greps the token to count bounded-freeze escalations apart from ordinary skips.
+        let escalated = FreshnessSkipMessage::new(None, None, 6000.0, None, 0, true).console_line();
+        assert!(
+            escalated.contains("escalated=true"),
+            "escalation must render escalated=true: {escalated}"
+        );
+        let routine = FreshnessSkipMessage::new(None, None, 1800.0, None, 7, false).console_line();
+        assert!(
+            routine.contains("escalated=false"),
+            "routine skip must render escalated=false: {routine}"
+        );
+    }
+
+    #[test]
     fn renders_keyframe_some_as_bare_sequence() {
-        let line = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7).console_line();
+        let line = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false).console_line();
         assert!(
             line.contains("keyframe_seq=42"),
             "Some(42) should render as keyframe_seq=42: {line}"
@@ -426,7 +462,7 @@ mod freshness_skip_console_line_tests {
     fn renders_keyframe_none_as_held_last_good() {
         // The keyframe-less held case (#1020 evict-and-hold) is the distinct signal the
         // investigation distinguishes from a skip-to-live, so its rendering is pinned.
-        let line = FreshnessSkipMessage::new(None, None, 1800.0, None, 7).console_line();
+        let line = FreshnessSkipMessage::new(None, None, 1800.0, None, 7, false).console_line();
         assert!(
             line.contains("keyframe_seq=none (held last-good)"),
             "None should render as keyframe_seq=none (held last-good): {line}"
@@ -436,7 +472,7 @@ mod freshness_skip_console_line_tests {
     #[test]
     fn rounds_head_age_to_whole_millis() {
         // `{:.0}` rounds: 1234.6 -> 1235.
-        let line = FreshnessSkipMessage::new(None, None, 1234.6, Some(1), 0).console_line();
+        let line = FreshnessSkipMessage::new(None, None, 1234.6, Some(1), 0, false).console_line();
         assert!(
             line.contains("head_age=1235ms"),
             "head_age should round to 1235ms: {line}"
@@ -451,7 +487,7 @@ mod freshness_skip_console_line_tests {
     fn empty_peers_render_as_empty_arrow() {
         // `None` peers (a skip forwarded before SetContext) render as `->`, matching the prior
         // inline `unwrap_or_default()` behavior — keeps the line shape stable for the grep.
-        let line = FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1).console_line();
+        let line = FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1, false).console_line();
         assert!(
             line.contains("freshness_skip ->:"),
             "empty peers should render as `->`: {line}"

@@ -525,6 +525,12 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                             skip_msg.keyframe_seq.map(|s| s as i64).unwrap_or(-1)
                         ),
                         metric!("dropped", skip_msg.dropped),
+                        // Issue #1662: 1 marks the keyframe-less hold-ceiling escalation
+                        // (decoder-pipeline reset), 0 a routine skip. Encoded as i64 to match the
+                        // numeric-metric convention here (`keyframe_seq` above); lets a structured
+                        // consumer (e.g. a future "reconnecting video" UI) key off the escalation
+                        // without parsing the console line.
+                        metric!("escalated", i64::from(skip_msg.escalated)),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);
