@@ -4690,6 +4690,11 @@ pub fn AttendantsComponent(
     let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
     let previous_active_decode_set: Rc<RefCell<HashSet<u64>>> =
         use_hook(|| Rc::new(RefCell::new(HashSet::new())));
+    // #1256 Phase 1: last pushed per-peer tile-size hints, so we only call
+    // `set_peer_tile_hints` when the map actually changes (join/leave/pin/resize),
+    // not on every render. Sibling of `previous_active_decode_set`.
+    let previous_peer_tile_hints: Rc<RefCell<HashMap<u64, videocall_client::TileHint>>> =
+        use_hook(|| Rc::new(RefCell::new(HashMap::new())));
     let active_screen_sharer: Option<String> = {
         let mut stack = screen_share_stack.write();
         // Remove peers who stopped sharing or left
@@ -5268,6 +5273,79 @@ pub fn AttendantsComponent(
             );
             client.set_active_decode_set(&active_decode_set);
             *previous_active_decode_set = active_decode_set.clone();
+        }
+    }
+
+    // #1256 Phase 1: push the per-peer rendered-tile-size hints so the receiver can
+    // LID the requested simulcast layer to the size actually painted. The decode
+    // set is now fully settled (phases 1-4 above), so the hint map is keyed over the
+    // same `active_decode_set` the relay will receive layers for.
+    //
+    // Tile device-pixel height: in the grid layout every decoded tile is the same
+    // `compute_layout` cell (height = tile_w / TILE_AR), scaled by the device pixel
+    // ratio to compare against the layers' NATIVE device-pixel heights. In
+    // screen-share mode the participant panel tiles are not the same fixed grid
+    // thumbnail, so we apply NO lid (None -> Uncapped) and let the downlink chooser
+    // run unconstrained.
+    let dpr = window().device_pixel_ratio().max(1.0);
+    let tile_device_px_h: Option<u32> = if has_screen_share {
+        None
+    } else if tile_count == 1 {
+        // tile_count == 1 renders FULL-BLEED (.participants-1 .grid-item.full-bleed
+        // in style.css drops the 3:2 cap; the lone tile paints at the full cell
+        // height = avail_h). Use avail_h so the hint matches the PAINTED height — the
+        // 3:2-capped tw/TILE_AR under-estimates in portrait and would over-cap the
+        // full-screen 1-on-1 to a blurry low layer (#1256 P3).
+        Some((avail_h * dpr).round() as u32)
+    } else {
+        let (_c, _r, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
+        let th = tw / TILE_AR;
+        Some((th * dpr).round() as u32)
+    };
+
+    let peer_tile_hints: HashMap<u64, videocall_client::TileHint> = {
+        use videocall_client::TileHint;
+        // The pinned peer is held by USER_ID; resolve it to the session_id present
+        // in `active_decode_set` so the (Uncapped) pin exemption matches a real peer.
+        let pinned_session: Option<u64> = pinned_peer_id.peek().as_deref().and_then(|pu| {
+            active_decode_set
+                .iter()
+                .copied()
+                .find(|sid| client.get_peer_user_id(&sid.to_string()).as_deref() == Some(pu))
+        });
+        // `active_screen_sharer` is a SESSION_ID string (it comes from the
+        // session-id-keyed `screen_share_stack`).
+        let screen_session: Option<u64> = active_screen_sharer
+            .as_ref()
+            .and_then(|s| s.parse::<u64>().ok());
+        active_decode_set
+            .iter()
+            .map(|&sid| {
+                // Pinned and screen-share peers are NEVER size-capped — they render
+                // large, so the receiver should pull the full downlink-sustainable
+                // layer for them.
+                let uncapped = Some(sid) == pinned_session || Some(sid) == screen_session;
+                let hint = match (uncapped, tile_device_px_h) {
+                    (true, _) => TileHint::Uncapped,
+                    (false, Some(h)) => TileHint::Capped { device_px_h: h },
+                    (false, None) => TileHint::Uncapped,
+                };
+                (sid, hint)
+            })
+            .collect()
+    };
+    {
+        // Dedup: only push when the hint map actually changed (join/leave/pin/resize).
+        // Only record the map as delivered when the push was actually APPLIED — if
+        // set_peer_tile_hints dropped it on a transient `inner` borrow conflict (returns
+        // false), leave `previous_peer_tile_hints` UNCHANGED so the next render re-attempts
+        // the push (the map still differs from prev). Otherwise a dropped resize-to-small
+        // push would strand a stale cap and the small tile would keep pulling the high
+        // layer until the next layout change (#1256). `&&` short-circuits left-to-right, so
+        // set_peer_tile_hints is only called when the map actually changed.
+        let mut prev = previous_peer_tile_hints.borrow_mut();
+        if *prev != peer_tile_hints && client.set_peer_tile_hints(peer_tile_hints.clone()) {
+            *prev = peer_tile_hints.clone();
         }
     }
 

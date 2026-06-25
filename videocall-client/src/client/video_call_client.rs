@@ -25,7 +25,9 @@ use super::layer_preference_sender::LayerPreferenceSender;
 use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
-use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
+use crate::decode::layer_chooser::{
+    PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint,
+};
 use crate::decode::peer_decode_manager::{PeerDecodeError, PeerDeviceInfo, PeerReceiveDiag};
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
@@ -2219,6 +2221,46 @@ impl VideoCallClient {
             }
         } else {
             warn!("set_receive_layer_bounds: inner busy, bounds not applied this call");
+        }
+    }
+
+    /// Push the per-peer rendered-tile-size hints (issue #1256 Phase 1). Keyed by
+    /// session_id; `TileHint::Capped { device_px_h }` lets the receiver LID the
+    /// requested simulcast layer to the smallest layer covering the tile,
+    /// `TileHint::Uncapped` (or an absent peer) applies no lid. Applies IMMEDIATELY:
+    /// re-ticks the choosers (re-clamps + updates decode guards + requests a keyframe
+    /// on any up-switch) and re-sends the (now-lidded) LAYER_PREFERENCE, so a
+    /// tile-size change takes effect without waiting for the next monitor tick.
+    /// AUDIO is never size-capped. No wire/protobuf/relay change — the lid rides the
+    /// existing per-receiver LAYER_PREFERENCE clamp seam.
+    ///
+    /// Returns `true` when the push was APPLIED and published this call, and `false`
+    /// when it was DROPPED because `inner` was transiently borrowed elsewhere (a
+    /// `try_borrow_mut` conflict). The UI dedup MUST only record the hint map as
+    /// delivered when this returns `true`, so a dropped push is retried on the next
+    /// render instead of stranding a stale size cap (issue #1256 — a resize-to-small
+    /// that loses the borrow race would otherwise keep pulling the high layer
+    /// indefinitely).
+    pub fn set_peer_tile_hints(&self, hints: std::collections::HashMap<u64, TileHint>) -> bool {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.peer_decode_manager.set_peer_tile_hints(hints);
+            let now_ms = js_sys::Date::now() as u64;
+            let bounds = inner.receive_layer_bounds;
+            let desired = inner
+                .peer_decode_manager
+                .tick_layer_choosers(now_ms, &bounds);
+            if let Some(entries) = inner
+                .layer_preference_sender
+                .take_if_changed(&desired, now_ms)
+            {
+                let user_id = inner.options.user_id.clone();
+                let cc = inner.connection_controller.clone();
+                send_layer_preference_via(&cc, &user_id, entries);
+            }
+            true
+        } else {
+            warn!("set_peer_tile_hints: inner busy, hints not applied this call");
+            false
         }
     }
 
@@ -4517,6 +4559,41 @@ mod disconnect_tests {
         assert!(
             !inner.peer_decode_manager.has_send_packet_callback(),
             "send_packet must be cleared after disconnect()"
+        );
+    }
+
+    /// #1256: set_peer_tile_hints must return `false` when `inner` is already borrowed
+    /// (the push is dropped on contention) and `true` on a clean apply. The UI dedup
+    /// keys off this to retry a dropped push instead of stranding a stale size cap.
+    ///
+    /// MUTATION: making the method always return `true` (or dropping the `else { false }`)
+    /// breaks the contended-false assertion; making it always return `false` breaks the
+    /// clean-true assertion.
+    #[wasm_bindgen_test]
+    fn set_peer_tile_hints_returns_false_when_inner_borrowed() {
+        use crate::decode::layer_chooser::TileHint;
+        use std::collections::HashMap;
+        let client = VideoCallClient::new(build_test_options());
+        let hints: HashMap<u64, TileHint> =
+            HashMap::from([(1u64, TileHint::Capped { device_px_h: 360 })]);
+        // Clean apply: no outstanding borrow -> true.
+        assert!(
+            client.set_peer_tile_hints(hints.clone()),
+            "set_peer_tile_hints must return true when it applies the push"
+        );
+        // Contended: hold a live mutable borrow on `inner` so the internal try_borrow_mut
+        // fails -> the push is dropped and the method returns false.
+        {
+            let _guard = client.inner.borrow_mut();
+            assert!(
+                !client.set_peer_tile_hints(hints.clone()),
+                "set_peer_tile_hints must return false when inner is already borrowed (push dropped)"
+            );
+        }
+        // After the guard drops, a fresh call applies again -> true (the drop was transient).
+        assert!(
+            client.set_peer_tile_hints(hints),
+            "set_peer_tile_hints must return true again once the borrow is released"
         );
     }
 }
