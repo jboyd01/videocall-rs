@@ -491,6 +491,17 @@ pub struct CameraEncoder {
     /// The encode loop `.swap(false)`-consumes this each frame; a duplicate arm is
     /// idempotent and only matters when a PLI is pending.
     keyframe_cooldown_reset: Rc<AtomicBool>,
+    /// Camera video-at-floor flag (issue #1611): `true` when the camera AQ's
+    /// video quality is fully exhausted — tier at the user-capped step-down floor
+    /// AND active simulcast layers at 1. Stored unconditionally by the camera AQ
+    /// control loop AFTER every `tick()` so it is always current, and shared into
+    /// the [`MicrophoneEncoder`] so the mic-side uplink-distress detector's
+    /// backstop gate can open even with the camera on (the "camera-on but video
+    /// can't shed further → audio may shed" path).
+    ///
+    /// `Arc` (not `Rc`) because it crosses from the camera encoder into the mic
+    /// encoder, matching the camera-enabled-flag wiring pattern.
+    video_at_floor_flag: Arc<AtomicBool>,
     /// User-configurable adaptive-quality tier bounds (issue #961). Written by
     /// the UI via [`Self::set_quality_tier_bounds`], read by the encoder control
     /// loop (which applies them live to the `EncoderBitrateController`) and on
@@ -1109,6 +1120,9 @@ impl CameraEncoder {
             // Issue #1311: no reset pending at construction; armed by a re-election
             // (quality task) or a reconnect (client `Connected` callback).
             keyframe_cooldown_reset: Rc::new(AtomicBool::new(false)),
+            // Issue #1611: camera video NOT exhausted at construction (fresh encoder
+            // starts at the default tier, which is above the floor).
+            video_at_floor_flag: Arc::new(AtomicBool::new(false)),
             quality_bounds: Rc::new(RefCell::new(SharedQualityBounds::default())),
             max_layers,
             // Simulcast ACTIVE-layer state (issue #989 / #1140 / #1141). Cold-start
@@ -1200,6 +1214,8 @@ impl CameraEncoder {
         // CONSUMES it per frame to clear `last_keyframe_emit_ms`. Both spawn_local
         // tasks share this same `CameraEncoder`-owned atom.
         let keyframe_cooldown_reset_quality = self.keyframe_cooldown_reset.clone();
+        // Issue #1611: the QUALITY task stores this each tick AFTER `tick()`.
+        let video_at_floor_flag = self.video_at_floor_flag.clone();
         // #961 (send quality bounds) + #1082 (simulcast layers) both feed the
         // encoder control loop — clone both sides' shared state.
         let quality_bounds = self.quality_bounds.clone();
@@ -1596,6 +1612,12 @@ impl CameraEncoder {
                 encoder_control.tick(now);
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
+                // Issue #1611: unconditionally store whether camera video is
+                // exhausted (tier at user-capped floor AND active layers at 1).
+                // The mic encoder's backstop gate reads this to open even with
+                // the camera on when video can't shed further.
+                video_at_floor_flag.store(encoder_control.video_at_floor(), Ordering::Release);
+
                 // Write encoder decision inputs to shared atomics for health
                 // reporting. Issue #1184: the dead receiver-FPS-derived ratios
                 // (`encoder_fps_ratio` / `encoder_bitrate_ratio`) and their
@@ -1793,6 +1815,20 @@ impl CameraEncoder {
     /// the mic encoder, matching the congestion-flag wiring.
     pub fn camera_enabled_flag(&self) -> Arc<AtomicBool> {
         self.state.enabled.clone()
+    }
+
+    /// Returns the camera video-at-floor flag (`Arc<AtomicBool>`): `true` when
+    /// the camera AQ's video quality is fully exhausted (tier at user-capped
+    /// floor AND active simulcast layers at 1) (issue #1611).
+    ///
+    /// Shared into the [`MicrophoneEncoder`] (via
+    /// [`MicrophoneEncoder::set_camera_video_exhausted_signal`]) so the mic-side
+    /// uplink-distress detector's backstop gate can open even with the camera on
+    /// when video can't shed further — the "camera-on but video exhausted →
+    /// audio may shed" path. Updated unconditionally by the camera AQ control
+    /// loop on every tick (AFTER `encoder_control.tick()`).
+    pub fn video_at_floor_flag(&self) -> Arc<AtomicBool> {
+        self.video_at_floor_flag.clone()
     }
 
     /// Returns the current video quality tier index (0 = best, 7 = minimal).
