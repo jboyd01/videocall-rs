@@ -1359,6 +1359,41 @@ impl CameraEncoder {
                 if screen_active != prev_screen_active {
                     prev_screen_active = screen_active;
                     encoder_control.notify_screen_sharing(screen_active);
+
+                    // Frame-rate-aware WT uplink-saturation threshold (issue #1618).
+                    // When dual-streaming, the combined uplink burst density is higher
+                    // and the same writer.ready() stall catches more concurrent frames
+                    // (K-amplification). Raise the threshold to 8× the screen share's
+                    // frame interval (the longest IFI among active streams) so bursty-
+                    // but-healthy links do not false-positive. Reset to floor when the
+                    // screen share stops. The screen share top tier is 10fps (100ms
+                    // IFI); 8 × 100 = 800ms. WS users never reach this code path in a
+                    // meaningful way because the WT stall counter is held flat at 0
+                    // for WS (see block below at line ~1500).
+                    if screen_active {
+                        // Use the screen share top-tier fps (10) as worst-case IFI.
+                        // SCREEN_QUALITY_TIERS[0].target_fps = 10, IFI = 100ms.
+                        let screen_ifi_ms = 1000.0
+                            / f64::from(
+                                crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS[0]
+                                    .target_fps,
+                            );
+                        let threshold = 8.0 * screen_ifi_ms;
+                        videocall_transport::webtransport::set_ready_stall_threshold_ms(threshold);
+                        log::info!(
+                            "CameraEncoder: WT stall threshold raised to {:.0}ms (dual-stream, \
+                             screen IFI={:.0}ms)",
+                            threshold,
+                            screen_ifi_ms,
+                        );
+                    } else {
+                        // Reset to floor (250ms) — single-stream camera only.
+                        videocall_transport::webtransport::set_ready_stall_threshold_ms(0.0);
+                        log::info!(
+                            "CameraEncoder: WT stall threshold reset to floor (single-stream)",
+                        );
+                    }
+
                     log::info!(
                         "CameraEncoder: screen sharing {} — camera tier coordination applied",
                         if screen_active { "ACTIVE" } else { "INACTIVE" },
