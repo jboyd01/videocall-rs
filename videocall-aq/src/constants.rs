@@ -1661,9 +1661,13 @@ const _: () = assert!(
 /// the count of 3. A bursty-but-recovering link that never parks a frame past
 /// 250ms will not shed; one that parks several frames past 250ms then recovers
 /// WILL shed one rung (arguably a correct early shed, but a real quality drop).
+/// The threshold IS now frame-rate-aware (issue #1618): when dual-streaming
+/// (camera + screen), the producer-side `READY_STALL_THRESHOLD_MS` is raised
+/// to a fixed `8 × screen_top_tier_frame_interval_ms` (800ms for 10fps top tier),
+/// preventing K-amplification false positives on healthy links. This is a FIXED
+/// bound, not recomputed as either stream degrades.
 /// VALIDATE the bursty-recovery case on the #1080 netsim before relying on this
-/// to replace the relay CONGESTION signal (#1219); the threshold may need to be
-/// frame-rate-aware.
+/// to replace the relay CONGESTION signal (#1219).
 pub const WT_SATURATION_STALL_THRESHOLD: u64 = 3;
 
 /// Tumbling window (ms) for counting client-side WT slow-`ready()` events.
