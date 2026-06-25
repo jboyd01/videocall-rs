@@ -537,7 +537,13 @@ pub struct JitterBuffer<T> {
     /// KEYFRAME_REQUEST limiter (#979/#1011) coalesces for the *publisher*, but it
     /// does not throttle *this* receiver's uplink or worker→main bus, so the fire
     /// is additionally rate-limited at the source — see `last_keyframe_request_ms`.
-    request_keyframe: Box<dyn Fn()>,
+    ///
+    /// Invoked with the head-of-line backlog age (`head_age_ms`) that tripped the
+    /// freshness deadline (issue #1479): the worker forwards it on the wire so the
+    /// main thread's per-receiver cross-sender PLI budget can prioritize the stalest
+    /// stream when its global cap is reached. This buffer does NOT itself read the
+    /// value — it is a pure detector that hands the age to the hook.
+    request_keyframe: Box<dyn Fn(f64)>,
 
     /// Wall-clock (ms) of the last proactive keyframe request fired by the
     /// keyframe-less eviction path (issue #1025). Source-side throttle: under a
@@ -650,7 +656,7 @@ impl<T> JitterBuffer<T> {
     pub fn new(decoder: Box<dyn Decodable<Frame = T>>) -> Self {
         // Default: no proactive keyframe request and never-escalate (native/mock callers). The
         // worker supplies the real hooks via `with_recovery_hooks`.
-        Self::with_recovery_hooks(decoder, Box::new(|| {}), Box::new(|_| false))
+        Self::with_recovery_hooks(decoder, Box::new(|_| {}), Box::new(|_| false))
     }
 
     /// Like [`JitterBuffer::new`] but injects the proactive keyframe-request hook
@@ -659,7 +665,7 @@ impl<T> JitterBuffer<T> {
     /// [`JitterBuffer::with_recovery_hooks`] to inject both.
     pub fn with_keyframe_request(
         decoder: Box<dyn Decodable<Frame = T>>,
-        request_keyframe: Box<dyn Fn()>,
+        request_keyframe: Box<dyn Fn(f64)>,
     ) -> Self {
         Self::with_recovery_hooks(decoder, request_keyframe, Box::new(|_| false))
     }
@@ -671,7 +677,7 @@ impl<T> JitterBuffer<T> {
     /// triggers) and the actual `reset()` + escalation diagnostic. See `request_escalation`.
     pub fn with_recovery_hooks(
         decoder: Box<dyn Decodable<Frame = T>>,
-        request_keyframe: Box<dyn Fn()>,
+        request_keyframe: Box<dyn Fn(f64)>,
         request_escalation: Box<dyn Fn(f64) -> bool>,
     ) -> Self {
         Self {
@@ -1306,7 +1312,10 @@ impl<T> JitterBuffer<T> {
                         .consecutive_proactive_keyframe_requests
                         .saturating_add(1);
                     self.awaiting_proactive_keyframe = true;
-                    (self.request_keyframe)();
+                    // Issue #1479: forward the head-of-line backlog age that tripped the deadline
+                    // so the main thread's per-receiver cross-sender PLI budget can prioritize the
+                    // stalest stream when its global cap is reached.
+                    (self.request_keyframe)(head_age_ms);
                 }
             }
             false
@@ -2448,7 +2457,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded_frames.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2481,7 +2490,7 @@ mod tests {
         let r2 = requests2.clone();
         let mut jb2 = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded2.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 r2.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2518,7 +2527,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2585,7 +2594,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2640,7 +2649,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2695,7 +2704,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2807,7 +2816,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2853,7 +2862,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -3855,7 +3864,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -4317,7 +4326,7 @@ mod tests {
             reset_count.clone(),
         ));
         let spy = EscalationSpy::new(gate_open);
-        let mut jb = JitterBuffer::with_recovery_hooks(mock, Box::new(|| {}), spy.hook());
+        let mut jb = JitterBuffer::with_recovery_hooks(mock, Box::new(|_| {}), spy.hook());
 
         // Decode a keyframe so last-good = seq 1.
         jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);

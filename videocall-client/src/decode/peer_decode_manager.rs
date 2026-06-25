@@ -19,6 +19,7 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::layer_chooser::{DownlinkSample, LayerAvailability, LayerChooser};
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder, MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
+use super::pli_budget::{PliBudget, PliBudgetDecision};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
     KEYFRAME_BACKOFF_DECAY_MS, KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
@@ -127,10 +128,20 @@ fn emit_keyframe_request(
 /// limiter key, #1124), so it can call [`emit_keyframe_request`] for the right peer + stream
 /// without holding `&PeerDecodeManager`. The worker fires the route when its jitter buffer
 /// evicts a stale keyframe-less backlog for that stream.
+///
+/// Issue #1479: each route also captures a clone of the shared per-receiver cross-sender PLI
+/// `budget` and gates the emission through it. The gate sits ABOVE the transport-agnostic
+/// `emit_keyframe_request`, so it applies identically to WebTransport and WebSocket. The budget is
+/// a benign defense-in-depth ceiling (mirrors the relay's 32/s) that only sheds genuinely-redundant
+/// same-window cross-sender 2nd+ pokes — a sender's first-in-window request (including the #1662
+/// post-reset recovery PLI) is always allowed, so this never weakens the #1494 per-sender backoff
+/// nor wedges a frozen stream. On a shed it broadcasts a `pli_budget` `DiagEvent` and a throttled
+/// `warn!` (at most once per window per sender).
 fn install_keyframe_request_routes(
     peer: &Peer,
     send_packet: &Callback<PacketWrapper>,
     local_user_id: &str,
+    budget: &Rc<RefCell<PliBudget>>,
 ) {
     for (decoder, media_type) in [
         (&peer.video, MediaType::VIDEO),
@@ -140,14 +151,56 @@ fn install_keyframe_request_routes(
         let local_user_id = local_user_id.to_owned();
         let peer_user_id = peer.user_id.clone();
         let session_id = peer.session_id;
-        decoder.set_keyframe_request_route(Box::new(move || {
-            emit_keyframe_request(
-                &send_packet,
-                &local_user_id,
-                &peer_user_id,
-                session_id,
-                media_type,
-            );
+        let budget = budget.clone();
+        let sid_str = peer.sid_str.clone();
+        decoder.set_keyframe_request_route(Box::new(move |head_age_ms: f64| {
+            // Issue #1479: gate the proactive PLI through the per-receiver cross-sender budget.
+            // `now_ms()` is read here (the side-effecting route closure), NOT inside the pure
+            // `PliBudget::allow`, so the budget stays host-testable. Keyed by `session_id`, the
+            // same key the manager's lifecycle hooks clean up.
+            let decision = budget
+                .borrow_mut()
+                .allow(session_id, head_age_ms, now_ms() as u128);
+            match decision {
+                PliBudgetDecision::Allow => {
+                    emit_keyframe_request(
+                        &send_packet,
+                        &local_user_id,
+                        &peer_user_id,
+                        session_id,
+                        media_type,
+                    );
+                }
+                PliBudgetDecision::Shed { log } => {
+                    // Both the structured DiagEvent and the human-readable warn are gated by the
+                    // same `log` throttle (at most once per window per sender, computed in the pure
+                    // budget). Under a sustained meeting-wide freeze at cap a shed can fire on every
+                    // #1494-paced poke; throttling the DiagEvent too keeps the diagnostics bus from
+                    // emitting one event per shed. The `log` flag carries the throttle decision so
+                    // the route closure stays the only side-effecting place.
+                    if log {
+                        // Structured shed counter for in-process consumers (uploaded diagnostics).
+                        let evt = DiagEvent {
+                            subsystem: "pli_budget",
+                            stream_id: Some(sid_str.clone()),
+                            ts_ms: now_ms(),
+                            metrics: vec![
+                                metric!("shed", 1u64),
+                                metric!("from_peer", local_user_id.clone()),
+                                metric!("to_peer", sid_str.clone()),
+                                metric!("head_age_ms", head_age_ms),
+                                metric!("media_type", format!("{media_type:?}")),
+                            ],
+                        };
+                        let _ = global_sender().try_broadcast(evt);
+                        log::warn!(
+                            "[PLI_BUDGET] shed proactive keyframe request {}->{} ({media_type:?}, head_age={head_age_ms:.0}ms): per-receiver cross-sender budget at cap (#1479)",
+                            local_user_id,
+                            sid_str
+                        );
+                    }
+                }
+            }
         }));
     }
 }
@@ -2399,6 +2452,15 @@ pub struct PeerDecodeManager {
     /// gated; the `clear_all_peers` (remaining=0 marker) and `run_peer_monitor`
     /// (one snapshot per removal batch) paths stay unconditional.
     last_delete_peer_snapshot_ms: u64,
+    /// #1479: per-receiver cross-sender proactive-PLI budget, shared (via `Rc`)
+    /// into every per-(peer, media_type) keyframe-request route closure so they
+    /// can gate the proactive PLI through one cross-sender ceiling without holding
+    /// `&PeerDecodeManager`. Keyed by `session_id` (the same key as
+    /// `connected_peers`); cleaned per-sender on every peer-removal path
+    /// (`run_peer_monitor` / `delete_peer_at`) and fully on `clear_all_peers`. A
+    /// benign defense-in-depth shadow of the relay's 32/s cap (see
+    /// [`super::pli_budget`]).
+    pli_budget: Rc<RefCell<PliBudget>>,
     /// Test-only count of how many times `log_peer_leave_decode_snapshot`
     /// actually emitted, so #1399 coalescing can be asserted directly
     /// (O(N) -> constant under a within-window cascade). `Cell` because the
@@ -2432,6 +2494,7 @@ impl PeerDecodeManager {
             cached_sorted_string_keys: RefCell::new(None),
             screen_decode_retry_tokens: HashMap::new(),
             last_delete_peer_snapshot_ms: 0,
+            pli_budget: Rc::new(RefCell::new(PliBudget::new())),
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -2455,6 +2518,7 @@ impl PeerDecodeManager {
             cached_sorted_string_keys: RefCell::new(None),
             screen_decode_retry_tokens: HashMap::new(),
             last_delete_peer_snapshot_ms: 0,
+            pli_budget: Rc::new(RefCell::new(PliBudget::new())),
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -2659,13 +2723,16 @@ impl PeerDecodeManager {
             .connected_peers
             .remove_if_and_return(|peer| peer.check_heartbeat());
         let mut removed_ids = Vec::new();
-        for (_session_id, peer) in removed {
+        for (session_id, peer) in removed {
             if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
                 token.set(false);
             }
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
+            // Issue #1479: drop this sender's PLI-budget state on the heartbeat-timeout removal
+            // path so a rejoining session under the same id is never throttled by its prior life.
+            self.pli_budget.borrow_mut().remove_sender(session_id);
             removed_ids.push(peer.sid_str.clone());
             self.on_peer_removed.emit(peer.sid_str);
         }
@@ -3120,6 +3187,10 @@ impl PeerDecodeManager {
         // isn't wired (e.g. pre-connect / post-disconnect) — the proactive route stays unset.
         let send_packet_for_route = self.send_packet.clone();
         let local_user_id_for_route = self.local_user_id.clone();
+        // Issue #1479: clone the shared per-receiver PLI budget handle BEFORE the mutable borrow
+        // of `connected_peers`, so the route closures installed below can capture it without
+        // double-borrowing `self`. `Rc::clone` is cheap; all routes share one budget.
+        let pli_budget_for_route = self.pli_budget.clone();
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             let was_screen_enabled = peer.screen_enabled;
             if !peer.context_initialized {
@@ -3137,7 +3208,12 @@ impl PeerDecodeManager {
                 // (`send_packet` set); `session_id` (not `sid_str`) is the per-session limiter
                 // key (#1124).
                 if let Some(send_packet) = &send_packet_for_route {
-                    install_keyframe_request_routes(peer, send_packet, &local_user_id_for_route);
+                    install_keyframe_request_routes(
+                        peer,
+                        send_packet,
+                        &local_user_id_for_route,
+                        &pli_budget_for_route,
+                    );
                 }
                 peer.context_initialized = true;
             }
@@ -3503,6 +3579,9 @@ impl PeerDecodeManager {
             self.display_name_cache.remove(&session_id);
             self.device_info_cache.remove(&session_id);
             self.is_guest_cache.remove(&session_id);
+            // Issue #1479: drop this sender's PLI-budget state on the explicit-delete removal
+            // path (mirrors the heartbeat-timeout path in `run_peer_monitor`).
+            self.pli_budget.borrow_mut().remove_sender(session_id);
             // Phase 6: invalidate the sorted-keys cache before notifying
             // observers so any read in the callback sees a fresh list.
             self.invalidate_sorted_string_keys();
@@ -3569,6 +3648,10 @@ impl PeerDecodeManager {
         self.display_name_cache.clear();
         self.device_info_cache.clear();
         self.is_guest_cache.clear();
+        // Issue #1479: all senders leave on a connection drop, so reset the whole PLI budget.
+        // (The wall-clock window would also self-heal it after one window, but clearing here is
+        // immediate and matches the cache-clear semantics of the bulk teardown.)
+        self.pli_budget.borrow_mut().clear();
         // Phase 6: invalidate the sorted-keys cache and emit a single
         // batched event so observers can coalesce the bulk-clear into
         // one notification.
@@ -4200,8 +4283,8 @@ mod tests {
         let mut manager = PeerDecodeManager::new();
         let (peer, _muted) = make_test_peer(42);
         // Simulate a connected, context-initialized peer with routes installed.
-        peer.video.set_keyframe_request_route(Box::new(|| {}));
-        peer.screen.set_keyframe_request_route(Box::new(|| {}));
+        peer.video.set_keyframe_request_route(Box::new(|_| {}));
+        peer.screen.set_keyframe_request_route(Box::new(|_| {}));
         assert!(peer.video.has_keyframe_request_route());
         assert!(peer.screen.has_keyframe_request_route());
         manager.connected_peers.insert(42, peer);
