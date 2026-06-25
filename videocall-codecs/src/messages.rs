@@ -138,19 +138,34 @@ pub const REQUEST_KEYFRAME_KIND: &str = "request_keyframe";
 /// `from_peer` / `to_peer` mirror the worker's diagnostics context and are
 /// carried for log symmetry only; the main-side callback is per-decoder (already
 /// bound to one peer + media type), so it needs no identity from the wire.
+///
+/// `head_age_ms` (issue #1479) carries the head-of-line backlog age (ms) that
+/// tripped the freshness deadline and drove this proactive request. The main
+/// thread's per-receiver cross-sender PLI budget
+/// (`videocall_client::decode::pli_budget`) uses it as a staleness priority so
+/// that, when its global cap is reached, the STALEST contending stream's request
+/// is preserved and a fresher one is shed. `#[serde(default)]` keeps it optional
+/// on the wire: an old worker build (or any other message structurally
+/// deserializing into this shape) that omits the field decodes to `0.0`, so the
+/// serde-disambiguation contract (`kind`-based dispatch) is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestKeyframeMessage {
     pub kind: String,
     pub from_peer: Option<String>,
     pub to_peer: Option<String>,
+    /// Head-of-line backlog age (ms) that tripped the freshness deadline (issue #1479).
+    /// Defaulted on the wire so older payloads / overlapping shapes still deserialize.
+    #[serde(default)]
+    pub head_age_ms: f64,
 }
 
 impl RequestKeyframeMessage {
-    pub fn new(from_peer: Option<String>, to_peer: Option<String>) -> Self {
+    pub fn new(from_peer: Option<String>, to_peer: Option<String>, head_age_ms: f64) -> Self {
         Self {
             kind: REQUEST_KEYFRAME_KIND.to_string(),
             from_peer,
             to_peer,
+            head_age_ms,
         }
     }
 }
@@ -369,7 +384,7 @@ mod worker_log_disambiguation_tests {
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&fs).unwrap()).is_err()
         );
 
-        let rk = RequestKeyframeMessage::new(None, None);
+        let rk = RequestKeyframeMessage::new(None, None, 0.0);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&rk).unwrap()).is_err()
         );

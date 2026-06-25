@@ -830,14 +830,19 @@ fn gate_keyframe_less_escalation(head_age_ms: f64) -> bool {
 /// main thread. Invoked by the jitter buffer on a keyframe-less stale-backlog eviction. Reading
 /// the diagnostics context here (rather than capturing it at init) keeps the message tagged
 /// correctly even when `SetContext` lands after `initialize_jitter_buffer`.
-fn post_request_keyframe_to_main() {
+///
+/// `head_age_ms` (issue #1479) is the head-of-line backlog age that tripped the freshness
+/// deadline; it is carried on the wire so the main thread's per-receiver cross-sender PLI budget
+/// can prioritize the stalest stream when its global cap is reached. The buffer passes it in at
+/// the eviction call site.
+fn post_request_keyframe_to_main(head_age_ms: f64) {
     let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
         console::warn_1(&"[WORKER] request_keyframe: no worker scope; dropping".into());
         return;
     };
     let from_peer = CONTEXT_FROM.with(|f| f.borrow().clone());
     let to_peer = CONTEXT_TO.with(|t| t.borrow().clone());
-    let msg = RequestKeyframeMessage::new(from_peer, to_peer);
+    let msg = RequestKeyframeMessage::new(from_peer, to_peer, head_age_ms);
     match serde_wasm_bindgen::to_value(&msg) {
         Ok(val) => {
             let _ = scope.post_message(&val);
