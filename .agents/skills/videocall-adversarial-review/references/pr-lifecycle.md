@@ -52,6 +52,8 @@ Fetch the recorded head SHA into an isolated worktree. Compare the merge base to
 
 Treat `mergeable_state == dirty`, or a reliable `mergeable == false`, as a conflict. Retry once when GitHub reports unknown/null because mergeability is asynchronous. A conflicted PR cannot be approved.
 
+When advising the author to resolve conflicts: **force-push is blocked on this repository**. Instruct them to use `git merge github01/PR-staging` (not `git rebase`). Rebasing rewrites history and requires a force-push, which will be rejected and force creation of a new PR. A merge commit preserves the branch tip and can be pushed with a normal `git push`.
+
 Every required check on the current head must succeed before approval. Investigate failing logs. `neutral` or `skipped` is acceptable only after verifying that a load-bearing workflow was not bypassed by path filters. Do not approve while required checks are queued or in progress.
 
 For rollup/consolidation PRs, check out the integration head and compile the whole workspace because independently green sub-PRs can fail at their merge boundary.

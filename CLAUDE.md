@@ -76,7 +76,7 @@ Every change must satisfy the applicable rules below. These are derived from rec
 | **Keys off a "congestion," "pressure," "full," or "backpressure" signal** | Trace the signal to the actual queue/buffer where real backpressure surfaces. Actix mailbox `Full` is a burst absorber, NOT a receiver's downlink. Verify both transports (WS + WT). |
 | **Adds recovery/exit hysteresis (consecutive-success counters, cooldown timers)** | Verify it cannot **wedge** under the condition that triggers it. Strictly-consecutive success counters reset under ongoing contention and can pin a healthy entity indefinitely. Prefer windowed/decaying/time-bounded exits. |
 | **Is a test-reliability or de-flake change** | Demonstrate the spec **actually runs green** after the fix (local docker or CI dispatch). A de-flake PR that hasn't been run proves nothing about reliability. |
-| **Has a merge conflict with the base branch** | Rebase clean before requesting review. Red CI from a merge conflict is a blocker regardless of code quality. |
+| **Has a merge conflict with the base branch** | Resolve by **merging** the base branch (`git merge github01/PR-staging`) — do NOT rebase. Force-push is blocked on this repository; rebasing rewrites history and requires a force-push, which will fail and force creation of a new PR. A plain `git merge` adds a merge commit without rewriting history and can be pushed normally. |
 
 ## Source Code Rules
 
