@@ -1072,6 +1072,12 @@ impl CameraEncoder {
         on_error: Callback<String>,
         max_layers: u32,
     ) -> Self {
+        // Reset the WT uplink-saturation threshold to floor (250ms) to prevent
+        // leaking a raised threshold from a prior CameraEncoder that was dropped
+        // while screen-sharing (issue #1618 suggested fix). Ensures a clean
+        // single-stream baseline for every new encoder instance.
+        videocall_transport::webtransport::reset_ready_stall_threshold();
+
         let default_tier = &VIDEO_QUALITY_TIERS[0];
         let default_audio_tier = &AUDIO_QUALITY_TIERS[0];
         Self {
@@ -1389,7 +1395,7 @@ impl CameraEncoder {
                         );
                     } else {
                         // Reset to floor (250ms) — single-stream camera only.
-                        videocall_transport::webtransport::set_ready_stall_threshold_ms(0.0);
+                        videocall_transport::webtransport::reset_ready_stall_threshold();
                         log::info!(
                             "CameraEncoder: WT stall threshold reset to floor (single-stream)",
                         );

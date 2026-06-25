@@ -181,7 +181,9 @@ const READY_STALL_THRESHOLD_MS_FLOOR: f64 = 250.0;
 ///
 /// Initial value: bit pattern of 250.0_f64 (IEEE 754). Pinned by unit test
 /// `threshold_static_initializer_matches_floor` to the floor constant. Using a
-/// literal because `f64::to_bits()` is not const-stable at MSRV 1.70.
+/// literal (not `f64::to_bits()`) because const float operations require Rust
+/// 1.83+ and the project is pinned to 1.95 without MSRV enforcement, so the
+/// real cost is the un-named magic number, not a declared-MSRV constraint.
 const READY_STALL_THRESHOLD_MS_INIT_BITS: u64 = 4_643_000_109_586_448_384;
 
 static READY_STALL_THRESHOLD_MS: AtomicU64 = AtomicU64::new(READY_STALL_THRESHOLD_MS_INIT_BITS);
@@ -222,6 +224,14 @@ pub fn set_ready_stall_threshold_ms(ms: f64) {
         ms
     };
     READY_STALL_THRESHOLD_MS.store(clamped.to_bits(), Ordering::Relaxed);
+}
+
+/// Reset the uplink-saturation threshold back to the floor (250 ms).
+///
+/// Call this when switching from dual-stream back to single-stream (e.g. screen
+/// share stops), or when initializing a fresh encoder to ensure a clean baseline.
+pub fn reset_ready_stall_threshold() {
+    set_ready_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR);
 }
 
 /// Returns the current effective ready-stall threshold in milliseconds.
