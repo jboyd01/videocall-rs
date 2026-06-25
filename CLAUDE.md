@@ -109,3 +109,14 @@ This is mandatory for every agent making code changes — not optional. CI will 
 **Why this rule exists:** the recurring defect in this repo's PRs has not been missing knowledge — it is verification discipline. Plausible-looking artifacts (a warning, a test, a doc claim, a CI step) get shipped without proving they do their job, and a reviewer catches them later. The `code-reviewer` agent must be run in genuinely adversarial mode — instruct it to perform checks 1–3 above, not just style/correctness at a glance. Author-mode optimism ("this looks right") is the bias to counteract. Treat a self-review that returns "PASS" while these checks were not actually performed as a review that did not happen.
 
 This applies to every agent and to direct edits, and to every file type — code, tests, docs, CI, shell, and infra config. It is part of the definition of "complete," alongside passing linters and tests.
+
+## Responding To A REQUEST_CHANGES Verdict
+
+When fixing a PR after a `CHANGES_REQUESTED` review, these four steps are **mandatory** after pushing the fix commit(s):
+
+1. **Post a PR comment** summarizing what was fixed and how each blocker was addressed. Include the commit SHA(s), a one-line description of each change, and (for test fixes) confirmation that mutation sensitivity was verified.
+2. **Remove blocking labels** (`NEEDS CHANGES`, `NEEDS TESTS`, `RESOLVE CONFLICTS`) as applicable.
+3. **Add `READY FOR REVIEW`**.
+4. **Re-request review** from the reviewer who requested changes (`gh api --method POST repos/OWNER/REPO/pulls/PR/requested_reviewers -f "reviewers[]=LOGIN"`).
+
+Do not leave a PR in `NEEDS CHANGES` / `NEEDS TESTS` state after pushing a fix without completing all four steps.

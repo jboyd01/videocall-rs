@@ -92,6 +92,20 @@ Terminal invariants:
 - Code blockers apply `NEEDS CHANGES`.
 - Every completed review has at least one terminal verdict label.
 
+## Responding To A REQUEST_CHANGES Verdict
+
+When fixing a PR after a `CHANGES_REQUESTED` review:
+
+1. Push the fix commit(s).
+2. **Post a comment** on the PR summarizing exactly what was fixed and how each blocker was addressed. Include the commit SHA(s), a one-line description of each change, and (for test fixes) confirm mutation sensitivity was verified.
+3. **Reconcile labels**: remove `NEEDS CHANGES`, `NEEDS TESTS`, and `RESOLVE CONFLICTS` as applicable; add `READY FOR REVIEW`.
+4. **Re-request review** from the reviewer who requested changes:
+   ```bash
+   gh api --method POST repos/OWNER/REPO/pulls/PR/requested_reviewers -f "reviewers[]=LOGIN"
+   ```
+
+Do not leave the PR in `NEEDS CHANGES` state after pushing a fix without completing steps 2–4.
+
 ## Approved Follow-Ups
 
 For non-blocking observations on an otherwise approved PR, choose one disposition:
