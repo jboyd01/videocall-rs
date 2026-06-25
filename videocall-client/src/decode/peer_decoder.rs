@@ -672,6 +672,18 @@ impl VideoPeerDecoder {
             .as_ref()
             .map(|r| (r.last_width, r.last_height))
     }
+
+    /// issue #1640: test seam — read back the `(from_peer, to_peer)` pair most
+    /// recently written by `set_stream_context`. Returns `None` when
+    /// `set_stream_context` has not yet been called (e.g. noop decoder before
+    /// any lifecycle point fires). Guards the call-site ID-type fix: if the
+    /// production code is reverted to pass `userid` instead of
+    /// `local_session_id`, the `from_peer` field will be an email string and
+    /// the assertion in the regression test will fail.
+    #[cfg(test)]
+    pub(crate) fn stream_context_for_test(&self) -> Option<(String, String)> {
+        self.stream_context.borrow().clone()
+    }
 }
 
 impl PeerDecode for VideoPeerDecoder {
