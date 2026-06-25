@@ -2591,7 +2591,7 @@ impl MicrophoneEncoder {
             let fec_tier_bitrate = fec_reconfig_tier_bitrate;
             let fec_bitrate_floor = fec_reconfig_bitrate_floor;
             let fec_camera = fec_camera_active;
-            let fec_camera_video_exhausted = fec_camera_video_exhausted;
+            // Issue #1611: fec_camera_video_exhausted is already the Arc, captured directly
             let fec_init_bitrate: Option<u32> = if fec_single_layer {
                 // Top-tier bitrate = the bitrate the base encoder inits at while
                 // healthy (no floor cut), so the first healthy observation is
