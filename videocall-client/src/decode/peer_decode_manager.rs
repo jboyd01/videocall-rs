@@ -1715,6 +1715,25 @@ impl Peer {
         self.selected_audio_layer
     }
 
+    /// AUDIO-kind sibling of [`Self::set_selected_video_layer`] (issue #1695):
+    /// select which audio simulcast layer this receiver decodes for this peer.
+    /// AUDIO packets tagged with a different `simulcast_layer_id` are dropped
+    /// (see the AUDIO arm of the decode path) before decode, exactly like VIDEO.
+    ///
+    /// Unlike the VIDEO/SCREEN setters there is NO sequence-tracker re-anchor here:
+    /// audio carries no per-kind `SequenceTracker` (`track_sequence` returns early
+    /// for AUDIO — sequencing/PLI is handled inside NetEq, not the per-peer tracker),
+    /// so there is nothing to re-anchor on a layer switch. Assigning the field is the
+    /// whole operation, mirroring how `tick_audio_layer_chooser` / `seed_early_congestion`
+    /// already write `selected_audio_layer` directly. The `if`-guarded change check is
+    /// kept for symmetry with the VIDEO/SCREEN setters and to keep this a no-op on an
+    /// unchanged layer.
+    pub fn set_selected_audio_layer(&mut self, layer: u32) {
+        if layer != self.selected_audio_layer {
+            self.selected_audio_layer = layer;
+        }
+    }
+
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
     /// can update peer tiles.
     fn broadcast_peer_status(&self) {
@@ -3246,6 +3265,148 @@ impl PeerDecodeManager {
                     up_switches.push((peer.user_id.clone(), session_id, MediaType::SCREEN));
                 }
                 // AUDIO is NEVER size-capped — the guard is left untouched here.
+            }
+        }
+        up_switches
+    }
+
+    /// Reconcile every peer's DECODE GUARD to the layer the relay will actually
+    /// forward, AFTER a `LAYER_PREFERENCE` publish attempt (issue #1695).
+    ///
+    /// THE INVARIANT (single chokepoint): for every (peer, kind ∈ {Video, Screen,
+    /// Audio}) the decode guard MUST equal what the relay forwards, which is
+    /// `last_sent[(sid, kind)]` when a recorded entry exists, else
+    /// `highest_available(kind)`.
+    ///
+    /// AUDIO IS reconciled (issue #1695): it is the SAME guard-leads-wire class as
+    /// video/screen. `collect_desired_preferences`/`current_desired_preferences` DO
+    /// emit `PrefMediaKind::Audio` entries (constrained audio chooser), the relay's
+    /// exact-match filter includes AUDIO (`is_layer_filterable` matches AUDIO, and a
+    /// recorded `(src, AUDIO)` preference drops mismatched audio packets), and the
+    /// decode path drops AUDIO whose layer != `selected_audio_layer`. So a
+    /// rate-limited audio layer-preference change would leave `selected_audio_layer`
+    /// leading the audio wire → relay forwards only the old layer → exact-match drop
+    /// → audio drop until the next accepted publish — exactly the freeze this fix
+    /// removes for video/screen. Pinning the audio guard to the audio wire (or, with
+    /// no recorded entry, to `highest_available` = the layer the relay fails open and
+    /// forwards) closes that hole. Audio up-switches do NOT request a keyframe (audio
+    /// has no I-frames / no keyframe-gated decode — see below).
+    ///
+    /// WHY this exists (the #1256 regression): `apply_size_lid_to_decode_guards`
+    /// raises the EXACT-MATCH guard immediately on an up-switch, but the paired
+    /// publish goes through `LayerPreferenceSender::take_if_changed`, which returns
+    /// `None` WITHOUT promoting `last_sent` when it is rate-limited (<200ms since the
+    /// last accepted send). The guard then leads the wire (guard=L2, last_sent=L0),
+    /// the relay exact-match-forwards only L0, the guard rejects every L0 → freeze
+    /// ≤5s. Reconciling the guard DOWN to `last_sent` after every publish removes
+    /// that desync: the guard never leads the wire.
+    ///
+    /// `last_sent` is the sender's canonical last-written map (`None` until the first
+    /// send; a `(sid,kind)` ABSENT from it = "no preference recorded for that
+    /// source"). The caller MUST read it AFTER `take_if_changed` so an accepted send
+    /// has already promoted it to the just-sent map.
+    ///
+    /// Returns the UP-switch events (`target < old` returns nothing — a LOWER move
+    /// needs no keyframe) for VISIBLE + media-enabled peers, gated `peer.visible &&
+    /// peer.<kind>_enabled` — the SAME gate `apply_size_lid_to_decode_guards` uses
+    /// (lines 3217 / 3245) — so the caller can request a keyframe after the borrow
+    /// is released. A wasted-then-re-requested keyframe on a rate-limited raise
+    /// self-heals on the next push/tick. ONLY Video and Screen up-switches are
+    /// returned: AUDIO is reconciled (its guard is pinned) but NEVER pushed into the
+    /// up-switch vec, because audio is keyframe-less — there are no I-frames and the
+    /// audio decode path is not keyframe-gated, so an audio up-switch decodes the new
+    /// layer from the next packet without a keyframe request. Requesting one would be
+    /// a meaningless PLI for a kind that has no keyframes.
+    ///
+    /// It writes ONLY the guard (via `set_selected_*_layer`, which for Video/Screen
+    /// re-anchors the seq tracker only on an actual change; AUDIO has no seq tracker,
+    /// so its setter only assigns the field). It does NOT call
+    /// `choose()`/`tick_*`/`observe_*`/`seed_*` or mutate ANY chooser hysteresis —
+    /// the only mutation besides the guard is the benign lazy prune inside
+    /// `highest_available`.
+    pub fn reconcile_decode_guards_to_wire(
+        &mut self,
+        last_sent: Option<
+            &std::collections::BTreeMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
+        >,
+        now_ms: u64,
+    ) -> Vec<(String, u64, MediaType)> {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        // ACCEPTABLE-BY-DESIGN same-call guard bounce (issue #1695, do NOT "fix"):
+        // on a continuous resize-GROW drag that crosses a size-cap layer boundary,
+        // `apply_size_lid_to_decode_guards` raises the guard (e.g. L0→L2) and then —
+        // in the SAME synchronous `set_peer_tile_hints` call, before any packet is
+        // decoded — this method pulls it back to the rate-limited wire (L0). Across a
+        // ~60Hz drag that reads like a guard "bounce", but the decoder only ever sees
+        // the FINAL per-call value (the wire), so it decodes LIVE LOW-RES video the
+        // whole time (never frozen, never blank), self-heals within ≤200ms once the
+        // rate-limit clears, and does NOT re-arm once the tile size stabilizes. This
+        // is STRICTLY BETTER than the ≤5s freeze it replaces (the intended "soft,
+        // live" behavior). Do NOT try to suppress the down-reconcile during a grow to
+        // avoid the bounce — skipping the down move re-introduces the #1695 freeze
+        // (guard leads the wire → relay forwards old layer → exact-match drop).
+        let mut up_switches: Vec<(String, u64, MediaType)> = Vec::new();
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                // VIDEO. target = the relay-forwarded layer for this source:
+                //   * a recorded `last_sent` entry → the relay exact-match forwards
+                //     exactly that layer, so the guard must be it; ELSE
+                //   * NO entry → the relay FAILS OPEN and forwards ALL layers, i.e.
+                //     the publisher's TOP (`highest_available`), so the guard must
+                //     match the top it forwards — NOT "leave the guard where it is".
+                //
+                // LOAD-BEARING, DO NOT SIMPLIFY the `unwrap_or(highest_available)`
+                // branch. `collect_desired_preferences`/`current_desired_preferences`
+                // only inserts an entry when `layer < highest_available`, so a peer at
+                // top has NO entry → this branch fires and pins the guard to the top.
+                // If we instead left the guard alone, a DOWN-cap whose publish was
+                // rate-limited (entry not yet on the wire) would keep guard=L0 while
+                // the relay still forwards the old L2 → exact-match drop → the SAME
+                // freeze this fix removes. Fail-open forward-the-top is exactly what
+                // the relay does with no entry (chat_server.rs: no entry → forward
+                // ALL), so the guard must equal the top.
+                let v_target = last_sent
+                    .and_then(|m| m.get(&(session_id, PrefMediaKind::Video)).copied())
+                    .unwrap_or_else(|| peer.video_layer_availability.highest_available(now_ms));
+                let v_old = peer.selected_video_layer();
+                if v_target != v_old {
+                    peer.set_selected_video_layer(v_target);
+                }
+                if v_target > v_old && peer.visible && peer.video_enabled {
+                    up_switches.push((peer.user_id.clone(), session_id, MediaType::VIDEO));
+                }
+
+                // SCREEN — identical, screen_* fields / PrefMediaKind::Screen.
+                let s_target = last_sent
+                    .and_then(|m| m.get(&(session_id, PrefMediaKind::Screen)).copied())
+                    .unwrap_or_else(|| peer.screen_layer_availability.highest_available(now_ms));
+                let s_old = peer.selected_screen_layer();
+                if s_target != s_old {
+                    peer.set_selected_screen_layer(s_target);
+                }
+                if s_target > s_old && peer.visible && peer.screen_enabled {
+                    up_switches.push((peer.user_id.clone(), session_id, MediaType::SCREEN));
+                }
+
+                // AUDIO — identical pin (audio_* fields / PrefMediaKind::Audio).
+                // Audio is in the SAME exact-match family as video/screen (relay
+                // `is_layer_filterable` includes AUDIO; the decode path drops AUDIO
+                // whose layer != `selected_audio_layer`), so a rate-limited audio
+                // pref change would leave the guard leading the audio wire → drop.
+                // Pin the guard to the wire (recorded entry) else to the top the
+                // relay fails-open-forwards (`highest_available`) — same reasoning
+                // and same load-bearing `unwrap_or(highest_available)` as VIDEO.
+                let a_target = last_sent
+                    .and_then(|m| m.get(&(session_id, PrefMediaKind::Audio)).copied())
+                    .unwrap_or_else(|| peer.audio_layer_availability.highest_available(now_ms));
+                let a_old = peer.selected_audio_layer();
+                if a_target != a_old {
+                    peer.set_selected_audio_layer(a_target);
+                }
+                // NO up-switch push for AUDIO: audio is keyframe-less (no I-frames,
+                // decode is not keyframe-gated), so an audio up-switch needs no PLI —
+                // it decodes the new layer from the next packet. We reconcile the
+                // guard but request no keyframe. See the method doc-comment.
             }
         }
         up_switches
@@ -7271,6 +7432,148 @@ mod tests {
             Some(guard),
             wire,
             "guard must equal wire (no freeze) after the re-lid"
+        );
+    }
+
+    /// #1695 (guard must not lead the wire on a rate-limited up-switch): after a
+    /// `LAYER_PREFERENCE` publish whose change was RATE-LIMITED (take_if_changed
+    /// returned None without promoting last_sent), `apply_size_lid_to_decode_guards`
+    /// may have ALREADY raised the EXACT-MATCH decode guard to L2 while the wire
+    /// (last_sent) is still L0. The relay forwards only L0 → exact-match guard
+    /// rejects every L0 → freeze. `reconcile_decode_guards_to_wire(Some(wire))` must
+    /// pull the guard back DOWN to the wire layer (L0) so guard == wire.
+    ///
+    /// AUDIO is covered identically (issue #1695): audio is in the SAME relay
+    /// exact-match filter, so the test also pre-raises `selected_audio_layer` to L2
+    /// with a recorded audio wire entry of L0 (Case 1) and asserts the reconcile pulls
+    /// the AUDIO guard to L0; Case 2 (no entry) asserts the audio guard rises to
+    /// `highest_available` (L2) just like video.
+    ///
+    /// This drives the manager method DIRECTLY against a hand-built `last_sent` map
+    /// (the literal wire layer 0), NOT a re-implementation of the production path —
+    /// per CLAUDE.md "test the production function, not a copy".
+    ///
+    /// MUTATION: gut the body of `reconcile_decode_guards_to_wire` to `Vec::new()`
+    /// (no guard writes). The guard then STAYS at the pre-set L2 ≠ wire L0 and the
+    /// `selected_video_layer() == 0` assertion FAILS. Likewise breaking the
+    /// no-entry → `highest_available` branch fails the second case. Gutting ONLY the
+    /// AUDIO arm (removing the `set_selected_audio_layer` call) leaves the audio guard
+    /// at L2 ≠ wire L0 and fails the `selected_audio_layer() == 0` assertion below,
+    /// while the video/screen assertions still pass — proving the audio coverage is
+    /// independent.
+    #[test]
+    fn reconcile_decode_guards_to_wire_pins_guard_to_wire_not_above() {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        use std::collections::BTreeMap;
+
+        // ---- Case 1: recorded wire entry L0, guard pre-raised to L2 → reconcile to L0.
+        let mut manager = PeerDecodeManager::new();
+        // Peer with a learned 3-layer ladder (highest_available == 2).
+        manager.insert_zero_loss_top_peer_for_test(900);
+        let now = 2000u64;
+        // Simulate apply_size_lid's immediate up-raise: guard at L2 (the TOP).
+        manager
+            .connected_peers
+            .get_mut(&900)
+            .unwrap()
+            .set_selected_video_layer(2);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&900)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "precondition: guard pre-raised to L2 (apply_size_lid's immediate raise)"
+        );
+        // AUDIO precondition: pre-raise the AUDIO guard to L2 as well, so the
+        // reconcile has somewhere to pull it DOWN from (mirrors apply_size_lid's
+        // immediate raise for the exact-match audio guard).
+        manager
+            .connected_peers
+            .get_mut(&900)
+            .unwrap()
+            .set_selected_audio_layer(2);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&900)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "precondition: AUDIO guard pre-raised to L2"
+        );
+        // The wire (last_sent) still records L0 for this source — for BOTH video and
+        // audio (the rate-limited publish never promoted either past L0).
+        let mut wire: BTreeMap<(u64, PrefMediaKind), u32> = BTreeMap::new();
+        wire.insert((900, PrefMediaKind::Video), 0);
+        wire.insert((900, PrefMediaKind::Audio), 0);
+        let _ups = manager.reconcile_decode_guards_to_wire(Some(&wire), now);
+        // Guard must now EQUAL the wire (L0) — the relay forwards only L0, so the
+        // exact-match guard must accept L0, not reject it at L2.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&900)
+                .unwrap()
+                .selected_video_layer(),
+            0,
+            "#1695: guard must be pulled DOWN to the wire layer (L0), not lead it at L2"
+        );
+        // AUDIO guard must ALSO be pulled DOWN to the audio wire (L0): audio is in the
+        // same relay exact-match filter, so a guard leading the audio wire at L2 would
+        // drop every forwarded L0 audio packet (audio freeze). MUTATION TARGET: gut
+        // the AUDIO arm and this assertion fails (audio guard stays at L2).
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&900)
+                .unwrap()
+                .selected_audio_layer(),
+            0,
+            "#1695: AUDIO guard must be pulled DOWN to the audio wire (L0), not lead it at L2"
+        );
+
+        // ---- Case 2: NO recorded entry → guard must rise to highest_available (top
+        // the relay fails-open-forwards). Guard pre-set LOW (0), last_sent None.
+        let mut manager2 = PeerDecodeManager::new();
+        manager2.insert_zero_loss_top_peer_for_test(901);
+        manager2
+            .connected_peers
+            .get_mut(&901)
+            .unwrap()
+            .set_selected_video_layer(0);
+        // AUDIO guard also pre-set LOW (0) — must ALSO rise to the fail-open top.
+        manager2
+            .connected_peers
+            .get_mut(&901)
+            .unwrap()
+            .set_selected_audio_layer(0);
+        // No last_sent map at all → relay fails open → forwards ALL layers (the top).
+        let _ups2 = manager2.reconcile_decode_guards_to_wire(None, now);
+        let top = 2u32; // highest_available for the 3-layer fixture ladder
+        assert_eq!(
+            manager2
+                .connected_peers
+                .get(&901)
+                .unwrap()
+                .selected_video_layer(),
+            top,
+            "#1695: with no recorded entry the relay fails open (forwards the top), \
+             so the guard must match highest_available (L2), not stay at L0"
+        );
+        // AUDIO guard must ALSO rise to the fail-open top (L2): with no recorded audio
+        // entry the relay forwards ALL audio layers, so the audio guard must match the
+        // top it forwards — not stay pinned at L0 (which would drop the forwarded top).
+        assert_eq!(
+            manager2
+                .connected_peers
+                .get(&901)
+                .unwrap()
+                .selected_audio_layer(),
+            top,
+            "#1695: with no recorded audio entry the audio guard must match \
+             highest_available (L2), not stay at L0"
         );
     }
 

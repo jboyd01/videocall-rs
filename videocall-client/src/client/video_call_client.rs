@@ -778,6 +778,63 @@ fn send_layer_preference_via(
     }
 }
 
+/// THE single chokepoint for publishing a `LAYER_PREFERENCE` change AND keeping
+/// every decode guard in sync with what the relay will forward (issue #1695).
+///
+/// INVARIANT: after this returns, for every (peer, kind ∈ {Video, Screen, Audio})
+/// the decode guard == `last_sent[(sid,kind)]`-if-recorded-else-`highest_available`
+/// == the layer the relay exact-match (or fail-open) forwards. AUDIO is reconciled
+/// too (issue #1695): it is in the same relay exact-match filter, so a rate-limited
+/// audio pref change would otherwise leave the audio guard leading the audio wire →
+/// drop. Audio reconciles the guard but (being keyframe-less) requests no keyframe.
+///
+/// This is THE chokepoint: every LAYER_PREFERENCE publish site MUST call this so
+/// the guard can never lead the wire. A future 6th publish site that calls
+/// `take_if_changed` directly (without this helper) re-introduces the #1256
+/// guard/wire desync — DO NOT add one.
+///
+/// ORDERING IS LOAD-BEARING: `last_sent` is read AFTER `take_if_changed`, because
+/// an ACCEPTED send promotes `last_sent` to the just-sent map. Reading it BEFORE
+/// would reconcile the guard to the PRE-send map and re-desync for a cycle.
+///
+/// All five callers pass a `&mut Inner`. The four that hold a `RefMut<Inner>`
+/// pass `&mut inner` — `DerefMut` coercion turns `&mut RefMut<Inner>` into the
+/// `&mut Inner` parameter in argument position (clippy's `explicit_auto_deref`
+/// confirms `&mut *inner` would be redundant here); `seed_local_congestion_and_publish`
+/// already has `self: &mut Inner` and passes `self`.
+fn publish_and_reconcile(
+    inner: &mut Inner,
+    desired: &std::collections::HashMap<(u64, PrefMediaKind), u32>,
+    now_ms: u64,
+) {
+    if let Some(entries) = inner
+        .layer_preference_sender
+        .take_if_changed(desired, now_ms)
+    {
+        let user_id = inner.options.user_id.clone();
+        let cc = inner.connection_controller.clone();
+        send_layer_preference_via(&cc, &user_id, entries);
+    }
+    // Read `last_sent` AFTER `take_if_changed` (an accepted send promoted it to the
+    // just-sent map). CLONE the ≤64-entry canonical map so the immutable sender
+    // borrow ends before the `&mut peer_decode_manager` call below — the SAME
+    // snapshot-to-avoid-aliasing convention used for `bounds` at the monitor tick
+    // (see the `inner.receive_layer_bounds` snapshot comment ~line 1725).
+    let wire = inner.layer_preference_sender.last_sent().cloned();
+    let ups = inner
+        .peer_decode_manager
+        .reconcile_decode_guards_to_wire(wire.as_ref(), now_ms);
+    // Drain keyframe requests AFTER the &mut reconcile loop returned owned tuples
+    // (its &mut borrow ended); `send_keyframe_request` takes `&self`. An up-switch
+    // whose publish was rate-limited may waste-then-re-request a keyframe; it
+    // self-heals on the next push/tick.
+    for (user_id, sid, mt) in &ups {
+        inner
+            .peer_decode_manager
+            .send_keyframe_request(user_id, *sid, *mt);
+    }
+}
+
 /// Arm the CAMERA forced-keyframe cooldown reset on a (re)connect (issue #1311,
 /// hardened in #1352).
 ///
@@ -1226,14 +1283,7 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
         let desired = inner
             .peer_decode_manager
             .current_desired_preferences(now_ms, &bounds);
-        if let Some(entries) = inner
-            .layer_preference_sender
-            .take_if_changed(&desired, now_ms)
-        {
-            let user_id = inner.options.user_id.clone();
-            let cc = inner.connection_controller.clone();
-            send_layer_preference_via(&cc, &user_id, entries);
-        }
+        publish_and_reconcile(&mut inner, &desired, now_ms);
     });
 
     *slot_borrow = Some(interval);
@@ -1735,14 +1785,7 @@ impl VideoCallClient {
                                         reporter.update_received_layers(&desired);
                                     }
                                 }
-                                if let Some(entries) = inner
-                                    .layer_preference_sender
-                                    .take_if_changed(&desired, now_ms)
-                                {
-                                    let user_id = inner.options.user_id.clone();
-                                    let cc = inner.connection_controller.clone();
-                                    send_layer_preference_via(&cc, &user_id, entries);
-                                }
+                                publish_and_reconcile(&mut inner, &desired, now_ms);
                             }
                             Err(_) => {
                                 // Transient borrow conflict — another callback
@@ -2228,14 +2271,7 @@ impl VideoCallClient {
             let desired = inner
                 .peer_decode_manager
                 .tick_layer_choosers(now_ms, &bounds);
-            if let Some(entries) = inner
-                .layer_preference_sender
-                .take_if_changed(&desired, now_ms)
-            {
-                let user_id = inner.options.user_id.clone();
-                let cc = inner.connection_controller.clone();
-                send_layer_preference_via(&cc, &user_id, entries);
-            }
+            publish_and_reconcile(&mut inner, &desired, now_ms);
         } else {
             warn!("set_receive_layer_bounds: inner busy, bounds not applied this call");
         }
@@ -2307,14 +2343,7 @@ impl VideoCallClient {
             let desired = inner
                 .peer_decode_manager
                 .current_desired_preferences(now_ms, &bounds);
-            if let Some(entries) = inner
-                .layer_preference_sender
-                .take_if_changed(&desired, now_ms)
-            {
-                let user_id = inner.options.user_id.clone();
-                let cc = inner.connection_controller.clone();
-                send_layer_preference_via(&cc, &user_id, entries);
-            }
+            publish_and_reconcile(&mut inner, &desired, now_ms);
             true
         } else {
             warn!("set_peer_tile_hints: inner busy, hints not applied this call");
@@ -3241,14 +3270,7 @@ impl Inner {
         let desired = self
             .peer_decode_manager
             .current_desired_preferences(now_ms, &bounds);
-        if let Some(entries) = self
-            .layer_preference_sender
-            .take_if_changed(&desired, now_ms)
-        {
-            let user_id = self.options.user_id.clone();
-            let cc = self.connection_controller.clone();
-            send_layer_preference_via(&cc, &user_id, entries);
-        }
+        publish_and_reconcile(self, &desired, now_ms);
         seeded
     }
 
@@ -5040,6 +5062,7 @@ mod cooldown_reset_hardening_tests {
     use super::arm_camera_keyframe_cooldown_reset;
     use super::arm_keyframe_cooldown_reset_slot;
     use super::handle_connected_reconnect_resets;
+    use super::publish_and_reconcile;
     use super::VideoCallClient;
     use super::VideoCallClientOptions;
     use std::cell::RefCell;
@@ -5183,6 +5206,140 @@ mod cooldown_reset_hardening_tests {
                 .copied(),
             Some(1),
             "the stepped-down receive-layer preference must be advertised for the peer"
+        );
+    }
+
+    /// #1695 END-TO-END WIRING: the decode guard must not lead the RATE-LIMITED
+    /// `LAYER_PREFERENCE` wire. This drives the REAL production chokepoint
+    /// `publish_and_reconcile` (the SAME free function every publish site calls)
+    /// against a real host-built `Inner`, exercising the actual
+    /// `take_if_changed -> last_sent -> reconcile_decode_guards_to_wire` sequence —
+    /// NOT a hand-fabricated `last_sent` map. The existing
+    /// `reconcile_decode_guards_to_wire_pins_guard_to_wire_not_above`
+    /// (peer_decode_manager.rs) guards the reconcile METHOD in isolation; this guards
+    /// the WIRING: that `publish_and_reconcile` reconciles the guard to the
+    /// rate-limited (stale) `last_sent`, the integration the bug actually depends on.
+    ///
+    /// Scenario (the real #1256/#1695 bug):
+    ///   t=1000  publish_and_reconcile(desired={(sid,Video):0}) — first send is
+    ///           ACCEPTED, promoting `last_sent` to L0; reconcile pins guard to L0.
+    ///   (lid)   `apply_size_lid_to_decode_guards` (the PRODUCTION method that, in
+    ///           `seed_local_congestion_and_publish`, immediately raises the
+    ///           exact-match guard) raises the guard to the top (L2) — the guard now
+    ///           LEADS the wire, which is still L0.
+    ///   t=1100  publish_and_reconcile(desired={(sid,Video):2}) — only 100ms later, so
+    ///           `take_if_changed` is RATE-LIMITED (<200ms): it returns None WITHOUT
+    ///           promoting `last_sent` (still L0). `publish_and_reconcile` then reads
+    ///           that stale `last_sent` and reconciles the guard back DOWN to L0.
+    /// The relay forwards only L0; the exact-match guard must accept L0, not reject it
+    /// at L2 (the ≤5s freeze this fix removes).
+    ///
+    /// MUTATION: reverting EITHER production behavior breaks this test —
+    ///   (a) delete the `reconcile_decode_guards_to_wire(...)` call from
+    ///       `publish_and_reconcile` (the exact wiring revert Codex described): the
+    ///       guard stays at the leading L2 and the final `selected_video_layer() == 0`
+    ///       assertion FAILS; AND
+    ///   (b) make `take_if_changed` PROMOTE `last_sent` on its rate-limit branch (so
+    ///       the wire jumps to L2): the `last_sent` precondition assertion (still L0)
+    ///       FAILS, and the guard reconciles UP to L2 so `selected_video_layer() == 0`
+    ///       FAILS too.
+    /// The existing isolated reconcile test passes under BOTH reverts (it bypasses
+    /// `publish_and_reconcile` and hand-builds `last_sent`), which is precisely the
+    /// coverage gap this test closes.
+    ///
+    /// HOST `#[test]` (not `#[wasm_bindgen_test]`) so it runs in per-PR CI under
+    /// `cargo test -p videocall-client --lib`. `connection_controller` is `None` on
+    /// the test client, so `send_layer_preference_via` is a harmless no-op (logs and
+    /// returns) — the network send is irrelevant to the guard==wire invariant.
+    #[test]
+    fn publish_and_reconcile_pulls_guard_to_rate_limited_wire() {
+        use std::collections::HashMap;
+
+        let client = build_test_client();
+        let mut inner = client.inner.borrow_mut();
+
+        // A CONNECTED peer with a learned 3-layer ladder (highest_available == 2).
+        let sid = 700u64;
+        inner
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(sid);
+        let open = ReceiveLayerBounds::default();
+
+        // ---- t=1000: first publish of a LOW cap (L0) is ACCEPTED. This drives the
+        // REAL take_if_changed: first send (last_sent was None) is never rate-limited,
+        // so it promotes last_sent to {(sid,Video):0} and stamps the rate-limit clock.
+        let mut desired_low: HashMap<(u64, PrefMediaKind), u32> = HashMap::new();
+        desired_low.insert((sid, PrefMediaKind::Video), 0);
+        publish_and_reconcile(&mut inner, &desired_low, 1000);
+        // After the accepted publish the wire (last_sent) records L0 for this source.
+        assert_eq!(
+            inner
+                .layer_preference_sender
+                .last_sent()
+                .and_then(|m| m.get(&(sid, PrefMediaKind::Video)).copied()),
+            Some(0),
+            "precondition: the first publish was accepted and recorded L0 on the wire"
+        );
+        // ...and the guard was reconciled to that wire (L0).
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&sid)
+                .unwrap()
+                .selected_video_layer(),
+            0,
+            "precondition: guard reconciled to the accepted wire layer (L0)"
+        );
+
+        // ---- The lid's immediate up-raise: the PRODUCTION method that, inside
+        // `seed_local_congestion_and_publish`, raises the exact-match guard right
+        // before the paired publish. With open bounds and an unconstrained fresh
+        // chooser it raises the guard to the publisher's top (L2). The guard now LEADS
+        // the wire (guard=L2, last_sent=L0) — exactly the #1256 desync window.
+        let _ = inner
+            .peer_decode_manager
+            .apply_size_lid_to_decode_guards(1100, &open);
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&sid)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "precondition: the size-lid raise put the guard at the top (L2), leading the L0 wire"
+        );
+
+        // ---- t=1100 (only 100ms after the accepted send, < 200ms
+        // LAYER_PREFERENCE_MIN_UPDATE_MS): publish the UP-switch to L2. The REAL
+        // take_if_changed is RATE-LIMITED → returns None WITHOUT promoting last_sent.
+        // publish_and_reconcile then reconciles the guard to that stale wire (L0).
+        let mut desired_up: HashMap<(u64, PrefMediaKind), u32> = HashMap::new();
+        desired_up.insert((sid, PrefMediaKind::Video), 2);
+        publish_and_reconcile(&mut inner, &desired_up, 1100);
+
+        // CRUX (a): the wire was NOT promoted — the rate-limited up-switch left
+        // last_sent at L0. This pins the no-promote-on-rate-limit production behavior;
+        // mutating take_if_changed to promote on rate-limit breaks this.
+        assert_eq!(
+            inner
+                .layer_preference_sender
+                .last_sent()
+                .and_then(|m| m.get(&(sid, PrefMediaKind::Video)).copied()),
+            Some(0),
+            "#1695: a rate-limited up-switch must NOT promote the wire (still L0)"
+        );
+        // CRUX (b): the guard was pulled DOWN to the rate-limited wire (L0), NOT left
+        // leading at L2. Deleting the reconcile call from publish_and_reconcile leaves
+        // the guard at L2 and breaks this — the wiring revert Codex named.
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&sid)
+                .unwrap()
+                .selected_video_layer(),
+            0,
+            "#1695: publish_and_reconcile must pull the guard DOWN to the rate-limited \
+             wire (L0), not leave it leading at L2 (the <=5s freeze this fix removes)"
         );
     }
 
