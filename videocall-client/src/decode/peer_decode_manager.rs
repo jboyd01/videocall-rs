@@ -7202,6 +7202,78 @@ mod tests {
         );
     }
 
+    /// #1256 (guard/wire sync after congestion seeds): the seed helpers write the
+    /// decode guard LID-UNAWARE (user bounds only, not the size lid). The fix re-lids
+    /// the guards (via apply_size_lid_to_decode_guards) BETWEEN the seed and the
+    /// lid-aware publish, so guard == wire before the packet goes out — otherwise a
+    /// small-capped peer the seed flips to L1 has guard=L1 / wire=L0 and freezes for
+    /// ≤5s. This test reproduces the manager-level sequence the early-seed timer /
+    /// seed_local_congestion_and_publish run, and asserts the guard EQUALS the lid AND
+    /// equals the advertised wire layer.
+    ///
+    /// MUTATION: remove the apply_size_lid_to_decode_guards re-lid call (the seed alone
+    /// leaves the guard at the un-lidded clamp(current()) = L1 while the wire is L0) —
+    /// the `selected_video_layer() == 0` (guard) assertion fails. (The wire assertion
+    /// alone passes even un-fixed; the GUARD assertion is what this test adds.)
+    #[test]
+    fn congestion_seed_relid_syncs_guard_to_lid() {
+        use crate::decode::layer_chooser::{
+            DownlinkSample, PrefMediaKind, ReceiveLayerBounds, TileHint,
+        };
+        let mut manager = PeerDecodeManager::new();
+        manager.connected_peers.insert(
+            666,
+            make_congested_top_peer(666, TransportType::TRANSPORT_WEBTRANSPORT),
+        );
+        let now = 2000u64;
+        let bounds = ReceiveLayerBounds::default();
+        // Bring the chooser to the top (so the seed has somewhere to step DOWN from),
+        // exactly as congestion_seed_never_advertises_above_size_lid does.
+        if let Some(p) = manager.connected_peers.get_mut(&666) {
+            p.last_video_downlink = DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            };
+        }
+        let _ = manager.tick_layer_choosers(now, &bounds);
+        if let Some(p) = manager.connected_peers.get_mut(&666) {
+            p.last_video_downlink = DownlinkSample {
+                loss_per_sec: crate::decode::layer_chooser::LOSS_STEP_DOWN_PER_SEC + 1.0,
+                kf_per_sec: 0.0,
+            };
+        }
+        // Small tile -> lid = L0. Seed congestion (chooser steps DOWN to L1), then RE-LID
+        // the guards (the fix) — this is the manager-level equivalent of what the
+        // early-seed timer / seed_local_congestion_and_publish now do between seed and
+        // publish.
+        manager.set_peer_tile_hints(HashMap::from([(
+            666u64,
+            TileHint::Capped { device_px_h: 360 },
+        )]));
+        let seeded = manager.seed_early_congestion_for_connected_peers(now, &bounds);
+        assert!(seeded, "the congested peer's sample must seed a constrain");
+        let _ = manager.apply_size_lid_to_decode_guards(now, &bounds); // <-- the re-lid the fix inserts
+                                                                       // GUARD must now equal the lid (L0) — NOT the un-lidded clamp(current())=L1.
+        let guard = manager
+            .connected_peers
+            .get(&666)
+            .unwrap()
+            .selected_video_layer();
+        assert_eq!(
+            guard, 0,
+            "decode guard must be re-lidded to L0 (the lid), not the un-lidded seed result L1"
+        );
+        // WIRE (lid-aware publish) must equal the lid too — and EQUAL the guard.
+        let desired = manager.current_desired_preferences(now, &bounds);
+        let wire = desired.get(&(666, PrefMediaKind::Video)).copied();
+        assert_eq!(wire, Some(0), "advertised wire layer must be the lid L0");
+        assert_eq!(
+            Some(guard),
+            wire,
+            "guard must equal wire (no freeze) after the re-lid"
+        );
+    }
+
     /// #1256 (resize cadence): applying the size lid N times within ONE sample
     /// window must re-assert the SAME lidded layer, NOT compound into N congestion
     /// down-steps. `apply_size_lid_to_decode_guards` (what `set_peer_tile_hints` now

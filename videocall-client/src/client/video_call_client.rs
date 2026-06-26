@@ -1202,6 +1202,22 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
             .peer_decode_manager
             .seed_early_congestion_for_connected_peers(now_ms, &bounds);
 
+        // #1256: the seed helpers write the decode guard LID-UNAWARE (they fold the
+        // user `bounds` but not the size lid). Re-lid the guards so guard == the
+        // lid-aware wire `current_desired_preferences` is about to publish — otherwise
+        // a small-capped peer whose chooser the seed flips to L1 would have guard=L1
+        // / wire=L0 and freeze until the next 5s tick. apply_size_lid_to_decode_guards
+        // only LOWERS to the lid (never undoes the seed's congestion step below it),
+        // calls no choose(), and returns visibility-gated up-switches to keyframe.
+        let up = inner
+            .peer_decode_manager
+            .apply_size_lid_to_decode_guards(now_ms, &bounds);
+        for (user_id, sid, mt) in &up {
+            inner
+                .peer_decode_manager
+                .send_keyframe_request(user_id, *sid, *mt);
+        }
+
         // Publish the resulting desired map through the existing sender so
         // dedup/rate-limit invariants hold. The map is clamped to the user's
         // bounds and gated to layers below each kind's highest-available, mirroring
@@ -2253,13 +2269,17 @@ impl VideoCallClient {
     /// up-switch (unchanged). `set_receive_layer_bounds` keeps using `tick_layer_choosers`
     /// because it is human-CLICK-paced (not a continuous drag), so it is not the same risk.
     ///
-    /// Returns `true` when the push was APPLIED and published this call, and `false`
-    /// when it was DROPPED because `inner` was transiently borrowed elsewhere (a
-    /// `try_borrow_mut` conflict). The UI dedup MUST only record the hint map as
-    /// delivered when this returns `true`, so a dropped push is retried on the next
-    /// render instead of stranding a stale size cap (issue #1256 — a resize-to-small
-    /// that loses the borrow race would otherwise keep pulling the high layer
-    /// indefinitely).
+    /// Returns `true` when the inner borrow SUCCEEDED: the hint was applied to the
+    /// decode guards and a preference publish was ATTEMPTED. The publish itself may
+    /// have been a no-op or rate-limited by `take_if_changed` (the 200ms
+    /// `LAYER_PREFERENCE_MIN_UPDATE_MS` limiter), in which case the wire re-syncs on
+    /// the next monitor tick — `true` does NOT guarantee a packet went out, only that
+    /// the guard was lidded and the publish path ran. Returns `false` ONLY when the
+    /// inner borrow was CONTENDED (a `try_borrow_mut` conflict) and nothing was
+    /// applied. The UI dedup MUST only record the hint map as delivered when this
+    /// returns `true`, so a dropped push is retried on the next render instead of
+    /// stranding a stale size cap (issue #1256 — a resize-to-small that loses the
+    /// borrow race would otherwise keep pulling the high layer indefinitely).
     pub fn set_peer_tile_hints(&self, hints: std::collections::HashMap<u64, TileHint>) -> bool {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             inner.peer_decode_manager.set_peer_tile_hints(hints);
@@ -3206,6 +3226,16 @@ impl Inner {
         let seeded = self
             .peer_decode_manager
             .seed_downlink_congestion_for_connected_peers(now_ms, &bounds, exempt_speakers);
+        // #1256: re-lid the guards so guard == the lid-aware wire before publish
+        // (see the early-seed timer for the rationale). Only lowers to the lid; no
+        // choose(); returns visibility-gated up-switches to keyframe.
+        let up = self
+            .peer_decode_manager
+            .apply_size_lid_to_decode_guards(now_ms, &bounds);
+        for (user_id, sid, mt) in &up {
+            self.peer_decode_manager
+                .send_keyframe_request(user_id, *sid, *mt);
+        }
         // Publish the resulting (possibly held) preference via the existing
         // change-detected sender, exactly as `set_receive_layer_bounds` does.
         let desired = self
