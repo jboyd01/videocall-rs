@@ -1923,6 +1923,15 @@ impl Peer {
                     ),
                     now,
                 );
+                // EXACT-MATCH simulcast guard (NOT SVC "layer N and below"): these
+                // are independent encodes (see SIMULCAST_LAYER_TIER_INDICES doc in
+                // videocall-aq). A packet whose `layer_id` is not the selected layer
+                // is DROPPED, not down-decoded — so if this guard ever sits ABOVE the
+                // layer the relay is actually forwarding, EVERY arriving packet is
+                // skipped and the tile FREEZES on its last-good frame. The selected
+                // layer must therefore never lead the requested-layer wire state
+                // (issue #1695): raise it only once the LAYER_PREFERENCE that asks
+                // for the higher layer has been published.
                 if incoming_video_layer != self.selected_video_layer {
                     return Ok((MediaType::VIDEO, DecodeStatus::SKIPPED, None));
                 }

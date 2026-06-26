@@ -573,9 +573,13 @@ const LAYER_PREFERENCE_GAUGE_KINDS: [(i32, &str); 2] = [(1, "video"), (3, "scree
 /// For each kind in [`LAYER_PREFERENCE_GAUGE_KINDS`] (VIDEO, SCREEN) this finds
 /// the MAX `desired_layer` the receiver has requested across ALL sources for
 /// that kind, then buckets it via [`layer_id_bucket`] (so a forged id collapses
-/// to `"other"`). The max is the right reduction because the relay must
-/// forward/produce up to the highest layer the receiver asked for, so that
-/// single layer characterizes the session's demand for the kind.
+/// to `"other"`). The max is the right reduction as a single demand proxy: it
+/// is the most expensive layer this session pulls for the kind, so it
+/// characterizes the session's peak demand. (NOTE: this is a per-source MAX
+/// taken for the GAUGE only. Forwarding itself is EXACT-MATCH per source — the
+/// relay forwards ONLY each source's requested `layer_id`, never the cumulative
+/// `0..=N`; these are independent simulcast encodes, not nested SVC layers. See
+/// the forwarding filter below.)
 ///
 /// The return is parallel to [`LAYER_PREFERENCE_GAUGE_KINDS`] by index:
 /// `result[i]` is `Some(bucket)` when the receiver has at least one preference
@@ -5332,6 +5336,13 @@ fn handle_msg(
             // AFTER the viewport filter above (a VIDEO packet only reaches here
             // if the viewport forwarded it). SCREEN/AUDIO skip the viewport
             // filter entirely.
+            //
+            // EXACT-MATCH, not cumulative: a recorded preference of layer N means
+            // "forward ONLY layer N from this source", NOT "layers 0..=N". These
+            // are independent simulcast encodes, not nested SVC layers (see the
+            // SIMULCAST_LAYER_TIER_INDICES doc in videocall-aq). A receiver that
+            // requests a layer the relay is not forwarding gets nothing decodable
+            // and freezes (issue #1695) — the client decode guard is exact-match too.
             //
             // NO-OP-FIRST / fail-open. Drop iff ALL hold:
             //   1. the cleartext `simulcast_layer_id` is non-zero, AND
