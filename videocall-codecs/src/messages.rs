@@ -500,12 +500,44 @@ mod freshness_skip_console_line_tests {
 
     #[test]
     fn empty_peers_render_as_empty_arrow() {
-        // `None` peers (a skip forwarded before SetContext) render as `->`, matching the prior
-        // inline `unwrap_or_default()` behavior — keeps the line shape stable for the grep.
+        // `None` peers (a skip forwarded before SetContext backfill) render as `->`,
+        // matching the prior inline `unwrap_or_default()` behavior — keeps the line
+        // shape stable for the grep. With issue #1640 this is now rare (SetContext is
+        // sent at peer creation), but can still occur if the freshness deadline trips
+        // on the very first frame before the postMessage delivering SetContext arrives.
         let line = FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1, false).console_line();
         assert!(
             line.contains("freshness_skip ->:"),
             "empty peers should render as `->`: {line}"
+        );
+    }
+
+    /// Issue #1640: both `from_peer` and `to_peer` are now session_id strings (u64).
+    /// This test pins the semantic contract: the arrow format `{from}->{to}` renders
+    /// numeric session_ids so that log-parsing scripts can treat both sides uniformly
+    /// (e.g. correlate `from_peer` to the local receiver's session_id and `to_peer`
+    /// to the publisher's session_id without guessing whether a field is an email).
+    #[test]
+    fn session_id_peers_render_as_numeric_arrow() {
+        // Simulates the post-#1640 runtime: from_peer = local session_id,
+        // to_peer = remote publisher session_id — both u64 strings.
+        let line = FreshnessSkipMessage::new(
+            Some("9876543210".into()),
+            Some("1234567890".into()),
+            500.0,
+            Some(7),
+            3,
+            false,
+        )
+        .console_line();
+        assert!(
+            line.contains("9876543210->1234567890"),
+            "session_id peers should render as numeric arrow: {line}"
+        );
+        // Grep-contract: the full prefix + arrow is parseable in one regex.
+        assert!(
+            line.starts_with("[JITTER_BUFFER] freshness_skip 9876543210->1234567890:"),
+            "prefix + session_id arrow must form a single grep-able prefix: {line}"
         );
     }
 }
