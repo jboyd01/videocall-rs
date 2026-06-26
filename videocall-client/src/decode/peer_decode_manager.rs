@@ -1122,6 +1122,20 @@ impl Peer {
         self.selected_video_layer
     }
 
+    /// SCREEN-kind sibling of [`Self::set_selected_video_layer`] (issue #1256):
+    /// select which screen-share simulcast layer this receiver decodes for this
+    /// peer, re-anchoring the SCREEN sequence tracker ONLY on an actual change
+    /// (same #1079 H1 rationale as the VIDEO setter — a fresh per-layer sequence
+    /// baseline must be established, while a no-op switch must NOT discard healthy
+    /// loss/PLI history). Used by [`PeerDecodeManager::apply_size_lid_to_decode_guards`]
+    /// to lower/raise the screen decode guard without running the chooser.
+    pub fn set_selected_screen_layer(&mut self, layer: u32) {
+        if layer != self.selected_screen_layer {
+            self.screen_seq_tracker.reanchor_for_layer_switch();
+        }
+        self.selected_screen_layer = layer;
+    }
+
     /// Run the receiver-driven layer chooser one tick for this peer (issue #989,
     /// Phase 2) and apply the result to the local decode guard.
     ///
@@ -3131,6 +3145,112 @@ impl PeerDecodeManager {
         desired
     }
 
+    /// Apply the per-peer rendered-tile-size LID to the DECODE GUARDS directly,
+    /// WITHOUT advancing any chooser hysteresis (issue #1256 — resize cadence).
+    ///
+    /// This is the seam [`crate::client::video_call_client::VideoCallClient::set_peer_tile_hints`]
+    /// uses INSTEAD of [`Self::tick_layer_choosers`]. The 5s monitor tick owns the
+    /// congestion `choose()` loop; a tile-size push must NOT call `choose()` because
+    /// its DOWN path has no dwell gate (see `layer_chooser.rs`) and `last_video_downlink`
+    /// is fixed within a ~1s loss window, so feeding the same congested sample on
+    /// every resize-drag render (the UI bumps `viewport_version` on the RAW, un-debounced
+    /// resize listener) would compound into N down-steps + bank the sticky latch. Instead
+    /// this sets the guard purely from the lid composed with the chooser's EXISTING
+    /// pick — idempotent: N calls in one window re-assert the SAME layer.
+    ///
+    /// Per peer + VIDEO/SCREEN: baseline = the chooser's current pick clamped to the
+    /// user's bounds (`desired_preference().map(|r| bounds.clamp(r))`) or decode-best
+    /// (`highest_available`) when unconstrained — the SAME `v_base`
+    /// [`Peer::collect_desired_preferences`] computes, NOT a fresh `choose()`. The
+    /// guard layer = `min(baseline, effective_max)` where
+    /// `effective_max = size_lid.max(user_min).min(user_max)` (the SAME floor-respecting
+    /// composition as the tick / read-only fold). AUDIO is never touched. Re-anchors the
+    /// seq tracker on an actual guard change (mirrors `tick_layer_chooser`). Returns the
+    /// up-switch events (old < new) for VISIBLE + media-enabled peers so the caller can
+    /// request keyframes after the borrow is released — gated `peer.visible &&
+    /// peer.<kind>_enabled`, the SAME gate the tick uses.
+    pub fn apply_size_lid_to_decode_guards(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> Vec<(String, u64, MediaType)> {
+        use crate::decode::layer_chooser::{size_cap_layer, PrefMediaKind, TileHint};
+        let mut up_switches: Vec<(String, u64, MediaType)> = Vec::new();
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            // Read the per-peer tile hint BEFORE the &mut borrow (mirrors the tick
+            // loop's borrow discipline). Absent peer = Uncapped (fail-open).
+            let hint = self
+                .peer_tile_hints
+                .get(&session_id)
+                .copied()
+                .unwrap_or(TileHint::Uncapped);
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                // VIDEO — baseline + lid composition byte-identical to
+                // `collect_desired_preferences` so the guard and the advertised
+                // layer AGREE. Only chooser reads here are `desired_preference()`
+                // (pure getter) and `highest_available()` (benign prune); NO
+                // `choose()` / `tick_*` → advances NO hysteresis.
+                let vh = peer.video_layer_availability.highest_available(now_ms);
+                let v_base = peer
+                    .video_layer_chooser
+                    .desired_preference()
+                    .map(|raw| bounds.for_kind(PrefMediaKind::Video).clamp(raw))
+                    .unwrap_or(vh);
+                let v_lid = match hint {
+                    TileHint::Uncapped => vh,
+                    TileHint::Capped { device_px_h } => {
+                        size_cap_layer(device_px_h, vh, vh + 1, PrefMediaKind::Video)
+                    }
+                };
+                let v_user_min = bounds.for_kind(PrefMediaKind::Video).min.unwrap_or(0);
+                let v_user_max = bounds
+                    .for_kind(PrefMediaKind::Video)
+                    .max
+                    .unwrap_or(u32::MAX);
+                let v_effective_max = v_lid.max(v_user_min).min(v_user_max);
+                let v_new = v_base.min(v_effective_max);
+                let v_old = peer.selected_video_layer();
+                if v_new != v_old {
+                    // Reanchors the VIDEO seq tracker ONLY on an actual change.
+                    peer.set_selected_video_layer(v_new);
+                }
+                if v_new > v_old && peer.visible && peer.video_enabled {
+                    up_switches.push((peer.user_id.clone(), session_id, MediaType::VIDEO));
+                }
+
+                // SCREEN — identical with screen_* fields / PrefMediaKind::Screen.
+                let sh = peer.screen_layer_availability.highest_available(now_ms);
+                let s_base = peer
+                    .screen_layer_chooser
+                    .desired_preference()
+                    .map(|raw| bounds.for_kind(PrefMediaKind::Screen).clamp(raw))
+                    .unwrap_or(sh);
+                let s_lid = match hint {
+                    TileHint::Uncapped => sh,
+                    TileHint::Capped { device_px_h } => {
+                        size_cap_layer(device_px_h, sh, sh + 1, PrefMediaKind::Screen)
+                    }
+                };
+                let s_user_min = bounds.for_kind(PrefMediaKind::Screen).min.unwrap_or(0);
+                let s_user_max = bounds
+                    .for_kind(PrefMediaKind::Screen)
+                    .max
+                    .unwrap_or(u32::MAX);
+                let s_effective_max = s_lid.max(s_user_min).min(s_user_max);
+                let s_new = s_base.min(s_effective_max);
+                let s_old = peer.selected_screen_layer();
+                if s_new != s_old {
+                    peer.set_selected_screen_layer(s_new);
+                }
+                if s_new > s_old && peer.visible && peer.screen_enabled {
+                    up_switches.push((peer.user_id.clone(), session_id, MediaType::SCREEN));
+                }
+                // AUDIO is NEVER size-capped — the guard is left untouched here.
+            }
+        }
+        up_switches
+    }
+
     /// Early-seed congestion across every connected peer showing an
     /// early-congested sample (issue #1179, Part B).
     ///
@@ -3647,7 +3767,13 @@ impl PeerDecodeManager {
     /// because this is a signaling/control packet, not user media data.
     /// The server needs to read the target `user_id` / `target_session_id` to
     /// route and rate-limit it correctly.
-    fn send_keyframe_request(
+    ///
+    /// `pub(crate)` so `VideoCallClient::set_peer_tile_hints` can drain the
+    /// up-switch keyframes returned by `apply_size_lid_to_decode_guards` AFTER
+    /// the `&mut` peer borrow has been released (issue #1256). It takes `&self`,
+    /// so the drain does not re-borrow the manager mutably — same shape as the
+    /// in-manager drain at the tail of `tick_layer_choosers`.
+    pub(crate) fn send_keyframe_request(
         &self,
         peer_user_id: &str,
         target_session_id: u64,
@@ -7073,6 +7199,112 @@ mod tests {
         assert!(
             v == Some(0),
             "congestion must not advertise above the size lid (lid L0); got {v:?}"
+        );
+    }
+
+    /// #1256 (resize cadence): applying the size lid N times within ONE sample
+    /// window must re-assert the SAME lidded layer, NOT compound into N congestion
+    /// down-steps. `apply_size_lid_to_decode_guards` (what `set_peer_tile_hints` now
+    /// calls) sets the guard purely from the lid + the chooser's existing pick — no
+    /// `choose()` — so it is idempotent. The OLD path
+    /// (`tick_layer_choosers` -> `choose()`) would, on a congested peer, step down one
+    /// rung PER call (here 2->1->0 across the 3 lidded calls), the over-collapse this
+    /// fixes.
+    ///
+    /// The lid is chosen to map to **L1** (`device_px_h = 580`: 360*1.1=396 < 580
+    /// fails L0; 540*1.1=594 >= 580 -> L1) so the idempotent result (1) DIFFERS from
+    /// the compounded result (0). With an L0 lid both paths would land at 0 and the
+    /// test would not discriminate.
+    ///
+    /// MUTATION: make `apply_size_lid_to_decode_guards` advance the chooser (e.g.
+    /// call `tick_layer_chooser`/`choose()` instead of reading `desired_preference()`),
+    /// OR re-point `set_peer_tile_hints` at `tick_layer_choosers`. On this CONGESTED
+    /// peer the 3 calls then step the guard 2->1->0 (the constrained DOWN branch has
+    /// no dwell gate and `last_video_downlink` is fixed within the window), landing at
+    /// 0 — BELOW the lid — and the `== 1` assertion fails. Idempotency (no `choose()`
+    /// advance) is what holds it at the lid.
+    ///
+    /// HOST `#[test]` (not `#[wasm_bindgen_test]`) so it actually runs under
+    /// `cargo test -p videocall-client --lib` — cf. `early_seed_respects_user_receive_max`,
+    /// which drives these same manager methods on the host harness.
+    #[test]
+    fn size_lid_apply_is_idempotent_across_resize_drag() {
+        use crate::decode::layer_chooser::{
+            DownlinkSample, PrefMediaKind, ReceiveLayerBounds, TileHint,
+        };
+
+        let mut manager = PeerDecodeManager::new();
+        // Congested peer, learned 3-layer ladder (highest_available == 2). A FIXED
+        // small clock keeps availability (observed at t=1000 by the helper) inside
+        // the prune window (same trick as `congestion_seed_never_advertises_above_size_lid`).
+        manager.connected_peers.insert(
+            777,
+            make_congested_top_peer(777, TransportType::TRANSPORT_WEBTRANSPORT),
+        );
+        let now = 2000u64;
+        let bounds = ReceiveLayerBounds::default();
+
+        // Bring the (unconstrained) chooser UP to the TOP (current == 2) via one CLEAN
+        // unclamped tick, exactly as `congestion_seed_never_advertises_above_size_lid`
+        // does — so the MUTATION (choose()-driven) path has somewhere to step DOWN
+        // FROM (2 -> 1 -> 0). The fixed path leaves the chooser unconstrained, so
+        // `desired_preference()` stays None and `v_base` stays at the top (2) every call.
+        if let Some(p) = manager.connected_peers.get_mut(&777) {
+            p.last_video_downlink = DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            };
+        }
+        let _ = manager.tick_layer_choosers(now, &bounds);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&777)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "clean unconstrained tick climbs the guard to the top before the lid applies"
+        );
+        // Restore the congested sample: the MUTATION path would consume it on every
+        // call; the fixed path never reads it (no choose()).
+        if let Some(p) = manager.connected_peers.get_mut(&777) {
+            p.last_video_downlink = DownlinkSample {
+                loss_per_sec: crate::decode::layer_chooser::LOSS_STEP_DOWN_PER_SEC + 1.0,
+                kf_per_sec: 0.0,
+            };
+        }
+
+        // A tile that maps to L1 (see the doc): store the hint, then apply the lid 3
+        // times in the SAME window (simulating a resize drag's N un-debounced pushes).
+        manager.set_peer_tile_hints(HashMap::from([(
+            777u64,
+            TileHint::Capped { device_px_h: 580 },
+        )]));
+        for _ in 0..3 {
+            let _ = manager.apply_size_lid_to_decode_guards(now, &bounds);
+        }
+
+        // Fixed path: chooser stays unconstrained (no choose() ran) -> v_base = highest
+        // = 2, effective_max = lid 1 -> guard = min(2, 1) = 1 on EVERY call. The OLD
+        // choose()-path would have compounded to 0 (2 -> 1 -> 0) — see the MUTATION note.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&777)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "the lid (L1) must be re-asserted idempotently across the resize drag, \
+             NOT compounded below it"
+        );
+        // Corollary: applying NO choose() means the chooser is still unconstrained, so
+        // the read-only publish advertises the lid (1 < highest 2), proving the guard
+        // and the wire agree on the lidded layer.
+        let desired = manager.current_desired_preferences(now, &bounds);
+        assert_eq!(
+            desired.get(&(777, PrefMediaKind::Video)).copied(),
+            Some(1),
+            "the wire preference must match the idempotent lidded guard (L1)"
         );
     }
 

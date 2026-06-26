@@ -2229,11 +2229,29 @@ impl VideoCallClient {
     /// session_id; `TileHint::Capped { device_px_h }` lets the receiver LID the
     /// requested simulcast layer to the smallest layer covering the tile,
     /// `TileHint::Uncapped` (or an absent peer) applies no lid. Applies IMMEDIATELY:
-    /// re-ticks the choosers (re-clamps + updates decode guards + requests a keyframe
-    /// on any up-switch) and re-sends the (now-lidded) LAYER_PREFERENCE, so a
+    /// it lowers/raises each peer's decode guard via
+    /// [`PeerDecodeManager::apply_size_lid_to_decode_guards`] (which composes the lid
+    /// with the chooser's EXISTING pick — it does NOT call `choose()`), requests a
+    /// keyframe on any up-switch, and re-sends the (now-lidded) LAYER_PREFERENCE via
+    /// the READ-ONLY [`PeerDecodeManager::current_desired_preferences`] path — so a
     /// tile-size change takes effect without waiting for the next monitor tick.
     /// AUDIO is never size-capped. No wire/protobuf/relay change — the lid rides the
     /// existing per-receiver LAYER_PREFERENCE clamp seam.
+    ///
+    /// Why NOT `tick_layer_choosers` here (issue #1256 resize-cadence fix): the UI
+    /// pushes this on EVERY render off the RAW (un-debounced) resize listener, so a
+    /// resize drag produces ~10-100 pushes within ONE ~1s loss window. The chooser's
+    /// `choose()` DOWN path has no dwell gate — it steps down ONE rung per call, fed
+    /// the SAME congested `last_video_downlink` sample (only overwritten on ~1s
+    /// rollover) — so routing this through the tick would over-collapse an
+    /// already-congested receiver (2 calls flatten a 3-layer stream to base) and bank
+    /// the sticky latch + churn the clean-window counters far faster than the intended
+    /// 5s cadence, then pay the ~15s-per-rung climb-back. The guard-apply path advances
+    /// NO chooser hysteresis, so it is idempotent: N calls in one window re-assert the
+    /// SAME lid against the SAME chooser state, never compounding. The 5s monitor tick
+    /// still owns `choose()`-driven adaptation AND its own lid fold + keyframe-on-
+    /// up-switch (unchanged). `set_receive_layer_bounds` keeps using `tick_layer_choosers`
+    /// because it is human-CLICK-paced (not a continuous drag), so it is not the same risk.
     ///
     /// Returns `true` when the push was APPLIED and published this call, and `false`
     /// when it was DROPPED because `inner` was transiently borrowed elsewhere (a
@@ -2247,9 +2265,28 @@ impl VideoCallClient {
             inner.peer_decode_manager.set_peer_tile_hints(hints);
             let now_ms = js_sys::Date::now() as u64;
             let bounds = inner.receive_layer_bounds;
+            // #1256 resize-cadence fix: apply the lid to the decode guards WITHOUT
+            // calling choose() (no congestion down-step / sticky banking on a resize
+            // drag's N pushes). The 5s monitor tick still owns choose()-driven
+            // adaptation AND its own lid fold + keyframe-on-up-switch (unchanged).
+            let up_switches = inner
+                .peer_decode_manager
+                .apply_size_lid_to_decode_guards(now_ms, &bounds);
+            // Drain keyframe requests AFTER the &mut peer loop (the manager method
+            // already returned owned (user_id, sid, media_type) tuples, ending its
+            // &mut borrow; send_keyframe_request takes &self on the manager). Mirrors
+            // the drain in tick_layer_choosers.
+            for (user_id, sid, mt) in &up_switches {
+                inner
+                    .peer_decode_manager
+                    .send_keyframe_request(user_id, *sid, *mt);
+            }
+            // Publish the (lid-aware, durable) preference via the READ-ONLY path so the
+            // wire cap survives the early-seed/congestion republishers (P1) — and so
+            // this push advances NO chooser hysteresis.
             let desired = inner
                 .peer_decode_manager
-                .tick_layer_choosers(now_ms, &bounds);
+                .current_desired_preferences(now_ms, &bounds);
             if let Some(entries) = inner
                 .layer_preference_sender
                 .take_if_changed(&desired, now_ms)
