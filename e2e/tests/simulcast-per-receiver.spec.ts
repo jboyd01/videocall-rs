@@ -2229,6 +2229,233 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       await degradedBrowser.close();
     }
   });
+
+  // -------------------------------------------------------------------------
+  // #1256 Phase 1 — SIZE-AWARE receiver simulcast layer cap.
+  //
+  // The feature: a receiver LIDs the requested simulcast layer to the rendered
+  // tile size. A peer shown as a SMALL grid thumbnail pulls a LOWER layer (the
+  // smallest whose native height covers the tile); when that peer is PINNED the
+  // tile grows, the lid lifts, and the receiver up-switches above the base layer
+  // (and requests a keyframe so it sharpens). The lid rides the EXISTING
+  // per-receiver LAYER_PREFERENCE clamp seam, so the receiver's per-peer layer
+  // SELECTION changes with NO wire/relay change — observable directly via the
+  // SAME `readVideoLayer()` received-quality readout the #989/#1434 tests read.
+  // (The READOUT is the authoritative client-side proof of the selected layer;
+  // we deliberately do NOT cross-check `relay_layer_filtered_total` here — that
+  // room-scoped counter only increments when the relay drops layers a receiver
+  // did NOT select, and on the WebSocket path the default 2-peer stack forwards
+  // all layers and decrements nothing, so it is not a reliable signal for this
+  // healthy-link, single-receiver scenario.)
+  //
+  // CRITICAL DISTINCTION from every other layer-divergence test in this file:
+  // there is NO network impairment. The whole point of #1256 is that a HEALTHY
+  // receiver on a good link caps by SIZE, not by congestion. On a healthy link
+  // the chooser would otherwise fail open to `highest_available` (the top layer)
+  // and the receiver would decode 720p for a tiny thumbnail — the waste #1256
+  // fixes. So this test asserts the receiver settles at the BASE layer with ZERO
+  // impairment, then climbs above the base once the peer is pinned.
+  //
+  // PRODUCING A SMALL TILE (verified empirically against this stack — see the
+  // observed readouts in the PR notes). `display_peers` (attendants.rs) FILTERS
+  // OUT the local user's own session, so a publisher + ONE receiver gives the
+  // receiver exactly ONE remote grid tile. The per-peer tile-size hint is
+  // `compute_layout(tile_count, avail_w, avail_h, gap).tile_w / TILE_AR *
+  // devicePixelRatio` device-px tall (attendants.rs, #1256 block) — it is
+  // computed for EVERY non-screen-share tile regardless of the full-bleed CSS
+  // exception. We shrink the RECEIVER viewport to 640x480 so that single tile's
+  // device-px height settles at ~340px. The camera ladder is L0=640x360 /
+  // L1=960x540 / L2=1280x720 with a 10% size-cap margin (the L0 boundary is
+  // 360*1.1=396px), so a ~340px tile caps to L0 (the BASE) — verified: at this
+  // viewport the readout reads "640x360" (index 0), and at the default 1280x720
+  // viewport the same receiver reads "1280x720" (the top). We assert
+  // `devicePixelRatio === 1` first: a HiDPI runner (dpr 2) would double the
+  // device-px height to ~680px and lift the cap to the top, masking the feature
+  // — so we fail loud rather than silently pass.
+  //
+  // UNTAGGED (no @bvt): like the #1434/#1108 WT default-suite tests above, this
+  // runs only in the default `dioxus` suite (NOT per-PR CI) and is validated on
+  // the local docker e2e stack. It needs NO toxiproxy/netsim profile.
+  // -------------------------------------------------------------------------
+  test("size-aware cap: a small-grid receiver pulls a LOWER layer than when the peer is pinned; pinning up-switches to the top (#1256)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1256_size_cap_${Date.now()}`;
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let rxPage: Page | undefined;
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1256-pub@videocall.rs",
+        "Sim1256Pub",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-1256-rx@videocall.rs",
+        "Sim1256Rx",
+        uiURL,
+      );
+      // Full 3-rung ladder on BOTH ends so the size lid has headroom to lower
+      // the requested layer below the top (the #1093 override replaces the
+      // device-sniffed capability ceiling that would otherwise clamp a low-core
+      // CI container to a single layer — no headroom, nothing to cap).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      rxPage = await rxCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      // Join at the DEFAULT viewport (1280x720) first. A LARGE single tile sizes
+      // above the L1 boundary so the receiver fails open to a HIGH layer, which in
+      // turn makes the publisher's receiver-driven AQ keep the upper rungs ACTIVE
+      // (with no receiver pulling them they get shed) — establishing the ladder
+      // headroom this test needs BEFORE we shrink to demonstrate the cap. (Setting
+      // the small viewport pre-join instead makes the lone receiver cap to base
+      // immediately, the publisher sheds the upper rungs, and there is never a
+      // >1-layer ladder to be "below".)
+      await joinMeeting(pubPage, meetingId, "Sim1256Pub");
+      await joinMeeting(rxPage, meetingId, "Sim1256Rx");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — assert the full ladder is actually
+      // emitted BEFORE the skip guard, so a silently-broken override fails loud
+      // instead of skipping on a clamped single layer (testing nothing).
+      await assertCapabilityOverrideActive(pubConsole);
+
+      // DPR GUARD: the device-px tile height = CSS height x devicePixelRatio. The
+      // 640x480 viewport (below) caps to L0 ONLY at dpr 1; a HiDPI runner (dpr 2)
+      // would double the height past the top layer's boundary and lift the cap to
+      // the top, masking the feature. Fail loud rather than silently pass.
+      const rxDpr = await rxPage.evaluate(() => window.devicePixelRatio);
+      expect(
+        rxDpr,
+        "#1256 requires devicePixelRatio === 1 on the receiver so the 640x480 " +
+          "viewport produces a sub-top tile height; a HiDPI runner would mask the cap",
+      ).toBe(1);
+
+      // The receiver must see the publisher's tile (peers connected).
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      await openPerformancePanel(rxPage);
+
+      // PHASE 0 — BASELINE (large tile climbs ABOVE the base layer). On the
+      // healthy link with a full-bleed tile the receiver must reach a HIGH layer
+      // (index >= 1) on a multi-rung ladder. This both (a) proves the LARGE tile
+      // is NOT capped to the base (the necessary counterpart to Phase A's cap) and
+      // (b) confirms ladder headroom exists. We poll for that condition DIRECTLY
+      // (not merely "decoding started") so the wait does not return on the first
+      // base-layer frame before the climb completes; the publisher's receiver-
+      // driven AQ ramps the upper rungs over a few seconds. Skip (NOT fail) if it
+      // never reaches a high layer within the window — that means the runner
+      // clamped the publisher to a single layer, leaving no rung above the base
+      // for a size cap to be below.
+      let sawHighBaseline = false;
+      await expect
+        .poll(
+          async () => {
+            const s = await readVideoLayer(rxPage!);
+            if (s && s.layerCount > 1 && s.layerIndex >= 1) sawHighBaseline = true;
+            return sawHighBaseline;
+          },
+          { timeout: 60_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBe(true)
+        .catch(() => {
+          /* never reached a high baseline within budget — handled by the skip below */
+        });
+      test.skip(
+        !sawHighBaseline,
+        "capability ceiling clamped the publisher to a single layer (the large-tile " +
+          "receiver never climbed above the base); no ladder headroom above the base " +
+          "for a size cap to be below (see helpers/simulcast-config.ts)",
+      );
+
+      // PHASE A — SHRINK ⇒ SIZE CAP ENGAGED. Shrink the receiver viewport so its
+      // single remote tile becomes a ~340 device-px thumbnail (caps to L0). The
+      // window `resize` listener (attendants.rs) bumps `viewport_version`, so the
+      // layout — and the per-peer tile-size hint pushed via set_peer_tile_hints —
+      // recomputes, and the lid lowers the requested layer. On a HEALTHY link the
+      // chooser would otherwise stay at `highest_available` (the high baseline
+      // above), so the index dropping to the BASE (0) can ONLY be the rendered-
+      // tile-size lid — the load-bearing #1256 assertion, with NO congestion. We
+      // assert on the INDEX (count-independent: the lid pins the lowest rung
+      // regardless of how many rungs the publisher currently has active).
+      await rxPage.setViewportSize({ width: 640, height: 480 });
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 99, {
+          timeout: 60_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "#1256 PHASE A: after shrinking the receiver viewport, the small-grid " +
+            "tile on a HEALTHY link must cap its requested layer to the BASE " +
+            "(index 0) — the size lid lowered it with no congestion",
+        })
+        .toBe(0);
+
+      const capped = await readVideoLayer(rxPage);
+      expect(capped, "#1256 PHASE A: receiver must still be decoding").not.toBeNull();
+      expect(
+        capped!.layerIndex,
+        `#1256 PHASE A: small tile capped to base layer (got index ${capped!.layerIndex})`,
+      ).toBe(0);
+
+      // PHASE B — PIN ⇒ UP-SWITCH ABOVE THE LID. Pinning the publisher's tile
+      // marks that peer Uncapped (pinned / screen-share / maximized are never
+      // size-capped), so the size lid LIFTS and the receiver up-switches above the
+      // base layer (requesting a keyframe so the higher layer sharpens). We assert
+      // the index climbs to AT LEAST 1 (strictly above the base lid): that is the
+      // unambiguous proof of the lid lift, robust to the publisher's active-layer
+      // count oscillating between 2 and 3 (asserting an exact top index would
+      // flake when the publisher is momentarily down to 2 active layers).
+      //
+      // The pin button (`button.pin-icon`, canvas_generator.rs) is
+      // `visibility: hidden` until its `.grid-item` parent is hovered (style.css
+      // `.grid-item:hover .pin-icon`) AND the full-bleed single tile pulses a
+      // speaking-glow animation, so a normal hover-then-click is flaky. We
+      // dispatch the click directly on the button via the DOM — this fires the
+      // Dioxus onclick (`on_toggle_pin`) regardless of CSS visibility/animation.
+      const gridTile = rxPage.locator("#grid-container .grid-item").first();
+      await expect(gridTile).toBeVisible({ timeout: 10_000 });
+      const pinButton = gridTile.locator("button.pin-icon");
+      await expect(pinButton).toHaveCount(1, { timeout: 10_000 });
+      await pinButton.evaluate((el: HTMLElement) => el.click());
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? -1, {
+          timeout: 45_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "#1256 PHASE B: pinning the peer must lift the size lid and up-switch the " +
+            "receiver ABOVE the base layer (index >= 1)",
+        })
+        .toBeGreaterThanOrEqual(1);
+
+      // PHASE C — UNPIN ⇒ CAP BACK DOWN. Unpinning re-applies the size lid (the
+      // tile is a small thumbnail again), so the requested layer drops back to the
+      // base. Same DOM-dispatch click on the (now toggled) pin button.
+      await pinButton.evaluate((el: HTMLElement) => el.click());
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 99, {
+          timeout: 60_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "#1256 PHASE C: unpinning must re-apply the size lid and cap the small " +
+            "tile back to the base layer (index 0)",
+        })
+        .toBe(0);
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
