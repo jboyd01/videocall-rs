@@ -10794,7 +10794,7 @@ mod tests {
         chat_server
             .send(Connect {
                 id: p_session,
-                addr: dummy.recipient(),
+                addr: dummy.clone().recipient(),
             })
             .await
             .expect("Connect P should succeed");
@@ -10859,7 +10859,7 @@ mod tests {
         chat_server
             .send(Connect {
                 id: c_session_2,
-                addr: dummy.recipient(),
+                addr: dummy.clone().recipient(),
             })
             .await
             .expect("Reconnect Connect C should succeed");
