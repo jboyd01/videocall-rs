@@ -3643,19 +3643,36 @@ impl Handler<JoinRoom> for ChatServer {
         // because they have no stable identity that could match a prior
         // session's pending entry — they always fall through as fresh joins.
         let mut reconnect_display_name: Option<String> = None;
+        // Last-known host flag of the reconnecting tab, captured from its prior
+        // `room_members` entry before that entry is removed below.
+        // The room JWT's `is_host` claim is frozen at mint time and a
+        // fast cached-URL transport reconnect re-presents that SAME token, so a
+        // demoted ex-host reconnecting after a transfer-host would otherwise
+        // re-seed `is_host=true` and override the authoritative
+        // `internal.meeting_host_changed` fanout — a phantom host that corrupts
+        // the transport host-leave→end decision. The prior entry already reflects
+        // that fanout (correct in BOTH directions: demoted→false, promoted→true),
+        // so we prefer it ONLY on a reconnection. When no transfer occurred the
+        // prior entry equals the JWT claim, so this is a strict no-op; it diverges
+        // from the JWT only in exactly the buggy post-transfer reconnect case.
+        let mut reconnect_is_host: Option<bool> = None;
         let is_reconnection = if let Some(ref iid) = instance_id {
             let departure_key = (room.clone(), iid.clone());
             if let Some(pending) = self.pending_departures.remove(&departure_key) {
                 ctx.cancel_future(pending.spawn_handle);
 
-                // Capture the old session's display_name before cleanup —
-                // it may have been updated by an in-meeting rename and is
-                // more current than the JWT's frozen-at-login display_name.
+                // Capture the old session's display_name AND host flag before
+                // cleanup — both are more current than the JWT's frozen-at-login
+                // values (rename via PARTICIPANT_DISPLAY_NAME_CHANGED, host flag
+                // via the host-change fanout).
                 if let Some(members) = self.room_members.get_mut(&room) {
-                    reconnect_display_name = members
+                    if let Some(old) = members
                         .iter()
                         .find(|m| m.session == pending.old_session && m.user_id == user_id)
-                        .map(|m| m.display_name.clone());
+                    {
+                        reconnect_display_name = Some(old.display_name.clone());
+                        reconnect_is_host = Some(old.is_host);
+                    }
                     members.retain(|m| m.session != pending.old_session);
                 }
 
@@ -3767,7 +3784,9 @@ impl Handler<JoinRoom> for ChatServer {
                     // (which reflects any renames) over the JWT's
                     // frozen-at-login name.
                     display_name: reconnect_display_name.unwrap_or_else(|| display_name.clone()),
-                    is_host,
+                    // On a reconnection, prefer the fanout-reconciled flag from
+                    // the prior entry over the (same, possibly stale) JWT seed.
+                    is_host: reconnect_is_host.unwrap_or(is_host),
                     end_on_host_leave,
                 });
 
@@ -10698,6 +10717,204 @@ mod tests {
         let parsed: MeetingEndedByHostPayload =
             serde_json::from_slice(&db_payload).expect("Payload should deserialize");
         assert_eq!(parsed.room_id, room);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Demoted ex-host whose transport reconnects with a stale (pre-demotion) room
+    // must NOT re-poison the relay's in-memory host flag.
+    // Otherwise that phantom host keeps the meeting alive when the
+    // REAL (transfer-target) host leaves — `was_last_present_host` counts the
+    // phantom as a present host and suppresses MEETING_ENDED.
+    //
+    // Flow: C joins as host (eohl=true); P joins as attendee; host transfers
+    // C→P via the `internal.meeting_host_changed` fanout; C's transport drops
+    // and RECONNECTS with the same instance_id + the stale token (is_host=true);
+    // then P (the real host) leaves. With the fix the relay re-seeds C from the
+    // fanout-reconciled prior entry (is_host=false), so P's departure is the
+    // last host leaving → MEETING_ENDED fires. Reverting the JoinRoom reconnect
+    // reconciliation (`reconnect_is_host.unwrap_or(is_host)` → `is_host`) makes C
+    // a phantom host → MEETING_ENDED is suppressed → this test fails.
+    //
+    // Observed on the explicit-Leave path because the `Leave` handler resolves
+    // `is_host` from `room_members` (so the departing host is correctly seen as
+    // host) and the only remaining member is the reconnected C — making the
+    // phantom flag the sole thing that decides whether the meeting ends.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_demoted_exhost_reconnect_does_not_phantom_block_meeting_end() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-1241-phantom-host";
+        let creator = "creator@example.com";
+        let target = "target@example.com";
+
+        // C joins as host (eohl=true), instance "c-iid", session 1.
+        let c_session_1 = 9_700u64;
+        chat_server
+            .send(Connect {
+                id: c_session_1,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect C should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: c_session_1,
+                room: room.to_string(),
+                user_id: creator.to_string(),
+                display_name: creator.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("c-iid".to_string()),
+                is_host: true,
+                end_on_host_leave: true,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom C should deliver")
+            .expect("JoinRoom C should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: c_session_1,
+            })
+            .await
+            .expect("Activate C should succeed");
+
+        // P joins as a plain attendee (is_host=false), instance "p-iid", session 2.
+        let p_session = 9_701u64;
+        chat_server
+            .send(Connect {
+                id: p_session,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect P should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: p_session,
+                room: room.to_string(),
+                user_id: target.to_string(),
+                display_name: target.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("p-iid".to_string()),
+                is_host: false,
+                end_on_host_leave: true,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom P should deliver")
+            .expect("JoinRoom P should return Ok");
+        chat_server
+            .send(ActivateConnection { session: p_session })
+            .await
+            .expect("Activate P should succeed");
+
+        // Transfer host C→P: the `internal.meeting_host_changed` fanout flips
+        // both cached flags (demote C, promote P) across the presence map.
+        chat_server
+            .send(UpdateMemberHostFlag(MeetingHostChangePayload {
+                room_id: room.to_string(),
+                user_id: creator.to_string(),
+                is_host: false,
+            }))
+            .await
+            .expect("demote-C fanout should succeed");
+        chat_server
+            .send(UpdateMemberHostFlag(MeetingHostChangePayload {
+                room_id: room.to_string(),
+                user_id: target.to_string(),
+                is_host: true,
+            }))
+            .await
+            .expect("promote-P fanout should succeed");
+
+        // C's transport drops (pending departure), then RECONNECTS with the same
+        // instance_id and the STALE pre-demotion token (is_host=true).
+        chat_server
+            .send(Disconnect {
+                session: c_session_1,
+                room: room.to_string(),
+                user_id: creator.to_string(),
+                display_name: creator.to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect C should succeed");
+
+        let c_session_2 = 9_702u64;
+        chat_server
+            .send(Connect {
+                id: c_session_2,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Reconnect Connect C should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: c_session_2,
+                room: room.to_string(),
+                user_id: creator.to_string(),
+                display_name: creator.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("c-iid".to_string()), // same instance → reconnection
+                is_host: true,                          // STALE pre-demotion claim
+                end_on_host_leave: true,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("Reconnect JoinRoom C should deliver")
+            .expect("Reconnect JoinRoom C should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: c_session_2,
+            })
+            .await
+            .expect("Activate reconnected C should succeed");
+
+        // Subscribe AFTER the reconnect but BEFORE P leaves so we capture the
+        // broadcast; small sleep lets the subscription propagate.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("subscribe system subject");
+        sleep(Duration::from_millis(200)).await;
+
+        // The REAL host (P) leaves. The relay's `Leave` handler resolves is_host
+        // from room_members (P=true); the only remaining member is reconnected C.
+        // With the fix C is is_host=false → last host left → MEETING_ENDED.
+        chat_server
+            .send(Leave {
+                session: p_session,
+                room: room.to_string(),
+                user_id: target.to_string(),
+            })
+            .await
+            .expect("Leave P should succeed");
+
+        let (saw_ended, _saw_left) =
+            collect_meeting_events(&mut system_sub, Duration::from_secs(3)).await;
+        assert!(
+            saw_ended,
+            "MEETING_ENDED must fire when the real host leaves; a demoted ex-host \
+             reconnecting with a stale token must not phantom-block the end (#1241)"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────
