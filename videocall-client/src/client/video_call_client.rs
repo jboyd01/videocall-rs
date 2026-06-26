@@ -25,7 +25,9 @@ use super::layer_preference_sender::LayerPreferenceSender;
 use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
-use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
+use crate::decode::layer_chooser::{
+    PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint,
+};
 use crate::decode::peer_decode_manager::{PeerDecodeError, PeerDeviceInfo, PeerReceiveDiag};
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
@@ -1200,6 +1202,22 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
             .peer_decode_manager
             .seed_early_congestion_for_connected_peers(now_ms, &bounds);
 
+        // #1256: the seed helpers write the decode guard LID-UNAWARE (they fold the
+        // user `bounds` but not the size lid). Re-lid the guards so guard == the
+        // lid-aware wire `current_desired_preferences` is about to publish — otherwise
+        // a small-capped peer whose chooser the seed flips to L1 would have guard=L1
+        // / wire=L0 and freeze until the next 5s tick. apply_size_lid_to_decode_guards
+        // only LOWERS to the lid (never undoes the seed's congestion step below it),
+        // calls no choose(), and returns visibility-gated up-switches to keyframe.
+        let up = inner
+            .peer_decode_manager
+            .apply_size_lid_to_decode_guards(now_ms, &bounds);
+        for (user_id, sid, mt) in &up {
+            inner
+                .peer_decode_manager
+                .send_keyframe_request(user_id, *sid, *mt);
+        }
+
         // Publish the resulting desired map through the existing sender so
         // dedup/rate-limit invariants hold. The map is clamped to the user's
         // bounds and gated to layers below each kind's highest-available, mirroring
@@ -2223,6 +2241,87 @@ impl VideoCallClient {
         }
     }
 
+    /// Push the per-peer rendered-tile-size hints (issue #1256 Phase 1). Keyed by
+    /// session_id; `TileHint::Capped { device_px_h }` lets the receiver LID the
+    /// requested simulcast layer to the smallest layer covering the tile,
+    /// `TileHint::Uncapped` (or an absent peer) applies no lid. Applies IMMEDIATELY:
+    /// it lowers/raises each peer's decode guard via
+    /// [`PeerDecodeManager::apply_size_lid_to_decode_guards`] (which composes the lid
+    /// with the chooser's EXISTING pick — it does NOT call `choose()`), requests a
+    /// keyframe on any up-switch, and re-sends the (now-lidded) LAYER_PREFERENCE via
+    /// the READ-ONLY [`PeerDecodeManager::current_desired_preferences`] path — so a
+    /// tile-size change takes effect without waiting for the next monitor tick.
+    /// AUDIO is never size-capped. No wire/protobuf/relay change — the lid rides the
+    /// existing per-receiver LAYER_PREFERENCE clamp seam.
+    ///
+    /// Why NOT `tick_layer_choosers` here (issue #1256 resize-cadence fix): the UI
+    /// pushes this on EVERY render off the RAW (un-debounced) resize listener, so a
+    /// resize drag produces ~10-100 pushes within ONE ~1s loss window. The chooser's
+    /// `choose()` DOWN path has no dwell gate — it steps down ONE rung per call, fed
+    /// the SAME congested `last_video_downlink` sample (only overwritten on ~1s
+    /// rollover) — so routing this through the tick would over-collapse an
+    /// already-congested receiver (2 calls flatten a 3-layer stream to base) and bank
+    /// the sticky latch + churn the clean-window counters far faster than the intended
+    /// 5s cadence, then pay the ~15s-per-rung climb-back. The guard-apply path advances
+    /// NO chooser hysteresis, so it is idempotent: N calls in one window re-assert the
+    /// SAME lid against the SAME chooser state, never compounding. The 5s monitor tick
+    /// still owns `choose()`-driven adaptation AND its own lid fold + keyframe-on-
+    /// up-switch (unchanged). `set_receive_layer_bounds` keeps using `tick_layer_choosers`
+    /// because it is human-CLICK-paced (not a continuous drag), so it is not the same risk.
+    ///
+    /// Returns `true` when the inner borrow SUCCEEDED: the hint was applied to the
+    /// decode guards and a preference publish was ATTEMPTED. The publish itself may
+    /// have been a no-op or rate-limited by `take_if_changed` (the 200ms
+    /// `LAYER_PREFERENCE_MIN_UPDATE_MS` limiter), in which case the wire re-syncs on
+    /// the next monitor tick — `true` does NOT guarantee a packet went out, only that
+    /// the guard was lidded and the publish path ran. Returns `false` ONLY when the
+    /// inner borrow was CONTENDED (a `try_borrow_mut` conflict) and nothing was
+    /// applied. The UI dedup MUST only record the hint map as delivered when this
+    /// returns `true`, so a dropped push is retried on the next render instead of
+    /// stranding a stale size cap (issue #1256 — a resize-to-small that loses the
+    /// borrow race would otherwise keep pulling the high layer indefinitely).
+    pub fn set_peer_tile_hints(&self, hints: std::collections::HashMap<u64, TileHint>) -> bool {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.peer_decode_manager.set_peer_tile_hints(hints);
+            let now_ms = js_sys::Date::now() as u64;
+            let bounds = inner.receive_layer_bounds;
+            // #1256 resize-cadence fix: apply the lid to the decode guards WITHOUT
+            // calling choose() (no congestion down-step / sticky banking on a resize
+            // drag's N pushes). The 5s monitor tick still owns choose()-driven
+            // adaptation AND its own lid fold + keyframe-on-up-switch (unchanged).
+            let up_switches = inner
+                .peer_decode_manager
+                .apply_size_lid_to_decode_guards(now_ms, &bounds);
+            // Drain keyframe requests AFTER the &mut peer loop (the manager method
+            // already returned owned (user_id, sid, media_type) tuples, ending its
+            // &mut borrow; send_keyframe_request takes &self on the manager). Mirrors
+            // the drain in tick_layer_choosers.
+            for (user_id, sid, mt) in &up_switches {
+                inner
+                    .peer_decode_manager
+                    .send_keyframe_request(user_id, *sid, *mt);
+            }
+            // Publish the (lid-aware, durable) preference via the READ-ONLY path so the
+            // wire cap survives the early-seed/congestion republishers (P1) — and so
+            // this push advances NO chooser hysteresis.
+            let desired = inner
+                .peer_decode_manager
+                .current_desired_preferences(now_ms, &bounds);
+            if let Some(entries) = inner
+                .layer_preference_sender
+                .take_if_changed(&desired, now_ms)
+            {
+                let user_id = inner.options.user_id.clone();
+                let cc = inner.connection_controller.clone();
+                send_layer_preference_via(&cc, &user_id, entries);
+            }
+            true
+        } else {
+            warn!("set_peer_tile_hints: inner busy, hints not applied this call");
+            false
+        }
+    }
+
     /// Lower this client's RECEIVED simulcast layer preferences in response to
     /// LOCAL CPU/render pressure (Stage 1 of the #1562 decode-pressure cascade).
     /// Called from the decode-budget loop on a Down edge. Composes with the relay
@@ -3127,6 +3226,16 @@ impl Inner {
         let seeded = self
             .peer_decode_manager
             .seed_downlink_congestion_for_connected_peers(now_ms, &bounds, exempt_speakers);
+        // #1256: re-lid the guards so guard == the lid-aware wire before publish
+        // (see the early-seed timer for the rationale). Only lowers to the lid; no
+        // choose(); returns visibility-gated up-switches to keyframe.
+        let up = self
+            .peer_decode_manager
+            .apply_size_lid_to_decode_guards(now_ms, &bounds);
+        for (user_id, sid, mt) in &up {
+            self.peer_decode_manager
+                .send_keyframe_request(user_id, *sid, *mt);
+        }
         // Publish the resulting (possibly held) preference via the existing
         // change-detected sender, exactly as `set_receive_layer_bounds` does.
         let desired = self
@@ -4524,6 +4633,41 @@ mod disconnect_tests {
         assert!(
             !inner.peer_decode_manager.has_send_packet_callback(),
             "send_packet must be cleared after disconnect()"
+        );
+    }
+
+    /// #1256: set_peer_tile_hints must return `false` when `inner` is already borrowed
+    /// (the push is dropped on contention) and `true` on a clean apply. The UI dedup
+    /// keys off this to retry a dropped push instead of stranding a stale size cap.
+    ///
+    /// MUTATION: making the method always return `true` (or dropping the `else { false }`)
+    /// breaks the contended-false assertion; making it always return `false` breaks the
+    /// clean-true assertion.
+    #[wasm_bindgen_test]
+    fn set_peer_tile_hints_returns_false_when_inner_borrowed() {
+        use crate::decode::layer_chooser::TileHint;
+        use std::collections::HashMap;
+        let client = VideoCallClient::new(build_test_options());
+        let hints: HashMap<u64, TileHint> =
+            HashMap::from([(1u64, TileHint::Capped { device_px_h: 360 })]);
+        // Clean apply: no outstanding borrow -> true.
+        assert!(
+            client.set_peer_tile_hints(hints.clone()),
+            "set_peer_tile_hints must return true when it applies the push"
+        );
+        // Contended: hold a live mutable borrow on `inner` so the internal try_borrow_mut
+        // fails -> the push is dropped and the method returns false.
+        {
+            let _guard = client.inner.borrow_mut();
+            assert!(
+                !client.set_peer_tile_hints(hints.clone()),
+                "set_peer_tile_hints must return false when inner is already borrowed (push dropped)"
+            );
+        }
+        // After the guard drops, a fresh call applies again -> true (the drop was transient).
+        assert!(
+            client.set_peer_tile_hints(hints),
+            "set_peer_tile_hints must return true again once the borrow is released"
         );
     }
 }
