@@ -4358,6 +4358,7 @@ impl Handler<JoinRoom> for ChatServer {
                                 &msg,
                                 parsed.as_ref(),
                                 &room_clone,
+                                &self_subject,
                                 session_clone,
                                 &server_addr,
                             );
@@ -4845,23 +4846,70 @@ fn try_intercept_layer_preference(
 /// carries no "intercepted" bool precisely so a future edit cannot accidentally
 /// turn it into a `continue` that would suppress the client broadcast.
 ///
-/// Gating mirrors `try_intercept_participant_list_request`: `.system` subject,
-/// `parsed` Some, `PacketType::MEETING`, `user_id == SYSTEM_USER_ID`, parseable
-/// `MeetingPacket`, and a JOINED/LEFT event type (anything else returns). A
-/// self-origin event (`session_id == own_session`) is ignored — a pod hears its
+/// Gating accepts presence on EITHER of the two subjects that can carry a
+/// server-authored PARTICIPANT_JOINED/LEFT: the room broadcast
+/// `room.{room}.system` (activation + 2+ requester waves), OR this receiver's own
+/// subject `room.{room}.{self}` == `self_subject` — the targeted re-announce a
+/// remote peer UNICASTS to a lone joiner (#1202 catch-up,
+/// `SessionManager::rebroadcast_publication`'s `Some(requester)` arm). The gate
+/// was originally `.system`-only; that dropped the unicast re-announce, so a
+/// publisher that joined AFTER its viewers were already Active never mirrored them
+/// → empty receiver union → base-pinned LAYER_HINT (#1202 publisher-LAST bug).
+/// Everything after the subject gate is identical to
+/// `try_intercept_participant_list_request`: `parsed` Some, `PacketType::MEETING`,
+/// `user_id == SYSTEM_USER_ID`, parseable `MeetingPacket`, and a JOINED/LEFT event
+/// type (anything else returns).
+///
+/// SECURITY: the authenticity boundary is NOT the subject gate. It is (a) ingress
+/// `classify_packet` DROPPING every client-authored `PacketType::MEETING` packet
+/// so a client cannot inject a PARTICIPANT_JOINED onto NATS at all, and (b) clients
+/// can only publish to `room.{room}.{their-own-session}`. A PARTICIPANT_JOINED with
+/// `user_id == SYSTEM_USER_ID` is therefore server-authored on ANY subject, so
+/// observing the unicast subject does NOT widen the attack surface — the
+/// `PacketType::MEETING` + `SYSTEM_USER_ID` checks below are the real locks, and the
+/// subject gate is only a cheap pre-filter. If you weaken either of those locks,
+/// this subject widening becomes load-bearing.
+///
+/// A self-origin event (`session_id == own_session`) is ignored — a pod hears its
 /// own broadcasts on `.system` and must not mirror its own sessions as remote.
 /// `target_user_id` (the user id) and `display_name` are strict-UTF-8 decoded
 /// exactly like `try_intercept_display_name_change`; non-UTF-8 logs and returns.
 ///
 /// `parsed` is the `PacketWrapper` decoded once per packet in the NATS loop.
+/// `self_subject` is this receiver's own publish subject
+/// (`room.{room}.{session}`), supplied by the NATS loop.
 fn observe_participant_presence(
     msg: &async_nats::Message,
     parsed: Option<&PacketWrapper>,
     room: &str,
+    self_subject: &str,
     own_session: SessionId,
     server: &Addr<ChatServer>,
 ) {
-    if !msg.subject.ends_with(".system") {
+    // SUBJECT GATE — cheap first filter. Accept presence ONLY on the two
+    // subjects that can carry a server-authored PARTICIPANT_JOINED/LEFT:
+    //   - `room.{room}.system`        : the room broadcast (activation + waves)
+    //   - `room.{room}.{self}`        : the targeted re-announce a remote peer
+    //                                    UNICASTS to a lone joiner (#1202 catch-up,
+    //                                    SessionManager::rebroadcast_publication
+    //                                    `Some(requester)` arm). The `.system`-only
+    //                                    gate dropped this, so a publisher that
+    //                                    joined AFTER its viewers were already Active
+    //                                    never mirrored them → empty receiver union
+    //                                    → base-pinned LAYER_HINT.
+    // Media frames arrive on `room.{room}.{other}` and are rejected here.
+    //
+    // SECURITY — the trust boundary is NOT this subject gate; it is the
+    // combination of (a) ingress `classify_packet` DROPPING every
+    // client-authored `PacketType::MEETING` packet so a client cannot inject a
+    // MEETING/PARTICIPANT_JOINED onto NATS at all, and (b) clients can only
+    // publish to `room.{room}.{their-own-session}`. A PARTICIPANT_JOINED with
+    // `user_id == SYSTEM_USER_ID` is therefore server-authored on ANY subject, so
+    // observing the unicast subject does NOT widen the attack surface. The
+    // packet_type + SYSTEM_USER_ID gates below are the real authenticity checks;
+    // this subject gate is only a cheap pre-filter. If you weaken either of those
+    // locks, this widening becomes load-bearing.
+    if !(msg.subject.ends_with(".system") || msg.subject.as_str() == self_subject) {
         return;
     }
 
@@ -11628,6 +11676,131 @@ mod tests {
             union, MID,
             "Stage-B union must include the mirrored remote receiver's MID cap (1); a local-only \
              revert makes R invisible → empty receiver set → 0"
+        );
+    }
+
+    /// (A) SUBJECT ROUTING — the publisher-LAST catch-up bug (#1202 follow-up).
+    ///
+    /// Unlike the four `MirrorRemoteMembership`-injecting tests above (which inject
+    /// the mirror message DIRECTLY and so cannot see a subject-routing miss), this
+    /// drives the PRODUCTION `observe_participant_presence` tap with the REAL
+    /// unicast re-announce that `SessionManager::rebroadcast_publication`'s
+    /// `Some(requester)` arm emits — i.e. a PARTICIPANT_JOINED addressed to
+    /// `room.{room}.{publisher}` (the publisher's own `self_subject`), NOT
+    /// `.system`. A publisher P that joined AFTER its remote viewer R was already
+    /// Active learns about R only via this unicast catch-up. With the widened
+    /// subject gate, the tap observes it → mirrors R as a Remote row → R's MID cap
+    /// caps P's receiver union. On revert to the `.system`-only gate, the unicast
+    /// subject is dropped, R is never mirrored, and the union is empty → 0 ≠ MID.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_mirror_unicast_reannounce_observed_caps_union_stage_a() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-1202-stage-a-unicast-reannounce";
+        let p: SessionId = 5401; // LOCAL publisher that joined LAST
+        let r: SessionId = 5402; // REMOTE receiver (other relay binary), already Active
+        const MID: u32 = 1; // a non-base, non-sentinel layer
+
+        // The publisher's own publish subject — exactly the subject a remote peer
+        // unicasts the catch-up PARTICIPANT_JOINED to (the `Some(requester)` arm).
+        let self_subject = format!("room.{room}.{p}").replace(' ', "_");
+
+        chat.send(TestSetMembershipMirrorEnabled(true))
+            .await
+            .expect("set flag");
+
+        // Seed the LOCAL publisher P (Active local row) so the union has a source.
+        chat.send(TestSeedActiveMember {
+            session: p,
+            room: room.to_string(),
+            user_id: "p@example.com".to_string(),
+            display_name: "P".to_string(),
+        })
+        .await
+        .expect("seed P");
+
+        // Build the REAL unicast re-announce R's remote pod would emit for R, with
+        // P as the lone requester. This exercises the production subject format and
+        // packet bytes — NOT a hand-rolled message.
+        let (subject, bytes) = SessionManager::rebroadcast_publication(
+            room,
+            "r@example.com",
+            "R",
+            r,       // responder_session (the remote receiver)
+            false,   // is_guest
+            true,    // responder_is_active
+            Some(p), // unicast to the lone requester P
+        )
+        .expect("rebroadcast_publication should produce a unicast re-announce");
+
+        // The unicast subject MUST equal the publisher's own self_subject — the
+        // exact subject the `.system`-only gate dropped.
+        assert_eq!(
+            subject, self_subject,
+            "the unicast re-announce must be addressed to the publisher's own subject \
+             (room.{{room}}.{{publisher}}), which is NOT a `.system` subject"
+        );
+
+        // Synthesize the `async_nats::Message` the relay's NATS loop would receive
+        // on the publisher's subscription, and parse the wrapper exactly as the
+        // loop does (single decode, shared with every consumer).
+        let msg = make_nats_message(&subject, bytes);
+        let parsed = parse_pw(&msg);
+
+        // Drive the PRODUCTION tap with the publisher's own session + self_subject.
+        // It fire-and-forgets a `MirrorRemoteMembership` to the server; the JOIN
+        // handler runs only because the mirror flag is ON (flipped above).
+        observe_participant_presence(&msg, parsed.as_ref(), room, &self_subject, p, &chat);
+
+        // `do_send` is fire-and-forget; a subsequent `.send().await` round-trips
+        // through the same mailbox, guaranteeing the MirrorRemoteMembership JOIN
+        // (and its coalesced recompute) has been processed before we seed prefs.
+        // (GetRoomMembers is a cheap, side-effect-free flush message.)
+        let members = chat
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers flush");
+        assert!(
+            members.iter().any(|m| m.session == r),
+            "the unicast re-announce must have mirrored R as a remote row; on a \
+             `.system`-only gate revert R is never observed and this is empty"
+        );
+
+        // Cap R's preference for P's VIDEO (kind=1) to MID so the cap is observable
+        // (mirrors the Stage-B test ordering: mirror-observe BEFORE pref seed).
+        chat.send(TestSeedPrefAndRecompute {
+            room: room.to_string(),
+            receiver: r,
+            source: p,
+            kind: 1,
+            desired: Some(MID),
+        })
+        .await
+        .expect("cap R");
+
+        // With R observed via the unicast tap, the union over P's receivers == R's
+        // MID cap. On a `.system`-only gate revert R is invisible → empty receiver
+        // set after skipping the source → 0.
+        let union = chat
+            .send(TestMaxRequestedLayer {
+                room: room.to_string(),
+                source: p,
+                kind: 1,
+            })
+            .await
+            .expect("max_requested_layer");
+        assert_eq!(
+            union, MID,
+            "Stage-A union must include the remote receiver R that was mirrored via the \
+             UNICAST catch-up re-announce; a `.system`-only subject-gate revert drops that \
+             unicast → R never mirrored → empty receiver set → 0"
         );
     }
 
