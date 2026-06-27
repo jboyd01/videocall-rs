@@ -379,6 +379,26 @@ struct PendingDepartureState {
     was_active: bool,
 }
 
+/// Origin of a [`RoomMemberInfo`] row (issue #1202).
+///
+/// The relay runs as two binaries (ws + wt), each a separate `ChatServer` actor
+/// sharing one NATS bus, and each holds only its LOCAL slice of `room_members`.
+/// A `Local` row is one this actor seeded itself at `JoinRoom` — a real session
+/// it owns end-to-end (subscription, prefs, teardown). A `Remote` row is an
+/// INERT roster observer mirrored from the OTHER relay binary's PARTICIPANT_
+/// JOINED broadcast (Stage A). Remote rows participate ONLY in the Stage-B
+/// layer-union computation; every other decision site filters to `Local` so the
+/// presence of a remote row never alters teardown, host-leave, DB mark-left, or
+/// announce behaviour. Defaults to `Local` so every existing constructor (the
+/// `JoinRoom` add-site and all test seeds) keeps producing local rows with no
+/// code change — `Remote` is created ONLY by the mirror handler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MemberOrigin {
+    #[default]
+    Local,
+    Remote,
+}
+
 /// Information about a room member tracked by the ChatServer.
 #[derive(Clone, Debug)]
 struct RoomMemberInfo {
@@ -386,6 +406,9 @@ struct RoomMemberInfo {
     user_id: String,
     display_name: String,
     is_host: bool,
+    /// Whether this row was seeded locally (`JoinRoom`) or mirrored from the
+    /// other relay binary over NATS (issue #1202). See [`MemberOrigin`].
+    origin: MemberOrigin,
     /// **Note:** this field is captured from the JWT at JoinRoom time and is
     /// retained for backward compatibility with [`Disconnect`] / [`Leave`]
     /// handlers that still propagate the per-session value. It can become
@@ -736,6 +759,33 @@ struct RecomputeLayerHints {
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct FlushPendingRecomputes;
+
+/// Whether a mirrored cross-instance presence event is a JOIN or a LEFT (#1202).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirrorEvent {
+    Join,
+    Left,
+}
+
+/// Cross-instance membership-mirror command (issue #1202).
+///
+/// Built by [`observe_participant_presence`] when this relay binary observes a
+/// PARTICIPANT_JOINED / PARTICIPANT_LEFT on a room's `.system` subject that was
+/// published by the OTHER relay binary (a session this actor does NOT own). The
+/// handler maintains an INERT `origin: Remote` row in `room_members` so the
+/// Stage-B layer union can see cross-pod receivers. It touches `room_members`
+/// ONLY — never `sessions`, `active_subs`, `connection_states`, the instance
+/// index, prefs, or pending departures — and never publishes PARTICIPANT_LEFT
+/// or a DB mark-left. See the `MemberOrigin` doc for the inertness invariant.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct MirrorRemoteMembership {
+    room: String,
+    session: SessionId,
+    user_id: String,
+    display_name: String,
+    event: MirrorEvent,
+}
 
 /// Trailing-debounce flush for coalesced cross-server presence re-announces.
 ///
@@ -1158,6 +1208,18 @@ pub struct ChatServer {
     /// debounce trailing — it dedups the whole wave rather than firing per
     /// request. Cancelled in [`Actor::stopping`] so no `SpawnHandle` leaks.
     rebroadcast_coalesce_handle: Option<SpawnHandle>,
+    /// Cross-instance membership mirror master switch (issue #1202). Read ONCE
+    /// from the `MEMBERSHIP_MIRROR_ENABLED` env var at actor construction and
+    /// never mutated at runtime (except via the `#[cfg(test)]`
+    /// `TestSetMembershipMirrorEnabled` seam). When `false` (the default) the
+    /// relay behaves byte-for-byte as it did before #1202: the `.system`
+    /// presence tap never observes, the `MirrorRemoteMembership` handler
+    /// short-circuits, and the Stage-B layer union reads only LOCAL rows. When
+    /// `true`, remote PARTICIPANT_JOINED/LEFT are mirrored as inert `Remote`
+    /// rows (Stage A) and those rows count toward the layer union (Stage B) so a
+    /// publisher whose receivers are all on the other relay binary fail-opens to
+    /// the full ladder instead of being base-pinned.
+    membership_mirror_enabled: bool,
 }
 
 impl ChatServer {
@@ -1184,6 +1246,12 @@ impl ChatServer {
             layer_hint_recheck_handles: HashMap::new(),
             pending_rebroadcasts: HashMap::new(),
             rebroadcast_coalesce_handle: None,
+            // #1202: OFF unless explicitly enabled (`1`/`true`, case-insensitive).
+            // Read once here; the flag gates both the Stage-A mirror tap/handler
+            // and the Stage-B union inclusion. Default OFF = today's behavior.
+            membership_mirror_enabled: std::env::var("MEMBERSHIP_MIRROR_ENABLED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 
@@ -1286,12 +1354,25 @@ impl ChatServer {
         // when a remaining same-user session is found.
         let mut user_still_present = false;
         if let Some(room_id) = room {
-            if let Some(members) = self.room_members.get_mut(room_id) {
-                members.retain(|m| m.session != *session_id);
-                room_became_empty = members.is_empty();
-                was_last_host = was_last_present_host(members, is_host);
+            if self.room_members.contains_key(room_id) {
+                // Remove the departing session FIRST (a write; session ids are
+                // globally unique so this can never match a mirrored Remote row).
+                if let Some(members) = self.room_members.get_mut(room_id) {
+                    members.retain(|m| m.session != *session_id);
+                }
+                // c1/c2/c3 (#1202): these reads must see ONLY local-origin rows —
+                // a mirrored Remote row from the other relay binary must never
+                // suppress teardown (c1), flip the host-leave decision (c2), or
+                // suppress the per-user DB mark-left (c3). All three route through
+                // the `local_members`/`local_is_empty` chokepoint so "filter to
+                // Local" is the centralized default, not a per-site choice. c2/c3
+                // keep their `&[RoomMemberInfo]` helper signatures (the production
+                // fns called here) fed the local-only slice via `.collect()`.
+                room_became_empty = self.local_is_empty(room_id);
+                let local: Vec<RoomMemberInfo> = self.local_members(room_id).cloned().collect();
+                was_last_host = was_last_present_host(&local, is_host);
                 if let Some(departing_uid) = user_id {
-                    user_still_present = user_has_remaining_session(members, departing_uid);
+                    user_still_present = user_has_remaining_session(&local, departing_uid);
                 }
             } else {
                 was_last_host = is_host;
@@ -1640,21 +1721,52 @@ impl ChatServer {
     /// JoinRoom (the `UpdateRoomPolicy` handler accepts events for empty
     /// rooms). Wiping the legitimately-cached policy in that window would be
     /// a regression, so the helper is a no-op for the "no entry" case.
+    /// Iterator over only the LOCAL-origin members of `room` (issue #1202).
+    ///
+    /// The single chokepoint feeding every category-(c) read (teardown / empty /
+    /// host-leave / DB-write / announce): a mirrored `Remote` row is an inert
+    /// roster observer that must never influence these decisions. A missing room
+    /// entry yields an empty iterator.
+    fn local_members(&self, room: &str) -> impl Iterator<Item = &RoomMemberInfo> {
+        self.room_members
+            .get(room)
+            .into_iter()
+            .flatten()
+            .filter(|m| m.origin == MemberOrigin::Local)
+    }
+
+    /// Whether `room` has NO LOCAL-origin members (issue #1202).
+    ///
+    /// The single source of truth for "is this room locally drained?", replacing
+    /// the bare `members.is_empty()` reads at the teardown sites (`leave_rooms`
+    /// c1, `forget_room_if_empty` c4, `forget_session` c5, `ExecutePendingDeparture`
+    /// c6). A missing room entry counts as empty. A room that still holds only
+    /// `Remote` rows is LOCALLY empty here — so teardown/became-empty fires and a
+    /// stranded remote row never wedges the meeting active.
+    fn local_is_empty(&self, room: &str) -> bool {
+        self.room_members
+            .get(room)
+            .is_none_or(|members| !members.iter().any(|m| m.origin == MemberOrigin::Local))
+    }
+
     fn forget_room_if_empty(&mut self, room: &str) {
-        if let Some(members) = self.room_members.get(room) {
-            if members.is_empty() {
-                self.room_members.remove(room);
-                self.room_policy.remove(room);
-                // Bound room-labeled relay series to LIVE rooms (issue #996):
-                // remove every `{room=...}` CounterVec/GaugeVec series for this
-                // drained room (was previously just the #988 viewport gauge).
-                // CounterVec series otherwise persist for the process lifetime,
-                // so each distinct meeting would leak a permanent series. We
-                // keep the `room` label (the meeting-investigation dashboard and
-                // RelayPacketDrops alert depend on it) and instead expire it on
-                // room drain — see `metrics::forget_room_metrics`.
-                crate::metrics::forget_room_metrics(room);
-            }
+        // c4 (#1202): keep the outer `get(room)` guard so a room with NO entry is
+        // still a no-op, but flip the inner emptiness test to LOCAL-only via the
+        // centralized `local_is_empty` accessor — a room holding only mirrored
+        // Remote rows must still be GC'd (the same predicate is the single source
+        // of truth in `local_is_empty`).
+        if self.room_members.contains_key(room) && self.local_is_empty(room) {
+            self.room_members.remove(room);
+            self.room_policy.remove(room);
+            // Bound room-labeled relay series to LIVE rooms (issue #996):
+            // remove every `{room=...}` CounterVec/GaugeVec series for this
+            // drained room (was previously just the #988 viewport gauge).
+            // CounterVec series otherwise persist for the process lifetime,
+            // so each distinct meeting would leak a permanent series. We
+            // keep the `room` label (the meeting-investigation dashboard and
+            // RelayPacketDrops alert depend on it) and instead expire it on
+            // room drain — see `metrics::forget_room_metrics`.
+            crate::metrics::forget_room_metrics(room);
         }
     }
 
@@ -1686,7 +1798,10 @@ impl ChatServer {
         let mut room_still_populated = false;
         if let Some(members) = self.room_members.get_mut(room) {
             members.retain(|m| m.session != session_id);
-            if members.is_empty() {
+            // c5 (#1202): LOCAL-only emptiness — a room left holding only mirrored
+            // Remote rows is locally drained and must still GC (inline form; the
+            // SAME predicate is centralized in `ChatServer::local_is_empty`).
+            if !members.iter().any(|m| m.origin == MemberOrigin::Local) {
                 self.room_members.remove(room);
                 // Mirror forget_room_if_empty: release ALL per-room relay series
                 // so the eviction teardown path also cannot leak room-labeled
@@ -1782,7 +1897,21 @@ impl ChatServer {
             // Unknown room → no actionable union; fail-open.
             return LAYER_HINT_FULL_LADDER_SENTINEL;
         };
-        let receiver_ids: Vec<SessionId> = members.iter().map(|m| m.session).collect();
+        // Stage B (#1202, site #1): when the mirror is ON, INCLUDE remote rows in
+        // the receiver union so a publisher whose receivers are all on the other
+        // relay binary sees them (a mirrored remote row has no local
+        // `session_layer_prefs` entry → `compute_max_requested_layer`'s `None` arm
+        // → full-ladder fail-open). When OFF, count only local rows — byte-for-byte
+        // today's behavior.
+        let receiver_ids: Vec<SessionId> = if self.membership_mirror_enabled {
+            members.iter().map(|m| m.session).collect()
+        } else {
+            members
+                .iter()
+                .filter(|m| m.origin == MemberOrigin::Local)
+                .map(|m| m.session)
+                .collect()
+        };
         compute_max_requested_layer(&receiver_ids, &self.session_layer_prefs, source, kind)
     }
 
@@ -1805,10 +1934,17 @@ impl ChatServer {
         // Only emit hints for a source that is an actual current publisher in the
         // room. If it has already left (no member row), there is nothing to hint
         // and its debounce state was/will be reaped by the teardown path.
-        let is_member = self
-            .room_members
-            .get(room)
-            .is_some_and(|members| members.iter().any(|m| m.session == source));
+        //
+        // Stage B (#1202, site #2): when the mirror is ON, a REMOTE row counts as
+        // a member so a remote PUBLISHER's hint is still emitted (and crosses back
+        // over NATS to it). When OFF, only a local row makes `source` a member —
+        // byte-for-byte today's behavior.
+        let is_member = self.room_members.get(room).is_some_and(|members| {
+            members.iter().any(|m| {
+                m.session == source
+                    && (self.membership_mirror_enabled || m.origin == MemberOrigin::Local)
+            })
+        });
         if !is_member {
             return;
         }
@@ -2076,6 +2212,28 @@ impl ChatServer {
     /// [`crate::metrics::forget_room_metrics`] at drain time.
     fn sweep_layer_preference_gauge(&self) {
         for (room, members) in &self.room_members {
+            // #1202: SET the cross-instance divergence gauge = count of mirrored
+            // remote-origin rows in this room. >0 means this room is split across
+            // the ws/wt relay binaries. SET (not inc) per live room each sweep so
+            // a room that lost its remote rows reads 0; drained rooms stop being
+            // iterated and their series is removed by `forget_room_metrics`.
+            //
+            // Gated on the master switch so that with the mirror OFF (the default)
+            // this emits NO new series at all — keeping "default OFF == today's
+            // behavior" byte-for-byte. When OFF no Remote row can ever exist, so
+            // the gauge would only ever read 0 anyway; skipping the SET avoids one
+            // always-zero series per room on the disabled path.
+            if self.membership_mirror_enabled {
+                crate::metrics::RELAY_ROOM_MEMBERSHIP_DIVERGENCE
+                    .with_label_values(&[room])
+                    .set(
+                        members
+                            .iter()
+                            .filter(|m| m.origin == MemberOrigin::Remote)
+                            .count() as f64,
+                    );
+            }
+
             // Tally counts: [kind_idx][bucket_idx]. Indexed parallel to
             // LAYER_PREFERENCE_GAUGE_KINDS and RELAY_LAYER_ID_BUCKETS.
             let mut counts =
@@ -2881,6 +3039,7 @@ impl Handler<TestSeedActiveMember> for ChatServer {
                 display_name: msg.display_name,
                 is_host: false,
                 end_on_host_leave: false,
+                origin: MemberOrigin::Local,
             });
         self.connection_states
             .insert(msg.session, ConnectionState::Active);
@@ -3033,13 +3192,113 @@ impl Handler<RecomputeLayerHints> for ChatServer {
                 // Room-wide recompute: snapshot the current publisher sessions so
                 // we are not holding an immutable borrow of `room_members` while
                 // `recompute_layer_hints_for_source` mutates `layer_hint_state`.
+                //
+                // Stage B (#1202, site #3): when the mirror is ON, include remote
+                // rows so a remote PUBLISHER is also recomputed (its hint crosses
+                // back over NATS). When OFF, only local rows — today's behavior.
                 let sources: Vec<SessionId> = match self.room_members.get(&msg.room) {
-                    Some(members) => members.iter().map(|m| m.session).collect(),
+                    Some(members) => {
+                        if self.membership_mirror_enabled {
+                            members.iter().map(|m| m.session).collect()
+                        } else {
+                            members
+                                .iter()
+                                .filter(|m| m.origin == MemberOrigin::Local)
+                                .map(|m| m.session)
+                                .collect()
+                        }
+                    }
                     None => return,
                 };
                 for source in sources {
                     self.recompute_layer_hints_for_source(&msg.room, source, ctx);
                 }
+            }
+        }
+    }
+}
+
+/// Maintain the inert cross-instance membership mirror (issue #1202, Stage A).
+///
+/// Idempotent + symmetric upsert/remove of an `origin: Remote` row keyed by the
+/// globally-unique `session` id (session_logic.rs). The handler touches
+/// `room_members` ONLY and arms a coalesced room-wide recompute so the Stage-B
+/// union picks up the change. It NEVER inserts into any per-session map, never
+/// activates a subscription, and never publishes PARTICIPANT_LEFT or a DB
+/// mark-left — a Remote row is a passive roster observer.
+impl Handler<MirrorRemoteMembership> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: MirrorRemoteMembership, ctx: &mut Self::Context) -> Self::Result {
+        // Belt-and-suspenders: the tap is already flag-gated (it never emits this
+        // message when OFF), but short-circuit here too so a stray/test-injected
+        // message cannot mutate state while the mirror is disabled. (Tests force
+        // the flag ON via `TestSetMembershipMirrorEnabled` before injecting.)
+        if !self.membership_mirror_enabled {
+            return;
+        }
+
+        // Bound the label/field lengths exactly like UpdateMemberHostFlag /
+        // EvictInstance so a malformed cross-instance event cannot insert an
+        // oversized row. (room is also the metric label.)
+        if msg.room.len() > 256 || msg.user_id.len() > 256 || msg.display_name.len() > 256 {
+            warn!(
+                "MirrorRemoteMembership: oversized field (room={}, user_id={}, display_name={} \
+                 bytes), dropping",
+                msg.room.len(),
+                msg.user_id.len(),
+                msg.display_name.len()
+            );
+            return;
+        }
+
+        match msg.event {
+            MirrorEvent::Join => {
+                // Idempotent + self-origin-safe: if ANY row already exists for
+                // this session (Local OR Remote), no-op. This both dedups repeat
+                // JOINs AND guarantees we never downgrade a Local row to Remote
+                // (a pod hears its OWN sessions' PARTICIPANT_JOINED on `.system`;
+                // the local row already present makes that a no-op).
+                let already_present = self
+                    .room_members
+                    .get(&msg.room)
+                    .is_some_and(|members| members.iter().any(|m| m.session == msg.session));
+                if already_present {
+                    return;
+                }
+                // `entry().or_default()`, NEVER `get_mut`: a locally-drained room
+                // has had its `room_members` entry removed by the local_is_empty
+                // GC, so a remote JOIN must be able to RE-CREATE the entry (the
+                // GC consequence in the design brief).
+                self.room_members
+                    .entry(msg.room.clone())
+                    .or_default()
+                    .push(RoomMemberInfo {
+                        session: msg.session,
+                        user_id: msg.user_id,
+                        display_name: msg.display_name,
+                        // is_host cannot come off the wire; safe because the only
+                        // is_host reader (`was_last_present_host`) is local-only.
+                        is_host: false,
+                        end_on_host_leave: false,
+                        origin: MemberOrigin::Remote,
+                    });
+                self.schedule_coalesced_recompute(&msg.room, ctx);
+            }
+            MirrorEvent::Left => {
+                // Remove ONLY a Remote row for this session — NEVER a Local row.
+                // This makes a spoofed/mis-ordered LEFT for a still-local session
+                // (LEFT-before-JOIN, or a duplicate of our own broadcast) inert.
+                if let Some(members) = self.room_members.get_mut(&msg.room) {
+                    members.retain(|m| {
+                        !(m.session == msg.session && m.origin == MemberOrigin::Remote)
+                    });
+                }
+                self.schedule_coalesced_recompute(&msg.room, ctx);
+                // GC an empty remote-only room (local_is_empty-keyed): without this
+                // a room that drained both its local AND mirrored members would
+                // leave a stale `room_members` entry until the next local event.
+                self.forget_room_if_empty(&msg.room);
             }
         }
     }
@@ -3412,7 +3671,11 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                 let mut room_became_empty = false;
                 if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|m| m.session != session);
-                    room_became_empty = members.is_empty();
+                    // c6 (#1202): LOCAL-only emptiness — a never-activated last
+                    // local member draining the room must fire empty->idle even if
+                    // mirrored Remote rows remain (inline form; SAME predicate
+                    // centralized in `ChatServer::local_is_empty`).
+                    room_became_empty = !members.iter().any(|m| m.origin == MemberOrigin::Local);
                 }
                 // Unlike `leave_rooms` / `forget_session`, this branch does NOT
                 // call `forget_layer_hint_state_for_source`, and deliberately so:
@@ -3753,6 +4016,15 @@ impl Handler<JoinRoom> for ChatServer {
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
+                // c7 (#1202): announce ONLY local-origin peers to the new joiner.
+                // A mirrored Remote row's session lives on the OTHER relay binary;
+                // that binary already announced it to its own clients, and the
+                // PARTICIPANT_LIST_REQUEST published below makes those peers
+                // re-announce cross-relay — so emitting a PARTICIPANT_JOINED for a
+                // Remote row here would double-announce it. This filter ALSO makes
+                // `is_first_in_room` below count LOCAL rows only, so a cross-pod-
+                // only first joiner still triggers MEETING_STARTED.
+                .filter(|m| m.origin == MemberOrigin::Local)
                 .map(|m| {
                     let is_guest = self
                         .session_is_guest
@@ -3769,6 +4041,8 @@ impl Handler<JoinRoom> for ChatServer {
         // True when the room had no non-observer participants before this join.
         // Used to gate the NATS MEETING_STARTED broadcast (the transport actors
         // already send MEETING_STARTED directly to every connecting client).
+        // `existing_members` is local-filtered above (c7), so this correctly
+        // counts LOCAL rows only — a cross-pod-only first joiner is still "first".
         let is_first_in_room = existing_members.is_empty() && !observer;
 
         // Track this session in room_members (only for non-observers)
@@ -3788,6 +4062,8 @@ impl Handler<JoinRoom> for ChatServer {
                     // the prior entry over the (same, possibly stale) JWT seed.
                     is_host: reconnect_is_host.unwrap_or(is_host),
                     end_on_host_leave,
+                    // The sole production add-site: a session this actor owns.
+                    origin: MemberOrigin::Local,
                 });
 
             // Seed the room_policy cache with the JWT-time `end_on_host_leave`
@@ -3850,6 +4126,12 @@ impl Handler<JoinRoom> for ChatServer {
         // inbound actor-mailbox overflow can be attributed to the right
         // transport on `relay_inbound_mailbox_drops_total` (Tier B #2 / #1057).
         let transport_for_loop = transport.clone();
+        // #1202: copy the membership-mirror flag into the loop closure. The flag
+        // lives on `self` (read once at actor construction), but the spawned loop
+        // owns no `&self`, so capture a cheap `Copy` of it here — mirroring how
+        // `transport_for_loop` snapshots a per-loop value before the spawn. When
+        // OFF, the presence tap is skipped entirely (today's behavior).
+        let membership_mirror_for_loop = self.membership_mirror_enabled;
         // #1219 Half 2: the shared receiver-downlink-congestion signal the
         // transport actor writes from `on_outbound_drop`; `handle_msg` reads it
         // to drive emergency layer shedding.
@@ -4063,6 +4345,23 @@ impl Handler<JoinRoom> for ChatServer {
                             &server_addr,
                         ) {
                             continue;
+                        }
+
+                        // #1202 Stage A: OBSERVE PARTICIPANT_JOINED/LEFT and mirror
+                        // cross-instance sessions as inert `Remote` rows. This does
+                        // NOT `continue` — PARTICIPANT_JOINED/LEFT must STILL reach
+                        // clients, so we fall through to `forward(...)` below
+                        // unconditionally. Gated by the per-loop flag copy: when
+                        // OFF this is skipped entirely (today's behavior).
+                        if membership_mirror_for_loop {
+                            observe_participant_presence(
+                                &msg,
+                                parsed.as_ref(),
+                                &room_clone,
+                                &self_subject,
+                                session_clone,
+                                &server_addr,
+                            );
                         }
 
                         if let Err(e) = forward(msg, parsed.as_ref()) {
@@ -4535,6 +4834,141 @@ fn try_intercept_layer_preference(
     // existing map unchanged — fail-open to the prior behaviour.
 
     true
+}
+
+/// OBSERVE (never intercept) a `.system` PARTICIPANT_JOINED / PARTICIPANT_LEFT
+/// and mirror it into `room_members` as an inert `origin: Remote` row when it
+/// originated on the OTHER relay binary (issue #1202, Stage A).
+///
+/// Unlike the `try_intercept_*` consumers, this returns `()` and the caller
+/// falls through to `forward(...)` UNCONDITIONALLY — PARTICIPANT_JOINED/LEFT
+/// MUST still reach clients. It is named `observe_*` (not `try_intercept_*`) and
+/// carries no "intercepted" bool precisely so a future edit cannot accidentally
+/// turn it into a `continue` that would suppress the client broadcast.
+///
+/// Gating accepts presence on EITHER of the two subjects that can carry a
+/// server-authored PARTICIPANT_JOINED/LEFT: the room broadcast
+/// `room.{room}.system` (activation + 2+ requester waves), OR this receiver's own
+/// subject `room.{room}.{self}` == `self_subject` — the targeted re-announce a
+/// remote peer UNICASTS to a lone joiner (#1202 catch-up,
+/// `SessionManager::rebroadcast_publication`'s `Some(requester)` arm). The gate
+/// was originally `.system`-only; that dropped the unicast re-announce, so a
+/// publisher that joined AFTER its viewers were already Active never mirrored them
+/// → empty receiver union → base-pinned LAYER_HINT (#1202 publisher-LAST bug).
+/// Everything after the subject gate is identical to
+/// `try_intercept_participant_list_request`: `parsed` Some, `PacketType::MEETING`,
+/// `user_id == SYSTEM_USER_ID`, parseable `MeetingPacket`, and a JOINED/LEFT event
+/// type (anything else returns).
+///
+/// SECURITY: the authenticity boundary is NOT the subject gate. It is (a) ingress
+/// `classify_packet` DROPPING every client-authored `PacketType::MEETING` packet
+/// so a client cannot inject a PARTICIPANT_JOINED onto NATS at all, and (b) clients
+/// can only publish to `room.{room}.{their-own-session}`. A PARTICIPANT_JOINED with
+/// `user_id == SYSTEM_USER_ID` is therefore server-authored on ANY subject, so
+/// observing the unicast subject does NOT widen the attack surface — the
+/// `PacketType::MEETING` + `SYSTEM_USER_ID` checks below are the real locks, and the
+/// subject gate is only a cheap pre-filter. If you weaken either of those locks,
+/// this subject widening becomes load-bearing.
+///
+/// A self-origin event (`session_id == own_session`) is ignored — a pod hears its
+/// own broadcasts on `.system` and must not mirror its own sessions as remote.
+/// `target_user_id` (the user id) and `display_name` are strict-UTF-8 decoded
+/// exactly like `try_intercept_display_name_change`; non-UTF-8 logs and returns.
+///
+/// `parsed` is the `PacketWrapper` decoded once per packet in the NATS loop.
+/// `self_subject` is this receiver's own publish subject
+/// (`room.{room}.{session}`), supplied by the NATS loop.
+fn observe_participant_presence(
+    msg: &async_nats::Message,
+    parsed: Option<&PacketWrapper>,
+    room: &str,
+    self_subject: &str,
+    own_session: SessionId,
+    server: &Addr<ChatServer>,
+) {
+    // SUBJECT GATE — cheap first filter. Accept presence ONLY on the two
+    // subjects that can carry a server-authored PARTICIPANT_JOINED/LEFT:
+    //   - `room.{room}.system`        : the room broadcast (activation + waves)
+    //   - `room.{room}.{self}`        : the targeted re-announce a remote peer
+    //                                    UNICASTS to a lone joiner (#1202 catch-up,
+    //                                    SessionManager::rebroadcast_publication
+    //                                    `Some(requester)` arm). The `.system`-only
+    //                                    gate dropped this, so a publisher that
+    //                                    joined AFTER its viewers were already Active
+    //                                    never mirrored them → empty receiver union
+    //                                    → base-pinned LAYER_HINT.
+    // Media frames arrive on `room.{room}.{other}` and are rejected here.
+    //
+    // SECURITY — the trust boundary is NOT this subject gate; it is the
+    // combination of (a) ingress `classify_packet` DROPPING every
+    // client-authored `PacketType::MEETING` packet so a client cannot inject a
+    // MEETING/PARTICIPANT_JOINED onto NATS at all, and (b) clients can only
+    // publish to `room.{room}.{their-own-session}`. A PARTICIPANT_JOINED with
+    // `user_id == SYSTEM_USER_ID` is therefore server-authored on ANY subject, so
+    // observing the unicast subject does NOT widen the attack surface. The
+    // packet_type + SYSTEM_USER_ID gates below are the real authenticity checks;
+    // this subject gate is only a cheap pre-filter. If you weaken either of those
+    // locks, this widening becomes load-bearing.
+    if !(msg.subject.ends_with(".system") || msg.subject.as_str() == self_subject) {
+        return;
+    }
+
+    let wrapper = match parsed {
+        Some(w) => w,
+        None => return,
+    };
+
+    if wrapper.packet_type != PacketType::MEETING.into() {
+        return;
+    }
+
+    if wrapper.user_id != SYSTEM_USER_ID.as_bytes() {
+        return;
+    }
+
+    // Parse an OWNED MeetingPacket (not a borrow of `wrapper`) so we can
+    // `std::mem::take` its byte fields for the strict-UTF-8 decode below.
+    let mut inner = match MeetingPacket::parse_from_bytes(&wrapper.data) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let event = if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+        MirrorEvent::Join
+    } else if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+        MirrorEvent::Left
+    } else {
+        return;
+    };
+
+    // Self-origin guard: a pod hears its OWN PARTICIPANT_JOINED/LEFT on `.system`
+    // (it published them). Never mirror our own session in as a remote row.
+    if inner.session_id == own_session {
+        return;
+    }
+
+    let user_id = match String::from_utf8(std::mem::take(&mut inner.target_user_id)) {
+        Ok(s) => s,
+        Err(_) => {
+            warn!("observe_participant_presence: non-UTF-8 target_user_id, dropping mirror event");
+            return;
+        }
+    };
+    let display_name = match String::from_utf8(std::mem::take(&mut inner.display_name)) {
+        Ok(s) => s,
+        Err(_) => {
+            warn!("observe_participant_presence: non-UTF-8 display_name, dropping mirror event");
+            return;
+        }
+    };
+
+    server.do_send(MirrorRemoteMembership {
+        room: room.to_string(),
+        session: inner.session_id,
+        user_id,
+        display_name,
+        event,
+    });
 }
 
 /// Checks whether `msg` is a `PARTICIPANT_LIST_REQUEST` system event.
@@ -9515,6 +9949,46 @@ mod tests {
         }
     }
 
+    /// Force the #1202 membership-mirror flag ON/OFF for a test, deterministically.
+    /// Preferred over the `MEMBERSHIP_MIRROR_ENABLED` env var because tests run in
+    /// parallel and a shared env var is racy. Drives the SAME field the production
+    /// `ChatServer::new` initializes, so the handler/tap/union reads behave exactly
+    /// as in production once flipped.
+    #[derive(ActixMessage)]
+    #[rtype(result = "()")]
+    struct TestSetMembershipMirrorEnabled(bool);
+
+    impl Handler<TestSetMembershipMirrorEnabled> for ChatServer {
+        type Result = ();
+
+        fn handle(
+            &mut self,
+            msg: TestSetMembershipMirrorEnabled,
+            _ctx: &mut Self::Context,
+        ) -> Self::Result {
+            self.membership_mirror_enabled = msg.0;
+        }
+    }
+
+    /// Drive the PRODUCTION `ChatServer::max_requested_layer` (a private `&self`
+    /// fn) so the Stage-B union test exercises the real union computation rather
+    /// than a re-implemented copy. Mirrors `GetRoomMembers`.
+    #[derive(ActixMessage)]
+    #[rtype(result = "u32")]
+    struct TestMaxRequestedLayer {
+        room: String,
+        source: SessionId,
+        kind: i32,
+    }
+
+    impl Handler<TestMaxRequestedLayer> for ChatServer {
+        type Result = MessageResult<TestMaxRequestedLayer>;
+
+        fn handle(&mut self, msg: TestMaxRequestedLayer, _ctx: &mut Self::Context) -> Self::Result {
+            MessageResult(self.max_requested_layer(&msg.room, msg.source, msg.kind))
+        }
+    }
+
     // ======================================================================
     // Helper: connect + join a session, returning Ok or panicking
     // ======================================================================
@@ -11121,6 +11595,481 @@ mod tests {
         let parsed: MeetingBecameEmptyPayload =
             serde_json::from_slice(&events[0]).expect("Payload should deserialize");
         assert_eq!(parsed.room_id, room);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // #1202 — cross-instance membership mirror (Stages A + B)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// (B) CORE GATE — Stage-B union inclusion.
+    ///
+    /// A LOCAL publisher P with a REMOTE receiver R (mirrored via the REAL
+    /// `MirrorRemoteMembership` JOIN handler) that has a recorded MID-layer
+    /// preference. With the mirror ON, `max_requested_layer(P)` must include R and
+    /// return R's capped value (1). On revert of the Stage-B ON-branch (the union
+    /// reads local-only), R is invisible, the union is computed over P-only (an
+    /// empty receiver set after skipping the source) and returns 0 → assert FAILS.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_mirror_remote_receiver_caps_union_stage_b() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-1202-stage-b-union";
+        let p: SessionId = 5001; // LOCAL publisher
+        let r: SessionId = 5002; // REMOTE receiver (other relay binary)
+        const MID: u32 = 1; // a non-base, non-sentinel layer
+
+        chat.send(TestSetMembershipMirrorEnabled(true))
+            .await
+            .expect("set flag");
+
+        // Seed the LOCAL publisher P (Active local row).
+        chat.send(TestSeedActiveMember {
+            session: p,
+            room: room.to_string(),
+            user_id: "p@example.com".to_string(),
+            display_name: "P".to_string(),
+        })
+        .await
+        .expect("seed P");
+
+        // Inject the REMOTE receiver R via the PRODUCTION mirror handler.
+        chat.send(MirrorRemoteMembership {
+            room: room.to_string(),
+            session: r,
+            user_id: "r@example.com".to_string(),
+            display_name: "R".to_string(),
+            event: MirrorEvent::Join,
+        })
+        .await
+        .expect("mirror JOIN R");
+
+        // Cap R's preference for P's VIDEO (kind=1) to the MID layer. This records
+        // a `session_layer_prefs[R]` entry, so R contributes MID (not fail-open)
+        // to the union — making the cap observable.
+        chat.send(TestSeedPrefAndRecompute {
+            room: room.to_string(),
+            receiver: r,
+            source: p,
+            kind: 1,
+            desired: Some(MID),
+        })
+        .await
+        .expect("cap R");
+
+        // Drive the PRODUCTION union fn. With the mirror ON, R is in the receiver
+        // set, so the union == R's cap (MID = 1). On a Stage-B revert R is invisible
+        // → union over P-only (empty after skipping source) → 0.
+        let union = chat
+            .send(TestMaxRequestedLayer {
+                room: room.to_string(),
+                source: p,
+                kind: 1,
+            })
+            .await
+            .expect("max_requested_layer");
+        assert_eq!(
+            union, MID,
+            "Stage-B union must include the mirrored remote receiver's MID cap (1); a local-only \
+             revert makes R invisible → empty receiver set → 0"
+        );
+    }
+
+    /// (A) SUBJECT ROUTING — the publisher-LAST catch-up bug (#1202 follow-up).
+    ///
+    /// Unlike the four `MirrorRemoteMembership`-injecting tests above (which inject
+    /// the mirror message DIRECTLY and so cannot see a subject-routing miss), this
+    /// drives the PRODUCTION `observe_participant_presence` tap with the REAL
+    /// unicast re-announce that `SessionManager::rebroadcast_publication`'s
+    /// `Some(requester)` arm emits — i.e. a PARTICIPANT_JOINED addressed to
+    /// `room.{room}.{publisher}` (the publisher's own `self_subject`), NOT
+    /// `.system`. A publisher P that joined AFTER its remote viewer R was already
+    /// Active learns about R only via this unicast catch-up. With the widened
+    /// subject gate, the tap observes it → mirrors R as a Remote row → R's MID cap
+    /// caps P's receiver union. On revert to the `.system`-only gate, the unicast
+    /// subject is dropped, R is never mirrored, and the union is empty → 0 ≠ MID.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_mirror_unicast_reannounce_observed_caps_union_stage_a() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-1202-stage-a-unicast-reannounce";
+        let p: SessionId = 5401; // LOCAL publisher that joined LAST
+        let r: SessionId = 5402; // REMOTE receiver (other relay binary), already Active
+        const MID: u32 = 1; // a non-base, non-sentinel layer
+
+        // The publisher's own publish subject — exactly the subject a remote peer
+        // unicasts the catch-up PARTICIPANT_JOINED to (the `Some(requester)` arm).
+        let self_subject = format!("room.{room}.{p}").replace(' ', "_");
+
+        chat.send(TestSetMembershipMirrorEnabled(true))
+            .await
+            .expect("set flag");
+
+        // Seed the LOCAL publisher P (Active local row) so the union has a source.
+        chat.send(TestSeedActiveMember {
+            session: p,
+            room: room.to_string(),
+            user_id: "p@example.com".to_string(),
+            display_name: "P".to_string(),
+        })
+        .await
+        .expect("seed P");
+
+        // Build the REAL unicast re-announce R's remote pod would emit for R, with
+        // P as the lone requester. This exercises the production subject format and
+        // packet bytes — NOT a hand-rolled message.
+        let (subject, bytes) = SessionManager::rebroadcast_publication(
+            room,
+            "r@example.com",
+            "R",
+            r,       // responder_session (the remote receiver)
+            false,   // is_guest
+            true,    // responder_is_active
+            Some(p), // unicast to the lone requester P
+        )
+        .expect("rebroadcast_publication should produce a unicast re-announce");
+
+        // The unicast subject MUST equal the publisher's own self_subject — the
+        // exact subject the `.system`-only gate dropped.
+        assert_eq!(
+            subject, self_subject,
+            "the unicast re-announce must be addressed to the publisher's own subject \
+             (room.{{room}}.{{publisher}}), which is NOT a `.system` subject"
+        );
+
+        // Synthesize the `async_nats::Message` the relay's NATS loop would receive
+        // on the publisher's subscription, and parse the wrapper exactly as the
+        // loop does (single decode, shared with every consumer).
+        let msg = make_nats_message(&subject, bytes);
+        let parsed = parse_pw(&msg);
+
+        // Drive the PRODUCTION tap with the publisher's own session + self_subject.
+        // It fire-and-forgets a `MirrorRemoteMembership` to the server; the JOIN
+        // handler runs only because the mirror flag is ON (flipped above).
+        observe_participant_presence(&msg, parsed.as_ref(), room, &self_subject, p, &chat);
+
+        // `do_send` is fire-and-forget; a subsequent `.send().await` round-trips
+        // through the same mailbox, guaranteeing the MirrorRemoteMembership JOIN
+        // (and its coalesced recompute) has been processed before we seed prefs.
+        // (GetRoomMembers is a cheap, side-effect-free flush message.)
+        let members = chat
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers flush");
+        assert!(
+            members.iter().any(|m| m.session == r),
+            "the unicast re-announce must have mirrored R as a remote row; on a \
+             `.system`-only gate revert R is never observed and this is empty"
+        );
+
+        // Cap R's preference for P's VIDEO (kind=1) to MID so the cap is observable
+        // (mirrors the Stage-B test ordering: mirror-observe BEFORE pref seed).
+        chat.send(TestSeedPrefAndRecompute {
+            room: room.to_string(),
+            receiver: r,
+            source: p,
+            kind: 1,
+            desired: Some(MID),
+        })
+        .await
+        .expect("cap R");
+
+        // With R observed via the unicast tap, the union over P's receivers == R's
+        // MID cap. On a `.system`-only gate revert R is invisible → empty receiver
+        // set after skipping the source → 0.
+        let union = chat
+            .send(TestMaxRequestedLayer {
+                room: room.to_string(),
+                source: p,
+                kind: 1,
+            })
+            .await
+            .expect("max_requested_layer");
+        assert_eq!(
+            union, MID,
+            "Stage-A union must include the remote receiver R that was mirrored via the \
+             UNICAST catch-up re-announce; a `.system`-only subject-gate revert drops that \
+             unicast → R never mirrored → empty receiver set → 0"
+        );
+    }
+
+    /// (A) INERTNESS — a mirrored Remote row must NOT block teardown.
+    ///
+    /// One LOCAL non-host member L (seeded via the real Connect+JoinRoom+Activate
+    /// path) and one REMOTE row R (real mirror JOIN). When L disconnects, the room
+    /// is LOCALLY empty (only R remains, origin=Remote) so the real
+    /// leave/grace/`leave_rooms` path (c1) must fire MEETING_BECAME_EMPTY exactly
+    /// once. On revert of c1 to bare `members.is_empty()`, `[R].is_empty()==false`
+    /// → empty NOT detected → 0 events → FAILS.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_mirror_remote_row_local_is_empty_fires_became_empty() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+
+        let room = "test-1202-inertness-empty";
+        let l: SessionId = 5101; // LOCAL non-host
+        let r: SessionId = 5102; // REMOTE row (other relay binary)
+
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
+            .await
+            .expect("subscribe became-empty");
+
+        chat.send(TestSetMembershipMirrorEnabled(true))
+            .await
+            .expect("set flag");
+
+        // Seed L through the REAL connect+join+activate path so the subsequent
+        // Disconnect drives the real grace + ExecutePendingDeparture + leave_rooms
+        // path that reaches c1.
+        chat.send(Connect {
+            id: l,
+            addr: dummy.clone().recipient(),
+        })
+        .await
+        .expect("Connect L");
+        chat.send(JoinRoom {
+            session: l,
+            room: room.to_string(),
+            user_id: "l@example.com".to_string(),
+            display_name: "L".to_string(),
+            is_guest: false,
+            observer: false,
+            instance_id: None,
+            is_host: false,
+            end_on_host_leave: false,
+            transport: "websocket".to_string(),
+            downlink_congested_epoch: never_epoch(),
+        })
+        .await
+        .expect("JoinRoom L delivery")
+        .expect("JoinRoom L Ok");
+        chat.send(ActivateConnection { session: l })
+            .await
+            .expect("Activate L");
+
+        // Inject the REMOTE row via the real mirror JOIN handler.
+        chat.send(MirrorRemoteMembership {
+            room: room.to_string(),
+            session: r,
+            user_id: "r@example.com".to_string(),
+            display_name: "R".to_string(),
+            event: MirrorEvent::Join,
+        })
+        .await
+        .expect("mirror JOIN R");
+
+        sleep(Duration::from_millis(300)).await;
+
+        // L disconnects: room is now LOCALLY empty though room_members still has
+        // [R]. The real leave path (c1) must detect local-emptiness and publish
+        // MEETING_BECAME_EMPTY exactly once.
+        chat.send(Disconnect {
+            session: l,
+            room: room.to_string(),
+            user_id: "l@example.com".to_string(),
+            display_name: "L".to_string(),
+            is_guest: false,
+            observer: false,
+            is_host: false,
+            end_on_host_leave: false,
+        })
+        .await
+        .expect("Disconnect L");
+
+        let events = drain_all(&mut empty_sub, Duration::from_secs(6)).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "became-empty must fire when the room is LOCALLY empty even though a mirrored Remote \
+             row [R] remains; a c1 revert to bare members.is_empty() sees [R] non-empty → 0 events"
+        );
+    }
+
+    /// (A) IDEMPOTENCY + LEFT — JOIN is idempotent, LEFT removes only the Remote
+    /// row, and a LEFT for a LOCAL session never removes the local row.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_mirror_idempotent_and_left() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-1202-idempotent";
+        let r1: SessionId = 5201; // remote, double-JOIN then LEFT
+        let l: SessionId = 5202; // local, target of a spurious remote LEFT
+
+        chat.send(TestSetMembershipMirrorEnabled(true))
+            .await
+            .expect("set flag");
+
+        // Double JOIN for the same remote session → exactly one row.
+        for _ in 0..2 {
+            chat.send(MirrorRemoteMembership {
+                room: room.to_string(),
+                session: r1,
+                user_id: "r1@example.com".to_string(),
+                display_name: "R1".to_string(),
+                event: MirrorEvent::Join,
+            })
+            .await
+            .expect("mirror JOIN r1");
+        }
+        let members = chat
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers");
+        assert_eq!(
+            members.iter().filter(|m| m.session == r1).count(),
+            1,
+            "double JOIN for the same remote session must yield exactly one row"
+        );
+
+        // LEFT for r1 → zero rows for r1.
+        chat.send(MirrorRemoteMembership {
+            room: room.to_string(),
+            session: r1,
+            user_id: "r1@example.com".to_string(),
+            display_name: "R1".to_string(),
+            event: MirrorEvent::Left,
+        })
+        .await
+        .expect("mirror LEFT r1");
+        let members = chat
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers");
+        assert_eq!(
+            members.iter().filter(|m| m.session == r1).count(),
+            0,
+            "LEFT must remove the remote row for that session"
+        );
+
+        // Seed a LOCAL member L, then send a spurious remote LEFT for L → L's row
+        // must be untouched (still present, still origin == Local).
+        chat.send(TestSeedActiveMember {
+            session: l,
+            room: room.to_string(),
+            user_id: "l@example.com".to_string(),
+            display_name: "L".to_string(),
+        })
+        .await
+        .expect("seed L");
+        chat.send(MirrorRemoteMembership {
+            room: room.to_string(),
+            session: l,
+            user_id: "l@example.com".to_string(),
+            display_name: "L".to_string(),
+            event: MirrorEvent::Left,
+        })
+        .await
+        .expect("spurious mirror LEFT for local L");
+        let members = chat
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers");
+        let l_row = members.iter().find(|m| m.session == l);
+        assert!(
+            l_row.is_some(),
+            "a remote LEFT must NEVER remove a LOCAL row"
+        );
+        assert_eq!(
+            l_row.expect("L row present").origin,
+            MemberOrigin::Local,
+            "L's row must remain origin == Local"
+        );
+    }
+
+    /// (A) GHOST-SAFETY — a mirrored Remote row must touch `room_members` ONLY:
+    /// no `sessions`, no `active_subs`, even after a real ActivateConnection.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_mirror_remote_row_is_ghost_safe() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-1202-ghost-safe";
+        let r: SessionId = 5301;
+
+        chat.send(TestSetMembershipMirrorEnabled(true))
+            .await
+            .expect("set flag");
+
+        chat.send(MirrorRemoteMembership {
+            room: room.to_string(),
+            session: r,
+            user_id: "r@example.com".to_string(),
+            display_name: "R".to_string(),
+            event: MirrorEvent::Join,
+        })
+        .await
+        .expect("mirror JOIN R");
+
+        // Attempt the real ActivateConnection for R — it owns no Connect-seeded
+        // session, so it must NOT create active maps for a ghost row.
+        chat.send(ActivateConnection { session: r })
+            .await
+            .expect("ActivateConnection R");
+
+        let has_active = chat
+            .send(HasActiveSub { session: r })
+            .await
+            .expect("HasActiveSub");
+        let has_session = chat
+            .send(HasSession { session: r })
+            .await
+            .expect("HasSession");
+        assert!(
+            !has_active,
+            "a mirrored Remote row must have NO active NATS subscription"
+        );
+        assert!(
+            !has_session,
+            "a mirrored Remote row must NOT be registered in `sessions`"
+        );
+
+        // The row IS present in room_members (the only map the mirror touches).
+        let members = chat
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers");
+        let r_row = members.iter().find(|m| m.session == r);
+        assert_eq!(
+            r_row.expect("R row present").origin,
+            MemberOrigin::Remote,
+            "the mirrored row must be present in room_members as origin == Remote"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -13931,6 +14880,7 @@ mod tests {
             display_name: format!("d{session}"),
             is_host: false,
             end_on_host_leave: false,
+            origin: MemberOrigin::Local,
         };
 
         // --- Active room: a KNOWN distribution across buckets × {video, screen} ---
@@ -15962,6 +16912,7 @@ mod tests {
             display_name: user_id.to_string(),
             is_host,
             end_on_host_leave: true,
+            origin: MemberOrigin::Local,
         }
     }
 
