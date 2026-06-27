@@ -454,6 +454,19 @@ fn user_has_remaining_session(remaining_members: &[RoomMemberInfo], user_id: &st
     remaining_members.iter().any(|m| m.user_id == user_id)
 }
 
+/// Whether a room's member slice holds NO LOCAL-origin row (issue #1705 / #1202).
+///
+/// THE single definition of "locally empty" that [`ChatServer::local_is_empty`]
+/// and the borrow-constrained inline teardown sites c5 (`forget_session`) and c6
+/// (`ExecutePendingDeparture`) all route through. A free fn over `&[RoomMemberInfo]`
+/// (not a `&self` method) so it composes with the `&mut Vec` borrows `get_mut`
+/// hands c5/c6 — keeping the #1202 inertness invariant (a mirrored `Remote` row
+/// must never suppress teardown / became-empty) in ONE place so a future edit to
+/// one copy cannot silently drift the other two.
+fn slice_is_locally_empty(members: &[RoomMemberInfo]) -> bool {
+    !members.iter().any(|m| m.origin == MemberOrigin::Local)
+}
+
 /// Cached per-room policy flags. Populated at first JoinRoom for the room and
 /// refreshed on `MEETING_SETTINGS_UPDATE_SUBJECT` NATS events from
 /// `meeting-api`.
@@ -1750,7 +1763,7 @@ impl ChatServer {
     fn local_is_empty(&self, room: &str) -> bool {
         self.room_members
             .get(room)
-            .is_none_or(|members| !members.iter().any(|m| m.origin == MemberOrigin::Local))
+            .is_none_or(|m| slice_is_locally_empty(m))
     }
 
     fn forget_room_if_empty(&mut self, room: &str) {
@@ -1803,9 +1816,10 @@ impl ChatServer {
         if let Some(members) = self.room_members.get_mut(room) {
             members.retain(|m| m.session != session_id);
             // c5 (#1202): LOCAL-only emptiness — a room left holding only mirrored
-            // Remote rows is locally drained and must still GC (inline form; the
-            // SAME predicate is centralized in `ChatServer::local_is_empty`).
-            if !members.iter().any(|m| m.origin == MemberOrigin::Local) {
+            // Remote rows is locally drained and must still GC. Now CALLS the shared
+            // `slice_is_locally_empty` free fn (the single definition of "locally
+            // empty"; #1705) rather than an inlined copy.
+            if slice_is_locally_empty(members) {
                 self.room_members.remove(room);
                 // Mirror forget_room_if_empty: release ALL per-room relay series
                 // so the eviction teardown path also cannot leak room-labeled
@@ -3677,9 +3691,10 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                     members.retain(|m| m.session != session);
                     // c6 (#1202): LOCAL-only emptiness — a never-activated last
                     // local member draining the room must fire empty->idle even if
-                    // mirrored Remote rows remain (inline form; SAME predicate
-                    // centralized in `ChatServer::local_is_empty`).
-                    room_became_empty = !members.iter().any(|m| m.origin == MemberOrigin::Local);
+                    // mirrored Remote rows remain. Now CALLS the shared
+                    // `slice_is_locally_empty` free fn (the single definition of
+                    // "locally empty"; #1705) rather than an inlined copy.
+                    room_became_empty = slice_is_locally_empty(members);
                 }
                 // Unlike `leave_rooms` / `forget_session`, this branch does NOT
                 // call `forget_layer_hint_state_for_source`, and deliberately so:
